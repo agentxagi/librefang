@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/assets/openfang-logo.png" width="160" alt="LibreFang Logo" />
+  <img src="public/assets/librefang-logo.svg" width="160" alt="LibreFang Logo" />
 </p>
 
 <h1 align="center">LibreFang</h1>
@@ -7,7 +7,7 @@
 
 <p align="center">
   Open-source Agent OS built in Rust. 137K LOC. 14 crates. 1,767+ tests. Zero clippy warnings.<br/>
-  <strong>Forked from `RightNow-AI/openfang`. Transparent governance. Preserved attribution. Compatible with the existing `openfang` CLI.</strong>
+  <strong>Forked from `RightNow-AI/librefang`. Transparent governance. Preserved attribution. Compatible with the existing `librefang` CLI.</strong>
 </p>
 
 <p align="center">
@@ -22,14 +22,14 @@
   <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square" alt="Rust" />
   <img src="https://img.shields.io/badge/license-Apache--2.0%20%7C%20MIT-blue?style=flat-square" alt="Apache-2.0 OR MIT" />
   <img src="https://img.shields.io/badge/community-maintained-brightgreen?style=flat-square" alt="Community Maintained" />
-  <img src="https://img.shields.io/badge/cli-openfang-informational?style=flat-square" alt="CLI openfang" />
+  <img src="https://img.shields.io/badge/cli-librefang-informational?style=flat-square" alt="CLI librefang" />
 </p>
 
 ---
 
-> **LibreFang is a community-maintained fork of [`RightNow-AI/openfang`](https://github.com/RightNow-AI/openfang).**
+> **LibreFang is a community-maintained fork of [`RightNow-AI/librefang`](https://github.com/RightNow-AI/librefang).**
 >
-> The codebase, binary, crate names, and config paths still use `openfang` for compatibility during the transition. LibreFang is taking a different path on project governance: we actively accept community contributions, review them in public, merge accepted work through normal GitHub flow, and preserve contributor credit when code is adapted.
+> The codebase, binary, crate names, and config paths still use `librefang` for compatibility during the transition. LibreFang is taking a different path on project governance: we actively accept community contributions, review them in public, merge accepted work through normal GitHub flow, and preserve contributor credit when code is adapted.
 
 > **Community status:** issues, pull requests, reviewers, and maintainers are actively welcome.
 
@@ -44,9 +44,9 @@ Traditional agent frameworks wait for you to type something. LibreFang runs **au
 The project website is live at [librefang.ai](https://librefang.ai/). Today, the fastest way to try LibreFang is still to install from source. The repository does not publish GitHub Releases yet, so the legacy installer scripts are being kept for the first community release.
 
 ```bash
-cargo install --git https://github.com/librefang/librefang openfang-cli
-openfang init
-openfang start
+cargo install --git https://github.com/librefang/librefang librefang-cli
+librefang init
+librefang start
 # Dashboard live at http://localhost:4200
 ```
 
@@ -54,9 +54,9 @@ openfang start
 <summary><strong>Windows</strong></summary>
 
 ```powershell
-cargo install --git https://github.com/librefang/librefang openfang-cli
-openfang init
-openfang start
+cargo install --git https://github.com/librefang/librefang librefang-cli
+librefang init
+librefang start
 ```
 
 </details>
@@ -73,7 +73,7 @@ irm https://librefang.ai/install.ps1 | iex
 
 ## Community Fork Commitments
 
-- LibreFang exists to continue the OpenFang codebase as an open community fork with normal GitHub collaboration.
+- LibreFang exists to continue the LibreFang codebase as an open community fork with normal GitHub collaboration.
 - Pull requests are reviewed in the open. If a change is accepted, it should land as a merge or squash merge whenever possible.
 - Community contributions are actively encouraged, including bug fixes, documentation, tests, packaging, release engineering, and maintainer help.
 - If a maintainer adapts or rewrites a contributor's patch, attribution is preserved in commit metadata and release notes.
@@ -110,19 +110,19 @@ All compiled into the binary. No downloading, no pip install, no Docker pull.
 
 ```bash
 # Activate the Researcher Hand — it starts working immediately
-openfang hand activate researcher
+librefang hand activate researcher
 
 # Check its progress anytime
-openfang hand status researcher
+librefang hand status researcher
 
 # Activate lead generation on a daily schedule
-openfang hand activate lead
+librefang hand activate lead
 
 # Pause without losing state
-openfang hand pause lead
+librefang hand pause lead
 
 # See all available Hands
-openfang hand list
+librefang hand list
 ```
 
 **Build your own.** Define a `HAND.toml` with tools, settings, and a system prompt. Publish to FangHub.
@@ -132,7 +132,7 @@ openfang hand list
 ## LibreFang vs The Landscape
 
 <p align="center">
-  <img src="public/assets/openfang-vs-claws.png" width="600" alt="LibreFang vs OpenClaw vs ZeroClaw" />
+  <img src="public/assets/librefang-vs-claws.png" width="600" alt="LibreFang vs OpenClaw vs ZeroClaw" />
 </p>
 
 ### Benchmarks: Measured, Not Marketed
@@ -254,19 +254,19 @@ LibreFang doesn't bolt security on after the fact. Every layer is independently 
 14 Rust crates. 137,728 lines of code. Modular kernel design.
 
 ```
-openfang-kernel      Orchestration, workflows, metering, RBAC, scheduler, budget tracking
-openfang-runtime     Agent loop, 3 LLM drivers, 53 tools, WASM sandbox, MCP, A2A
-openfang-api         140+ REST/WS/SSE endpoints, OpenAI-compatible API, dashboard
-openfang-channels    40 messaging adapters with rate limiting, DM/group policies
-openfang-memory      SQLite persistence, vector embeddings, canonical sessions, compaction
-openfang-types       Core types, taint tracking, Ed25519 manifest signing, model catalog
-openfang-skills      60 bundled skills, SKILL.md parser, FangHub marketplace
-openfang-hands       7 autonomous Hands, HAND.toml parser, lifecycle management
-openfang-extensions  25 MCP templates, AES-256-GCM credential vault, OAuth2 PKCE
-openfang-wire        OFP P2P protocol with HMAC-SHA256 mutual authentication
-openfang-cli         CLI with daemon management, TUI dashboard, MCP server mode
-openfang-desktop     Tauri 2.0 native app (system tray, notifications, global shortcuts)
-openfang-migrate     OpenClaw, LangChain, AutoGPT migration engine
+librefang-kernel      Orchestration, workflows, metering, RBAC, scheduler, budget tracking
+librefang-runtime     Agent loop, 3 LLM drivers, 53 tools, WASM sandbox, MCP, A2A
+librefang-api         140+ REST/WS/SSE endpoints, OpenAI-compatible API, dashboard
+librefang-channels    40 messaging adapters with rate limiting, DM/group policies
+librefang-memory      SQLite persistence, vector embeddings, canonical sessions, compaction
+librefang-types       Core types, taint tracking, Ed25519 manifest signing, model catalog
+librefang-skills      60 bundled skills, SKILL.md parser, FangHub marketplace
+librefang-hands       7 autonomous Hands, HAND.toml parser, lifecycle management
+librefang-extensions  25 MCP templates, AES-256-GCM credential vault, OAuth2 PKCE
+librefang-wire        OFP P2P protocol with HMAC-SHA256 mutual authentication
+librefang-cli         CLI with daemon management, TUI dashboard, MCP server mode
+librefang-desktop     Tauri 2.0 native app (system tray, notifications, global shortcuts)
+librefang-migrate     OpenClaw, LangChain, AutoGPT migration engine
 xtask                Build automation
 ```
 
@@ -303,13 +303,13 @@ Already running OpenClaw? One command:
 
 ```bash
 # Migrate everything — agents, memory, skills, configs
-openfang migrate --from openclaw
+librefang migrate --from openclaw
 
 # Migrate from a specific path
-openfang migrate --from openclaw --path ~/.openclaw
+librefang migrate --from openclaw --path ~/.openclaw
 
 # Dry run first to see what would change
-openfang migrate --from openclaw --dry-run
+librefang migrate --from openclaw --dry-run
 ```
 
 The migration engine imports your agents, conversation history, skills, and configuration. LibreFang reads SKILL.md natively and is compatible with the ClawHub marketplace.
@@ -338,34 +338,34 @@ curl -X POST localhost:4200/v1/chat/completions \
 
 ```bash
 # 1. Install
-cargo install --git https://github.com/librefang/librefang openfang-cli
+cargo install --git https://github.com/librefang/librefang librefang-cli
 
 # 2. Initialize — walks you through provider setup
-openfang init
+librefang init
 
 # 3. Start the daemon
-openfang start
+librefang start
 
 # 4. Dashboard is live at http://localhost:4200
 
 # 5. Activate a Hand — it starts working for you
-openfang hand activate researcher
+librefang hand activate researcher
 
 # 6. Chat with an agent
-openfang chat researcher
+librefang chat researcher
 > "What are the emerging trends in AI agent frameworks?"
 
 # 7. Spawn a pre-built agent
-openfang agent spawn coder
+librefang agent spawn coder
 ```
 
 <details>
 <summary><strong>Windows (PowerShell)</strong></summary>
 
 ```powershell
-cargo install --git https://github.com/librefang/librefang openfang-cli
-openfang init
-openfang start
+cargo install --git https://github.com/librefang/librefang librefang-cli
+librefang init
+librefang start
 ```
 
 </details>

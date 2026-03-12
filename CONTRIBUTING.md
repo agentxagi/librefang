@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to LibreFang. This guide covers everything you need to get started, from setting up your development environment to submitting pull requests.
 
-LibreFang is a community-maintained fork. For compatibility, the binary name, crate names, and most internal identifiers still use `openfang`.
+LibreFang is a community-maintained fork. For compatibility, the binary name, crate names, and most internal identifiers still use `librefang`.
 
 ## Table of Contents
 
@@ -69,9 +69,9 @@ The test suite is currently 1,744+ tests. All must pass before merging.
 ### Run Tests for a Single Crate
 
 ```bash
-cargo test -p openfang-kernel
-cargo test -p openfang-runtime
-cargo test -p openfang-memory
+cargo test -p librefang-kernel
+cargo test -p librefang-runtime
+cargo test -p librefang-memory
 ```
 
 ### Check for Clippy Warnings
@@ -107,10 +107,10 @@ cargo run -- doctor
 - **Documentation**: All public types and functions must have doc comments (`///`).
 - **Error Handling**: Use `thiserror` for error types. Avoid `unwrap()` in library code; prefer `?` propagation.
 - **Naming**:
-  - Types: `PascalCase` (e.g., `OpenFangKernel`, `AgentManifest`)
+  - Types: `PascalCase` (e.g., `LibreFangKernel`, `AgentManifest`)
   - Functions/methods: `snake_case`
   - Constants: `SCREAMING_SNAKE_CASE`
-  - Crate names: `openfang-{name}` (kebab-case)
+  - Crate names: `librefang-{name}` (kebab-case)
 - **Dependencies**: Workspace dependencies are declared in the root `Cargo.toml`. Prefer reusing workspace deps over adding new ones. If you need a new dependency, justify it in the PR.
 - **Testing**: Every new feature must include tests. Use `tempfile::TempDir` for filesystem isolation and random port binding for network tests.
 - **Serde**: All config structs use `#[serde(default)]` for forward compatibility with partial TOML.
@@ -123,26 +123,26 @@ LibreFang is organized as a Cargo workspace with 14 crates:
 
 | Crate | Role |
 |-------|------|
-| `openfang-types` | Shared type definitions, taint tracking, manifest signing (Ed25519), model catalog, MCP/A2A config types |
-| `openfang-memory` | SQLite-backed memory substrate with vector embeddings, usage tracking, canonical sessions, JSONL mirroring |
-| `openfang-runtime` | Agent loop, 3 LLM drivers (Anthropic/Gemini/OpenAI-compat), 38 built-in tools, WASM sandbox, MCP client/server, A2A protocol |
-| `openfang-hands` | Hands system (curated autonomous capability packages), 7 bundled hands |
-| `openfang-extensions` | Integration registry (25 bundled MCP templates), AES-256-GCM credential vault, OAuth2 PKCE |
-| `openfang-kernel` | Assembles all subsystems: workflow engine, RBAC auth, heartbeat monitor, cron scheduler, config hot-reload |
-| `openfang-api` | REST/WS/SSE API (Axum 0.8), 76 endpoints, 14-page SPA dashboard, OpenAI-compatible `/v1/chat/completions` |
-| `openfang-channels` | 40 channel adapters (Telegram, Discord, Slack, WhatsApp, and 36 more), formatter, rate limiter |
-| `openfang-wire` | OFP (OpenFang Protocol): TCP P2P networking with HMAC-SHA256 mutual authentication |
-| `openfang-cli` | Clap CLI with daemon auto-detect (HTTP mode vs. in-process fallback), MCP server |
-| `openfang-migrate` | Migration engine for importing from OpenClaw (and future frameworks) |
-| `openfang-skills` | Skill system: 60 bundled skills, FangHub marketplace, OpenClaw compatibility, prompt injection scanning |
-| `openfang-desktop` | Tauri 2.0 native desktop app (WebView + system tray + single-instance + notifications) |
+| `librefang-types` | Shared type definitions, taint tracking, manifest signing (Ed25519), model catalog, MCP/A2A config types |
+| `librefang-memory` | SQLite-backed memory substrate with vector embeddings, usage tracking, canonical sessions, JSONL mirroring |
+| `librefang-runtime` | Agent loop, 3 LLM drivers (Anthropic/Gemini/OpenAI-compat), 38 built-in tools, WASM sandbox, MCP client/server, A2A protocol |
+| `librefang-hands` | Hands system (curated autonomous capability packages), 7 bundled hands |
+| `librefang-extensions` | Integration registry (25 bundled MCP templates), AES-256-GCM credential vault, OAuth2 PKCE |
+| `librefang-kernel` | Assembles all subsystems: workflow engine, RBAC auth, heartbeat monitor, cron scheduler, config hot-reload |
+| `librefang-api` | REST/WS/SSE API (Axum 0.8), 76 endpoints, 14-page SPA dashboard, OpenAI-compatible `/v1/chat/completions` |
+| `librefang-channels` | 40 channel adapters (Telegram, Discord, Slack, WhatsApp, and 36 more), formatter, rate limiter |
+| `librefang-wire` | OFP (LibreFang Protocol): TCP P2P networking with HMAC-SHA256 mutual authentication |
+| `librefang-cli` | Clap CLI with daemon auto-detect (HTTP mode vs. in-process fallback), MCP server |
+| `librefang-migrate` | Migration engine for importing from OpenClaw (and future frameworks) |
+| `librefang-skills` | Skill system: 60 bundled skills, FangHub marketplace, OpenClaw compatibility, prompt injection scanning |
+| `librefang-desktop` | Tauri 2.0 native desktop app (WebView + system tray + single-instance + notifications) |
 | `xtask` | Build automation tasks |
 
 ### Key Architectural Patterns
 
-- **`KernelHandle` trait**: Defined in `openfang-runtime`, implemented on `OpenFangKernel` in `openfang-kernel`. This avoids circular crate dependencies while enabling inter-agent tools.
+- **`KernelHandle` trait**: Defined in `librefang-runtime`, implemented on `LibreFangKernel` in `librefang-kernel`. This avoids circular crate dependencies while enabling inter-agent tools.
 - **Shared memory**: A fixed UUID (`AgentId(Uuid::from_bytes([0..0, 0x01]))`) provides a cross-agent KV namespace.
-- **Daemon detection**: The CLI checks `~/.openfang/daemon.json` and pings the health endpoint. If a daemon is running, commands use HTTP; otherwise, they boot an in-process kernel.
+- **Daemon detection**: The CLI checks `~/.librefang/daemon.json` and pings the health endpoint. If a daemon is running, commands use HTTP; otherwise, they boot an in-process kernel.
 - **Capability-based security**: Every agent operation is checked against the agent's granted capabilities before execution.
 
 ---
@@ -165,7 +165,7 @@ agents/my-agent/agent.toml
 name = "my-agent"
 version = "0.1.0"
 description = "A brief description of what this agent does."
-author = "openfang"
+author = "librefang"
 module = "builtin:chat"
 tags = ["category"]
 
@@ -197,7 +197,7 @@ You are a specialized agent that...
 4. Test by spawning:
 
 ```bash
-openfang agent spawn agents/my-agent/agent.toml
+librefang agent spawn agents/my-agent/agent.toml
 ```
 
 5. Submit a PR with the new template.
@@ -206,11 +206,11 @@ openfang agent spawn agents/my-agent/agent.toml
 
 ## How to Add a New Channel Adapter
 
-Channel adapters live in `crates/openfang-channels/src/`. Each adapter implements the `ChannelAdapter` trait.
+Channel adapters live in `crates/librefang-channels/src/`. Each adapter implements the `ChannelAdapter` trait.
 
 ### Steps
 
-1. Create a new file: `crates/openfang-channels/src/myplatform.rs`
+1. Create a new file: `crates/librefang-channels/src/myplatform.rs`
 
 2. Implement the `ChannelAdapter` trait (defined in `types.rs`):
 
@@ -244,17 +244,17 @@ impl ChannelAdapter for MyPlatformAdapter {
 }
 ```
 
-3. Register the module in `crates/openfang-channels/src/lib.rs`:
+3. Register the module in `crates/librefang-channels/src/lib.rs`:
 
 ```rust
 pub mod myplatform;
 ```
 
-4. Wire it up in the channel bridge (`crates/openfang-api/src/channel_bridge.rs`) so the daemon starts it alongside other adapters.
+4. Wire it up in the channel bridge (`crates/librefang-api/src/channel_bridge.rs`) so the daemon starts it alongside other adapters.
 
-5. Add configuration support in `openfang-types` config structs (add a `[channels.myplatform]` section).
+5. Add configuration support in `librefang-types` config structs (add a `[channels.myplatform]` section).
 
-6. Add CLI setup wizard instructions in `crates/openfang-cli/src/main.rs` under `cmd_channel_setup`.
+6. Add CLI setup wizard instructions in `crates/librefang-cli/src/main.rs` under `cmd_channel_setup`.
 
 7. Write tests and submit a PR.
 
@@ -262,7 +262,7 @@ pub mod myplatform;
 
 ## How to Add a New Tool
 
-Built-in tools are defined in `crates/openfang-runtime/src/tool_runner.rs`.
+Built-in tools are defined in `crates/librefang-runtime/src/tool_runner.rs`.
 
 ### Steps
 

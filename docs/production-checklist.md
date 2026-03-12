@@ -15,7 +15,7 @@ The Tauri updater requires an Ed25519 keypair. The private key signs every relea
 cargo install tauri-cli --locked
 
 # Generate the keypair
-cargo tauri signer generate -w ~/.tauri/openfang.key
+cargo tauri signer generate -w ~/.tauri/librefang.key
 ```
 
 The command will output:
@@ -24,7 +24,7 @@ The command will output:
 Your public key was generated successfully:
 dW50cnVzdGVkIGNvb...  <-- COPY THIS
 
-Your private key was saved to: ~/.tauri/openfang.key
+Your private key was saved to: ~/.tauri/librefang.key
 ```
 
 Save both values. You need them for steps 2 and 3.
@@ -35,7 +35,7 @@ Save both values. You need them for steps 2 and 3.
 
 **Status:** BLOCKING — the placeholder must be replaced before building.
 
-Open `crates/openfang-desktop/tauri.conf.json` and replace:
+Open `crates/librefang-desktop/tauri.conf.json` and replace:
 
 ```json
 "pubkey": "PLACEHOLDER_REPLACE_WITH_GENERATED_PUBKEY"
@@ -57,7 +57,7 @@ Go to **GitHub repo → Settings → Secrets and variables → Actions → New r
 
 | Secret Name | Value | Required |
 |---|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/openfang.key` | Yes |
+| `TAURI_SIGNING_PRIVATE_KEY` | Contents of `~/.tauri/librefang.key` | Yes |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password you set during keygen (or empty string) | Yes |
 
 ### Optional — macOS Code Signing
@@ -90,7 +90,7 @@ Set `certificateThumbprint` in `tauri.conf.json` under `bundle.windows` and add 
 
 **Status:** VERIFY — icons may be placeholders.
 
-The following icon files must exist in `crates/openfang-desktop/icons/`:
+The following icon files must exist in `crates/librefang-desktop/icons/`:
 
 | File | Size | Usage |
 |---|---|---|
@@ -138,9 +138,9 @@ curl -fsSL https://librefang.ai/install.sh | sh
 **Status:** VERIFY — the Dockerfile must produce a working image.
 
 ```bash
-docker build -t openfang:local .
-docker run --rm openfang:local --version
-docker run --rm -p 4200:4200 -v openfang-data:/data openfang:local start
+docker build -t librefang:local .
+docker run --rm librefang:local --version
+docker run --rm -p 4200:4200 -v librefang-data:/data librefang:local start
 ```
 
 Confirm:
@@ -202,7 +202,7 @@ Once steps 1-8 are complete:
 
 ```bash
 # Ensure version matches everywhere
-grep '"version"' crates/openfang-desktop/tauri.conf.json
+grep '"version"' crates/librefang-desktop/tauri.conf.json
 grep '^version' Cargo.toml
 
 # Commit any final changes
@@ -258,7 +258,7 @@ docker run --rm ghcr.io/librefang/librefang:latest --version
 2. Tag v0.1.1 and push
 3. Wait for release workflow to complete
 4. Open the v0.1.0 app — after 10 seconds it should:
-   - Show "OpenFang Updating..." notification
+   - Show "LibreFang Updating..." notification
    - Download and install v0.1.1
    - Restart automatically to v0.1.1
 5. Right-click tray → "Check for Updates" → should show "Up to Date"
@@ -267,11 +267,11 @@ docker run --rm ghcr.io/librefang/librefang:latest --version
 ```bash
 # Linux/macOS
 curl -fsSL https://librefang.ai/install.sh | sh
-openfang --version  # Should print v0.1.0
+librefang --version  # Should print v0.1.0
 
 # Windows PowerShell
 irm https://librefang.ai/install.ps1 | iex
-openfang --version
+librefang --version
 ```
 
 ---

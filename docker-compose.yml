@@ -4,13 +4,13 @@
 
 version: "3.8"
 services:
-  openfang:
+  librefang:
     build: .
     # image: ghcr.io/librefang/librefang:latest  # Uncomment when GHCR is published
     ports:
       - "4200:4200"
     volumes:
-      - openfang-data:/data
+      - librefang-data:/data
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -22,4 +22,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  openfang-data:
+  librefang-data:

@@ -7,14 +7,14 @@ COPY crates ./crates
 COPY xtask ./xtask
 COPY agents ./agents
 COPY packages ./packages
-RUN cargo build --release --bin openfang
+RUN cargo build --release --bin librefang
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/openfang /usr/local/bin/
-COPY --from=builder /build/agents /opt/openfang/agents
+COPY --from=builder /build/target/release/librefang /usr/local/bin/
+COPY --from=builder /build/agents /opt/librefang/agents
 EXPOSE 4200
 VOLUME /data
-ENV OPENFANG_HOME=/data
-ENTRYPOINT ["openfang"]
+ENV LIBREFANG_HOME=/data
+ENTRYPOINT ["librefang"]
 CMD ["start"]

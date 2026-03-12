@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/openfang-types",
-    "crates/openfang-memory",
-    "crates/openfang-runtime",
-    "crates/openfang-wire",
-    "crates/openfang-api",
-    "crates/openfang-kernel",
-    "crates/openfang-cli",
-    "crates/openfang-channels",
-    "crates/openfang-migrate",
-    "crates/openfang-skills",
-    "crates/openfang-desktop",
-    "crates/openfang-hands",
-    "crates/openfang-extensions",
+    "crates/librefang-types",
+    "crates/librefang-memory",
+    "crates/librefang-runtime",
+    "crates/librefang-wire",
+    "crates/librefang-api",
+    "crates/librefang-kernel",
+    "crates/librefang-cli",
+    "crates/librefang-channels",
+    "crates/librefang-migrate",
+    "crates/librefang-skills",
+    "crates/librefang-desktop",
+    "crates/librefang-hands",
+    "crates/librefang-extensions",
     "xtask",
 ]
 

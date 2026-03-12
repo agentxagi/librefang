@@ -1,10 +1,10 @@
 from setuptools import setup
 
 setup(
-    name="openfang",
+    name="librefang",
     version="0.1.0",
-    description="Official Python client for the OpenFang Agent OS REST API",
-    py_modules=["openfang_sdk", "openfang_client"],
+    description="Official Python client for the LibreFang Agent OS REST API",
+    py_modules=["librefang_sdk", "librefang_client"],
     python_requires=">=3.8",
     classifiers=[
         "Programming Language :: Python :: 3",

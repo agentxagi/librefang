@@ -126,12 +126,12 @@ jobs:
 
             **Coming from OpenClaw?**
             ```bash
-            openfang migrate --from openclaw
+            librefang migrate --from openclaw
             ```
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
-          projectPath: crates/openfang-desktop
+          projectPath: crates/librefang-desktop
           args: ${{ matrix.platform.args }}
 
   # ── CLI Binary (5 platforms) ──────────────────────────────────────────────
@@ -177,33 +177,33 @@ jobs:
           key: cli-${{ matrix.target }}
       - name: Build CLI (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }} --bin openfang
+        run: cross build --release --target ${{ matrix.target }} --bin librefang
       - name: Build CLI
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} --bin openfang
+        run: cargo build --release --target ${{ matrix.target }} --bin librefang
       - name: Ad-hoc codesign CLI binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          xattr -cr target/${{ matrix.target }}/release/openfang || true
-          codesign --force --sign - target/${{ matrix.target }}/release/openfang
+          xattr -cr target/${{ matrix.target }}/release/librefang || true
+          codesign --force --sign - target/${{ matrix.target }}/release/librefang
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../openfang-${{ matrix.target }}.tar.gz openfang
+          tar czf ../../../librefang-${{ matrix.target }}.tar.gz librefang
           cd ../../..
-          sha256sum openfang-${{ matrix.target }}.tar.gz > openfang-${{ matrix.target }}.tar.gz.sha256
+          sha256sum librefang-${{ matrix.target }}.tar.gz > librefang-${{ matrix.target }}.tar.gz.sha256
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/openfang.exe" -DestinationPath "openfang-${{ matrix.target }}.zip"
-          $hash = (Get-FileHash "openfang-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  openfang-${{ matrix.target }}.zip" | Out-File -Encoding ASCII "openfang-${{ matrix.target }}.zip.sha256"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/librefang.exe" -DestinationPath "librefang-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash "librefang-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  librefang-${{ matrix.target }}.zip" | Out-File -Encoding ASCII "librefang-${{ matrix.target }}.zip.sha256"
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: openfang-${{ matrix.target }}.*
+          files: librefang-${{ matrix.target }}.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
