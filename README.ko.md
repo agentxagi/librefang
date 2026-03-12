@@ -11,6 +11,10 @@
 </p>
 
 <p align="center">
+  <strong>다국어 버전:</strong> <a href="README.md">English</a> | <a href="README.zh.md">中文</a> | <a href="README.ja.md">日本語</a> | <a href="README.ko.md">한국어</a> | <a href="README.es.md">Español</a> | <a href="README.de.md">Deutsch</a>
+</p>
+
+<p align="center">
   <a href="https://librefang.ai/">웹사이트</a> &bull;
   <a href="https://github.com/librefang/librefang">GitHub</a> &bull;
   <a href="GOVERNANCE.md">거버넌스</a> &bull;
