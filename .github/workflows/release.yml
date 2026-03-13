@@ -323,7 +323,12 @@ jobs:
           }
 
           asset_sha() {
-            jq -r --arg name "$1" '.assets[] | select(.name == $name) | (.digest // "" | sub("^sha256:"; ""))' release.json
+            local sha_url
+            sha_url="$(jq -r --arg name "${1}.sha256" '.assets[] | select(.name == $name) | .browser_download_url' release.json)"
+            if [ -z "$sha_url" ] || [ "$sha_url" = "null" ]; then
+              echo "" && return
+            fi
+            curl -fsSL "$sha_url" | awk '{print $1}'
           }
 
           asset_size() {
