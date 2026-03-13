@@ -68,7 +68,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: desktop-${{ matrix.platform.rust_target }}
+          key: desktop-${{ matrix.platform.rust_target }}-${{ github.ref_name }}
 
       - name: Import macOS signing certificate
         if: runner.os == 'macOS'
@@ -95,6 +95,16 @@ jobs:
           echo "Using signing identity: $IDENTITY"
           echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
           rm -f $RUNNER_TEMP/certificate.p12
+
+      - name: Check notarization readiness
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          TEAM_ID: ${{ secrets.MAC_NOTARIZE_TEAM_ID }}
+        run: |
+          if [ -z "$TEAM_ID" ] || [ ${#TEAM_ID} -lt 3 ]; then
+            echo "::warning::MAC_NOTARIZE_TEAM_ID is missing or invalid, falling back to unsigned build"
+            echo "APPLE_SIGNING_IDENTITY=" >> $GITHUB_ENV
+          fi
 
       - name: Build and bundle Tauri desktop app
         if: runner.os != 'macOS' || env.APPLE_SIGNING_IDENTITY == ''
@@ -220,7 +230,7 @@ jobs:
         run: cargo install cross --locked
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cli-${{ matrix.target }}
+          key: cli-${{ matrix.target }}-${{ github.ref_name }}
       - name: Build CLI (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }} --bin librefang
