@@ -188,13 +188,11 @@ $RELEASE_BODY"
         --head "$RELEASE_BRANCH")
 
     echo "→ $PR_URL"
-    echo ""
-    echo "After PR is merged, create the GitHub Release:"
-    echo "  gh release create $TAG --repo librefang/librefang --title 'LibreFang $VERSION' --generate-notes"
 else
     echo ""
     echo "gh CLI not found. Create a PR manually for branch '$RELEASE_BRANCH'."
 fi
 
 echo ""
-echo "Release branch $RELEASE_BRANCH pushed. Merge the PR to complete the release."
+echo "Tag $TAG pushed — release.yml workflow will auto-create the GitHub Release."
+echo "Merge the PR to land the version bump on main."
