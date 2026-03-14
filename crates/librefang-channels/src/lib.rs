@@ -1,54 +1,97 @@
 //! Channel Bridge Layer for the LibreFang Agent OS.
 //!
-//! Provides 40 pluggable messaging integrations that convert platform messages
+//! Provides 40+ pluggable messaging integrations that convert platform messages
 //! into unified `ChannelMessage` events for the kernel.
+//!
+//! Channels are gated behind cargo feature flags (`channel-xxx`).
+//! The `default` feature enables popular channels; use `all-channels` for everything.
 
+// Core infrastructure — always compiled
 pub mod bridge;
-pub mod discord;
-pub mod email;
 pub mod formatter;
-pub mod google_chat;
-pub mod irc;
-pub mod matrix;
-pub mod mattermost;
-pub mod rocketchat;
 pub mod router;
-pub mod signal;
-pub mod slack;
-pub mod teams;
-pub mod telegram;
-pub mod twitch;
 pub mod types;
-pub mod whatsapp;
-pub mod xmpp;
-pub mod zulip;
-// Wave 3 — High-value channels
+
+// Individual channel adapters — feature-gated (alphabetical order)
+#[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
-pub mod feishu;
-pub mod line;
-pub mod mastodon;
-pub mod messenger;
-pub mod reddit;
-pub mod revolt;
-pub mod viber;
-// Wave 4 — Enterprise & community channels
-pub mod flock;
-pub mod guilded;
-pub mod keybase;
-pub mod nextcloud;
-pub mod nostr;
-pub mod pumble;
-pub mod threema;
-pub mod twist;
-pub mod webex;
-// Wave 5 — Niche & differentiating channels
+#[cfg(feature = "channel-dingtalk")]
 pub mod dingtalk;
+#[cfg(feature = "channel-discord")]
+pub mod discord;
+#[cfg(feature = "channel-discourse")]
 pub mod discourse;
+#[cfg(feature = "channel-email")]
+pub mod email;
+#[cfg(feature = "channel-feishu")]
+pub mod feishu;
+#[cfg(feature = "channel-flock")]
+pub mod flock;
+#[cfg(feature = "channel-gitter")]
 pub mod gitter;
+#[cfg(feature = "channel-google-chat")]
+pub mod google_chat;
+#[cfg(feature = "channel-gotify")]
 pub mod gotify;
+#[cfg(feature = "channel-guilded")]
+pub mod guilded;
+#[cfg(feature = "channel-irc")]
+pub mod irc;
+#[cfg(feature = "channel-keybase")]
+pub mod keybase;
+#[cfg(feature = "channel-line")]
+pub mod line;
+#[cfg(feature = "channel-linkedin")]
 pub mod linkedin;
+#[cfg(feature = "channel-mastodon")]
+pub mod mastodon;
+#[cfg(feature = "channel-mattermost")]
+pub mod mattermost;
+#[cfg(feature = "channel-messenger")]
+pub mod messenger;
+#[cfg(feature = "channel-mumble")]
 pub mod mumble;
+#[cfg(feature = "channel-nextcloud")]
+pub mod nextcloud;
+#[cfg(feature = "channel-nostr")]
+pub mod nostr;
+#[cfg(feature = "channel-ntfy")]
 pub mod ntfy;
+#[cfg(feature = "channel-pumble")]
+pub mod pumble;
+#[cfg(feature = "channel-qq")]
 pub mod qq;
+#[cfg(feature = "channel-reddit")]
+pub mod reddit;
+#[cfg(feature = "channel-revolt")]
+pub mod revolt;
+#[cfg(feature = "channel-rocketchat")]
+pub mod rocketchat;
+#[cfg(feature = "channel-signal")]
+pub mod signal;
+#[cfg(feature = "channel-slack")]
+pub mod slack;
+#[cfg(feature = "channel-teams")]
+pub mod teams;
+#[cfg(feature = "channel-telegram")]
+pub mod telegram;
+#[cfg(feature = "channel-threema")]
+pub mod threema;
+#[cfg(feature = "channel-twist")]
+pub mod twist;
+#[cfg(feature = "channel-twitch")]
+pub mod twitch;
+#[cfg(feature = "channel-viber")]
+pub mod viber;
+#[cfg(feature = "channel-webex")]
+pub mod webex;
+#[cfg(feature = "channel-webhook")]
 pub mod webhook;
+#[cfg(feature = "channel-wecom")]
 pub mod wecom;
+#[cfg(feature = "channel-whatsapp")]
+pub mod whatsapp;
+#[cfg(feature = "channel-xmpp")]
+pub mod xmpp;
+#[cfg(feature = "channel-zulip")]
+pub mod zulip;
