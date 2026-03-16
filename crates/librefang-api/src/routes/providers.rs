@@ -324,6 +324,9 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
                     catalog.merge_discovered_models(&p.id, &probe.discovered_models);
                 }
             }
+            if !probe.discovered_model_info.is_empty() {
+                entry["discovered_model_info"] = serde_json::json!(probe.discovered_model_info);
+            }
             if let Some(err) = &probe.error {
                 entry["error"] = serde_json::json!(err);
             }
@@ -958,6 +961,9 @@ pub async fn set_provider_url(
     });
     if !probe.discovered_models.is_empty() {
         resp["discovered_models"] = serde_json::json!(probe.discovered_models);
+    }
+    if !probe.discovered_model_info.is_empty() {
+        resp["discovered_model_info"] = serde_json::json!(probe.discovered_model_info);
     }
 
     (StatusCode::OK, Json(resp))
