@@ -2087,7 +2087,7 @@ system_prompt = "You are a helpful assistant."
         }
 
         // Ephemeral: no tools — prevents side effects (tool writes to memory/disk)
-        let tools = vec![];
+        let tools: Vec<librefang_types::tool::ToolDefinition> = vec![];
         let mut manifest = entry.manifest.clone();
 
         // Reuse the prompt-builder to get a proper system prompt
@@ -2206,6 +2206,7 @@ system_prompt = "You are a helpful assistant."
             None, // no content blocks
             None, // no proactive memory
             None, // no context engine
+            None, // no pending messages
         )
         .await
         .map_err(KernelError::LibreFang)?;

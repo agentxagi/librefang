@@ -1,5 +1,26 @@
 //! Channel configuration, status, and WhatsApp QR flow handlers.
 
+/// 构建 Channel 领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
+    axum::Router::new()
+        .route("/channels", axum::routing::get(list_channels))
+        .route("/channels/{name}", axum::routing::get(get_channel))
+        .route(
+            "/channels/{name}/configure",
+            axum::routing::post(configure_channel).delete(remove_channel),
+        )
+        .route("/channels/{name}/test", axum::routing::post(test_channel))
+        .route("/channels/reload", axum::routing::post(reload_channels))
+        .route(
+            "/channels/whatsapp/qr/start",
+            axum::routing::post(whatsapp_qr_start),
+        )
+        .route(
+            "/channels/whatsapp/qr/status",
+            axum::routing::get(whatsapp_qr_status),
+        )
+}
+
 use super::skills::{
     remove_channel_config, remove_secret_env, upsert_channel_config, validate_env_var,
     write_secret_env,

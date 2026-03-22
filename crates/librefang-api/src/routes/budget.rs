@@ -1,6 +1,24 @@
 //! Budget and usage tracking handlers.
 
 use super::AppState;
+
+/// 构建预算和用量领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        .route("/usage", axum::routing::get(usage_stats))
+        .route("/usage/summary", axum::routing::get(usage_summary))
+        .route("/usage/by-model", axum::routing::get(usage_by_model))
+        .route("/usage/daily", axum::routing::get(usage_daily))
+        .route(
+            "/budget",
+            axum::routing::get(budget_status).put(update_budget),
+        )
+        .route("/budget/agents", axum::routing::get(agent_budget_ranking))
+        .route(
+            "/budget/agents/{id}",
+            axum::routing::get(agent_budget_status).put(update_agent_budget),
+        )
+}
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

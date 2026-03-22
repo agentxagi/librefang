@@ -1,5 +1,50 @@
 //! Model catalog, provider management, and Copilot OAuth handlers.
 
+/// 构建模型/提供者领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
+    axum::Router::new()
+        .route("/models", axum::routing::get(list_models))
+        .route(
+            "/models/aliases",
+            axum::routing::get(list_aliases).post(create_alias),
+        )
+        .route(
+            "/models/aliases/{alias}",
+            axum::routing::delete(delete_alias),
+        )
+        .route("/models/custom", axum::routing::post(add_custom_model))
+        .route(
+            "/models/custom/{*id}",
+            axum::routing::delete(remove_custom_model),
+        )
+        .route("/models/{*id}", axum::routing::get(get_model))
+        .route("/providers", axum::routing::get(list_providers))
+        .route("/catalog/update", axum::routing::post(catalog_update))
+        .route("/catalog/status", axum::routing::get(catalog_status))
+        .route(
+            "/providers/ollama/detect",
+            axum::routing::get(detect_ollama),
+        )
+        .route(
+            "/providers/github-copilot/oauth/start",
+            axum::routing::post(copilot_oauth_start),
+        )
+        .route(
+            "/providers/github-copilot/oauth/poll/{poll_id}",
+            axum::routing::get(copilot_oauth_poll),
+        )
+        .route(
+            "/providers/{name}/key",
+            axum::routing::post(set_provider_key).delete(delete_provider_key),
+        )
+        .route("/providers/{name}/test", axum::routing::post(test_provider))
+        .route(
+            "/providers/{name}/url",
+            axum::routing::put(set_provider_url),
+        )
+        .route("/providers/{name}", axum::routing::get(get_provider))
+}
+
 use super::network::remove_toml_section;
 use super::skills::{remove_secret_env, write_secret_env};
 use super::AppState;

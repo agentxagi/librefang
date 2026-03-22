@@ -1,6 +1,86 @@
 //! Workflow, trigger, schedule, and cron job handlers.
 
 use super::AppState;
+
+/// 构建工作流/触发器/调度/Cron 领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        // 触发器
+        .route(
+            "/triggers",
+            axum::routing::get(list_triggers).post(create_trigger),
+        )
+        .route(
+            "/triggers/{id}",
+            axum::routing::delete(delete_trigger).put(update_trigger),
+        )
+        // 调度
+        .route(
+            "/schedules",
+            axum::routing::get(list_schedules).post(create_schedule),
+        )
+        .route(
+            "/schedules/{id}",
+            axum::routing::get(get_schedule)
+                .delete(delete_schedule)
+                .put(update_schedule),
+        )
+        .route(
+            "/schedules/{id}/run",
+            axum::routing::post(run_schedule),
+        )
+        // 工作流
+        .route(
+            "/workflows",
+            axum::routing::get(list_workflows).post(create_workflow),
+        )
+        .route(
+            "/workflows/{id}",
+            axum::routing::get(get_workflow)
+                .put(update_workflow)
+                .delete(delete_workflow),
+        )
+        .route(
+            "/workflows/{id}/run",
+            axum::routing::post(run_workflow),
+        )
+        .route(
+            "/workflows/{id}/runs",
+            axum::routing::get(list_workflow_runs),
+        )
+        // 工作流模板（与 system.rs 的 agent 模板不同）
+        .route(
+            "/workflow-templates",
+            axum::routing::get(list_workflow_templates),
+        )
+        .route(
+            "/workflow-templates/{id}",
+            axum::routing::get(get_workflow_template),
+        )
+        .route(
+            "/workflow-templates/{id}/instantiate",
+            axum::routing::post(instantiate_template),
+        )
+        // Cron 作业
+        .route(
+            "/cron/jobs",
+            axum::routing::get(list_cron_jobs).post(create_cron_job),
+        )
+        .route(
+            "/cron/jobs/{id}",
+            axum::routing::get(get_cron_job)
+                .delete(delete_cron_job)
+                .put(update_cron_job),
+        )
+        .route(
+            "/cron/jobs/{id}/enable",
+            axum::routing::put(toggle_cron_job),
+        )
+        .route(
+            "/cron/jobs/{id}/status",
+            axum::routing::get(cron_job_status),
+        )
+}
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -1417,7 +1497,7 @@ pub struct TemplateListParams {
         (status = 200, description = "List of workflow templates", body = Vec<serde_json::Value>)
     )
 )]
-pub async fn list_templates(
+pub async fn list_workflow_templates(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TemplateListParams>,
 ) -> impl IntoResponse {
@@ -1469,7 +1549,7 @@ pub async fn list_templates(
         (status = 404, description = "Template not found")
     )
 )]
-pub async fn get_template(
+pub async fn get_workflow_template(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {

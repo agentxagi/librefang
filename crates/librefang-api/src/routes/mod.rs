@@ -1,22 +1,37 @@
 //! Route handlers for the LibreFang API.
 //!
-//! This module is split into domain-specific sub-modules for maintainability.
-//! All public handler functions are re-exported here for backward compatibility.
+//! 每个领域子模块导出一个 `router()` 函数来构建自己的路由树。
+//! `server.rs` 通过 `.merge()` 组合所有子路由器，避免在单一函数中维护数百行路由注册。
+//!
+//! 处理函数仍通过 glob re-export 暴露，以保持 `routes::handler_name` 的向后兼容性
+//! （特别是 openapi.rs 的 utoipa 宏需要此路径格式）。
 
-mod agents;
-mod budget;
-mod channels;
-mod config;
+// 各模块都导出 `router()` 函数，glob re-export 会产生同名歧义，
+// 但 `router()` 只通过限定路径访问（如 `routes::agents::router()`），不会实际冲突。
+#![allow(ambiguous_glob_reexports)]
+
+pub mod agents;
+pub mod budget;
+pub mod channels;
+pub mod config;
 pub mod goals;
-mod memory;
-mod network;
-mod plugins;
-mod providers;
-mod skills;
-mod system;
-mod workflows;
+pub mod memory;
+pub mod network;
+pub mod plugins;
+pub mod providers;
+pub mod skills;
+pub mod system;
+pub mod workflows;
 
-// Re-export everything so `routes::handler_name` still works in server.rs.
+// 通过 glob re-export 保持 `routes::handler_name` 向后兼容
+// （openapi.rs 的 utoipa 宏、ws.rs 等都依赖此路径格式）。
+//
+// 原先 system.rs 和 workflows.rs 都导出了 `list_templates` / `get_template`，
+// 导致 E0659 名称歧义。已将 workflows.rs 中的版本重命名为
+// `list_workflow_templates` / `get_workflow_template` 以消除冲突。
+//
+// 各模块都导出了 `router()` 函数，glob re-export 会产生歧义警告，
+// 但 `router()` 只通过限定路径（如 `routes::agents::router()`）访问，不会实际冲突。
 pub use agents::*;
 pub use budget::*;
 pub use channels::*;

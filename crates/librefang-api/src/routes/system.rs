@@ -2,6 +2,145 @@
 //! bindings, pairing, webhooks, and miscellaneous system handlers.
 
 use super::AppState;
+
+/// 构建系统杂项领域的路由（审计、日志、工具、会话、审批、配对等）。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        // 配置文件与模板
+        .route("/profiles", axum::routing::get(list_profiles))
+        .route("/profiles/{name}", axum::routing::get(get_profile))
+        .route("/templates", axum::routing::get(list_templates))
+        .route("/templates/{name}", axum::routing::get(get_template))
+        // Agent KV 存储
+        .route(
+            "/memory/agents/{id}/kv",
+            axum::routing::get(get_agent_kv),
+        )
+        .route(
+            "/memory/agents/{id}/kv/{key}",
+            axum::routing::get(get_agent_kv_key)
+                .put(set_agent_kv_key)
+                .delete(delete_agent_kv_key),
+        )
+        .route(
+            "/agents/{id}/memory/export",
+            axum::routing::get(export_agent_memory),
+        )
+        .route(
+            "/agents/{id}/memory/import",
+            axum::routing::post(import_agent_memory),
+        )
+        // 审计
+        .route("/audit/recent", axum::routing::get(audit_recent))
+        .route("/audit/verify", axum::routing::get(audit_verify))
+        // 日志流
+        .route("/logs/stream", axum::routing::get(logs_stream))
+        // 工具
+        .route("/tools", axum::routing::get(list_tools))
+        .route("/tools/{name}", axum::routing::get(get_tool))
+        // 会话管理
+        .route("/sessions", axum::routing::get(list_sessions))
+        .route("/sessions/search", axum::routing::get(search_sessions))
+        .route("/sessions/cleanup", axum::routing::post(session_cleanup))
+        .route(
+            "/sessions/{id}",
+            axum::routing::get(get_session).delete(delete_session),
+        )
+        .route(
+            "/sessions/{id}/label",
+            axum::routing::put(set_session_label),
+        )
+        .route(
+            "/agents/{id}/sessions/by-label/{label}",
+            axum::routing::get(find_session_by_label),
+        )
+        // 审批
+        .route(
+            "/approvals",
+            axum::routing::get(list_approvals).post(create_approval),
+        )
+        .route("/approvals/{id}", axum::routing::get(get_approval))
+        .route(
+            "/approvals/{id}/approve",
+            axum::routing::post(approve_request),
+        )
+        .route(
+            "/approvals/{id}/reject",
+            axum::routing::post(reject_request),
+        )
+        // Webhook 触发（外部事件注入）
+        .route("/hooks/wake", axum::routing::post(webhook_wake))
+        .route("/hooks/agent", axum::routing::post(webhook_agent))
+        // 聊天命令端点
+        .route("/commands", axum::routing::get(list_commands))
+        .route("/commands/{name}", axum::routing::get(get_command))
+        // 绑定
+        .route(
+            "/bindings",
+            axum::routing::get(list_bindings).post(add_binding),
+        )
+        .route(
+            "/bindings/{index}",
+            axum::routing::delete(remove_binding),
+        )
+        // 配对
+        .route("/pairing/request", axum::routing::post(pairing_request))
+        .route(
+            "/pairing/complete",
+            axum::routing::post(pairing_complete),
+        )
+        .route("/pairing/devices", axum::routing::get(pairing_devices))
+        .route(
+            "/pairing/devices/{id}",
+            axum::routing::delete(pairing_remove_device),
+        )
+        .route("/pairing/notify", axum::routing::post(pairing_notify))
+        // 备份 / 恢复
+        .route("/backup", axum::routing::post(create_backup))
+        .route("/backups", axum::routing::get(list_backups))
+        .route(
+            "/backups/{filename}",
+            axum::routing::delete(delete_backup),
+        )
+        .route("/restore", axum::routing::post(restore_backup))
+        // 队列状态
+        .route("/queue/status", axum::routing::get(queue_status))
+        // 任务队列管理
+        .route("/tasks/status", axum::routing::get(task_queue_status))
+        .route("/tasks/list", axum::routing::get(task_queue_list))
+        .route(
+            "/tasks/{id}",
+            axum::routing::delete(task_queue_delete),
+        )
+        .route(
+            "/tasks/{id}/retry",
+            axum::routing::post(task_queue_retry),
+        )
+        // 事件 Webhook 订阅
+        .route(
+            "/webhooks/events",
+            axum::routing::get(list_event_webhooks).post(create_event_webhook),
+        )
+        .route(
+            "/webhooks/events/{id}",
+            axum::routing::put(update_event_webhook).delete(delete_event_webhook),
+        )
+        // 出站 Webhook 管理
+        .route(
+            "/webhooks",
+            axum::routing::get(list_webhooks).post(create_webhook),
+        )
+        .route(
+            "/webhooks/{id}",
+            axum::routing::get(get_webhook)
+                .put(update_webhook)
+                .delete(delete_webhook),
+        )
+        .route(
+            "/webhooks/{id}/test",
+            axum::routing::post(test_webhook),
+        )
+}
 use crate::middleware::RequestLanguage;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

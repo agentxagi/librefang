@@ -1,6 +1,25 @@
 //! Health, status, configuration, security, and migration handlers.
 
 use super::AppState;
+
+/// 构建配置/健康/安全/迁移领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(prometheus_metrics))
+        .route("/health", axum::routing::get(health))
+        .route("/health/detail", axum::routing::get(health_detail))
+        .route("/status", axum::routing::get(status))
+        .route("/version", axum::routing::get(version))
+        .route("/config", axum::routing::get(get_config))
+        .route("/config/schema", axum::routing::get(config_schema))
+        .route("/config/set", axum::routing::post(config_set))
+        .route("/config/reload", axum::routing::post(config_reload))
+        .route("/security", axum::routing::get(security_status))
+        .route("/migrate/detect", axum::routing::get(migrate_detect))
+        .route("/migrate/scan", axum::routing::post(migrate_scan))
+        .route("/migrate", axum::routing::post(run_migrate))
+        .route("/shutdown", axum::routing::post(shutdown))
+}
 use crate::types::*;
 use axum::extract::State;
 use axum::http::StatusCode;

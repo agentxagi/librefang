@@ -1,5 +1,117 @@
 //! Skills, marketplace, ClawHub, hands, and extension handlers.
 
+/// 构建技能/市场/Hands/MCP/集成/扩展领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
+    axum::Router::new()
+        // 技能
+        .route("/skills", axum::routing::get(list_skills))
+        .route("/skills/install", axum::routing::post(install_skill))
+        .route("/skills/uninstall", axum::routing::post(uninstall_skill))
+        .route("/skills/create", axum::routing::post(create_skill))
+        // 市场 / ClawHub
+        .route(
+            "/marketplace/search",
+            axum::routing::get(marketplace_search),
+        )
+        .route("/clawhub/search", axum::routing::get(clawhub_search))
+        .route("/clawhub/browse", axum::routing::get(clawhub_browse))
+        .route(
+            "/clawhub/skill/{slug}",
+            axum::routing::get(clawhub_skill_detail),
+        )
+        .route(
+            "/clawhub/skill/{slug}/code",
+            axum::routing::get(clawhub_skill_code),
+        )
+        .route("/clawhub/install", axum::routing::post(clawhub_install))
+        // Hands（浏览器自动化引擎）
+        .route("/hands", axum::routing::get(list_hands))
+        .route("/hands/install", axum::routing::post(install_hand))
+        .route("/hands/active", axum::routing::get(list_active_hands))
+        .route("/hands/{hand_id}", axum::routing::get(get_hand))
+        .route(
+            "/hands/{hand_id}/activate",
+            axum::routing::post(activate_hand),
+        )
+        .route(
+            "/hands/{hand_id}/check-deps",
+            axum::routing::post(check_hand_deps),
+        )
+        .route(
+            "/hands/{hand_id}/install-deps",
+            axum::routing::post(install_hand_deps),
+        )
+        .route(
+            "/hands/{hand_id}/settings",
+            axum::routing::get(get_hand_settings).put(update_hand_settings),
+        )
+        .route(
+            "/hands/instances/{id}/pause",
+            axum::routing::post(pause_hand),
+        )
+        .route(
+            "/hands/instances/{id}/resume",
+            axum::routing::post(resume_hand),
+        )
+        .route(
+            "/hands/instances/{id}",
+            axum::routing::delete(deactivate_hand),
+        )
+        .route(
+            "/hands/instances/{id}/stats",
+            axum::routing::get(hand_stats),
+        )
+        .route(
+            "/hands/instances/{id}/browser",
+            axum::routing::get(hand_instance_browser),
+        )
+        // MCP 服务器管理
+        .route(
+            "/mcp/servers",
+            axum::routing::get(list_mcp_servers).post(add_mcp_server),
+        )
+        .route(
+            "/mcp/servers/{name}",
+            axum::routing::get(get_mcp_server)
+                .put(update_mcp_server)
+                .delete(delete_mcp_server),
+        )
+        // 集成
+        .route("/integrations", axum::routing::get(list_integrations))
+        .route(
+            "/integrations/available",
+            axum::routing::get(list_available_integrations),
+        )
+        .route("/integrations/add", axum::routing::post(add_integration))
+        .route(
+            "/integrations/{id}",
+            axum::routing::get(get_integration).delete(remove_integration),
+        )
+        .route(
+            "/integrations/{id}/reconnect",
+            axum::routing::post(reconnect_integration),
+        )
+        .route(
+            "/integrations/health",
+            axum::routing::get(integrations_health),
+        )
+        .route(
+            "/integrations/reload",
+            axum::routing::post(reload_integrations),
+        )
+        // 扩展
+        .route("/extensions", axum::routing::get(list_extensions))
+        .route(
+            "/extensions/install",
+            axum::routing::post(install_extension),
+        )
+        .route(
+            "/extensions/uninstall",
+            axum::routing::post(uninstall_extension),
+        )
+        .route("/extensions/{name}", axum::routing::get(get_extension))
+}
+
 use super::channels::FieldType;
 use super::config::json_to_toml_value;
 use super::AppState;

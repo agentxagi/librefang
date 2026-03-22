@@ -3,6 +3,77 @@
 use std::sync::Arc;
 
 use super::AppState;
+
+/// 构建内存/KV 领域的路由。
+pub fn router() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        // 全局 proactive memory 端点
+        .route(
+            "/memory",
+            axum::routing::get(memory_list).post(memory_add),
+        )
+        .route("/memory/search", axum::routing::get(memory_search))
+        .route("/memory/stats", axum::routing::get(memory_stats))
+        .route("/memory/cleanup", axum::routing::post(memory_cleanup))
+        .route("/memory/decay", axum::routing::post(memory_decay))
+        .route(
+            "/memory/bulk-delete",
+            axum::routing::post(memory_bulk_delete),
+        )
+        .route(
+            "/memory/items/{memory_id}",
+            axum::routing::put(memory_update).delete(memory_delete),
+        )
+        .route(
+            "/memory/items/{memory_id}/history",
+            axum::routing::get(memory_history),
+        )
+        .route(
+            "/memory/user/{user_id}",
+            axum::routing::get(memory_get_user),
+        )
+        // 每个 agent 的 proactive memory 端点
+        .route(
+            "/memory/agents/{id}",
+            axum::routing::get(memory_list_agent).delete(memory_reset_agent),
+        )
+        .route(
+            "/memory/agents/{id}/search",
+            axum::routing::get(memory_search_agent),
+        )
+        .route(
+            "/memory/agents/{id}/stats",
+            axum::routing::get(memory_stats_agent),
+        )
+        .route(
+            "/memory/agents/{id}/level/{level}",
+            axum::routing::delete(memory_clear_level),
+        )
+        .route(
+            "/memory/agents/{id}/duplicates",
+            axum::routing::get(memory_duplicates),
+        )
+        .route(
+            "/memory/agents/{id}/consolidate",
+            axum::routing::post(memory_consolidate),
+        )
+        .route(
+            "/memory/agents/{id}/count",
+            axum::routing::get(memory_count_agent),
+        )
+        .route(
+            "/memory/agents/{id}/relations",
+            axum::routing::get(memory_query_relations).post(memory_store_relations),
+        )
+        .route(
+            "/memory/agents/{id}/export",
+            axum::routing::get(memory_export_agent),
+        )
+        .route(
+            "/memory/agents/{id}/import",
+            axum::routing::post(memory_import_agent),
+        )
+}
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

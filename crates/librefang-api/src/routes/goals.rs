@@ -1,6 +1,22 @@
 //! Goals endpoints — hierarchical goal tracking with CRUD operations.
 
 use super::AppState;
+
+/// 构建目标管理领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        .route("/goals", axum::routing::get(list_goals).post(create_goal))
+        .route(
+            "/goals/{id}",
+            axum::routing::get(get_goal)
+                .put(update_goal_by_id)
+                .delete(delete_goal),
+        )
+        .route(
+            "/goals/{id}/children",
+            axum::routing::get(get_goal_children),
+        )
+}
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

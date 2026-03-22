@@ -8,6 +8,24 @@ use std::sync::Arc;
 
 use super::AppState;
 
+/// 构建上下文引擎插件领域的路由。
+pub fn router() -> axum::Router<Arc<AppState>> {
+    axum::Router::new()
+        .route(
+            "/plugins/registries",
+            axum::routing::get(list_plugin_registries),
+        )
+        .route("/plugins", axum::routing::get(list_plugins))
+        .route("/plugins/install", axum::routing::post(install_plugin))
+        .route("/plugins/uninstall", axum::routing::post(uninstall_plugin))
+        .route("/plugins/scaffold", axum::routing::post(scaffold_plugin))
+        .route("/plugins/{name}", axum::routing::get(get_plugin))
+        .route(
+            "/plugins/{name}/install-deps",
+            axum::routing::post(install_plugin_deps),
+        )
+}
+
 /// GET /api/plugins — List all installed context engine plugins.
 #[utoipa::path(
     get,

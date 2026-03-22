@@ -1,6 +1,56 @@
 //! Network, peer, A2A protocol, and inter-agent communication handlers.
 
 use super::AppState;
+
+/// 构建网络/对等节点/A2A/通信领域的路由。
+pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        .route("/peers", axum::routing::get(list_peers))
+        .route("/peers/{id}", axum::routing::get(get_peer))
+        .route("/network/status", axum::routing::get(network_status))
+        .route("/comms/topology", axum::routing::get(comms_topology))
+        .route("/comms/events", axum::routing::get(comms_events))
+        .route(
+            "/comms/events/stream",
+            axum::routing::get(comms_events_stream),
+        )
+        .route("/comms/send", axum::routing::post(comms_send))
+        .route("/comms/task", axum::routing::post(comms_task))
+        // 内部管理用 A2A 端点（版本化 API）
+        .route(
+            "/a2a/agents",
+            axum::routing::get(a2a_list_external_agents),
+        )
+        .route(
+            "/a2a/agents/{id}",
+            axum::routing::get(a2a_get_external_agent),
+        )
+        .route(
+            "/a2a/discover",
+            axum::routing::post(a2a_discover_external),
+        )
+        .route("/a2a/send", axum::routing::post(a2a_send_external))
+        .route(
+            "/a2a/tasks/{id}/status",
+            axum::routing::get(a2a_external_task_status),
+        )
+}
+
+/// 构建协议级 A2A 路由（不受版本管理，挂载在根路径）。
+pub fn protocol_router() -> axum::Router<std::sync::Arc<AppState>> {
+    axum::Router::new()
+        .route(
+            "/.well-known/agent.json",
+            axum::routing::get(a2a_agent_card),
+        )
+        .route("/a2a/agents", axum::routing::get(a2a_list_agents))
+        .route("/a2a/tasks/send", axum::routing::post(a2a_send_task))
+        .route("/a2a/tasks/{id}", axum::routing::get(a2a_get_task))
+        .route(
+            "/a2a/tasks/{id}/cancel",
+            axum::routing::post(a2a_cancel_task),
+        )
+}
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
