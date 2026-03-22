@@ -33,6 +33,12 @@ pub struct MockLlmDriver {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     /// 当前回复索引。
     index: Arc<Mutex<usize>>,
+    /// 自定义输入 token 数（默认 10）。
+    input_tokens: u64,
+    /// 自定义输出 token 数（默认 5）。
+    output_tokens: u64,
+    /// 自定义停止原因（默认 EndTurn）。
+    stop_reason: StopReason,
 }
 
 impl MockLlmDriver {
@@ -49,12 +55,41 @@ impl MockLlmDriver {
             responses,
             calls: Arc::new(Mutex::new(Vec::new())),
             index: Arc::new(Mutex::new(0)),
+            input_tokens: 10,
+            output_tokens: 5,
+            stop_reason: StopReason::EndTurn,
         }
     }
 
     /// 创建始终返回同一回复的 mock driver。
     pub fn with_response(response: impl Into<String>) -> Self {
         Self::new(vec![response.into()])
+    }
+
+    /// 设置自定义 token 用量（覆盖默认的 input=10, output=5）。
+    ///
+    /// ```rust
+    /// use librefang_testing::MockLlmDriver;
+    ///
+    /// let driver = MockLlmDriver::with_response("hi").with_tokens(100, 50);
+    /// ```
+    pub fn with_tokens(mut self, input: u64, output: u64) -> Self {
+        self.input_tokens = input;
+        self.output_tokens = output;
+        self
+    }
+
+    /// 设置自定义停止原因（覆盖默认的 EndTurn）。
+    ///
+    /// ```rust
+    /// use librefang_testing::MockLlmDriver;
+    /// use librefang_types::message::StopReason;
+    ///
+    /// let driver = MockLlmDriver::with_response("hi").with_stop_reason(StopReason::MaxTokens);
+    /// ```
+    pub fn with_stop_reason(mut self, reason: StopReason) -> Self {
+        self.stop_reason = reason;
+        self
     }
 
     /// 返回已记录的所有调用。
@@ -101,11 +136,11 @@ impl LlmDriver for MockLlmDriver {
                 text,
                 provider_metadata: None,
             }],
-            stop_reason: StopReason::EndTurn,
+            stop_reason: self.stop_reason,
             tool_calls: vec![],
             usage: TokenUsage {
-                input_tokens: 10,
-                output_tokens: 5,
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             },

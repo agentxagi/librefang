@@ -14,7 +14,8 @@ use tempfile::TempDir;
 ///
 /// # 示例
 ///
-/// ```no_run
+/// ```rust,ignore
+/// // ignore: 需要完整 kernel 启动环境（临时目录、SQLite），详见 tests.rs 中的集成测试
 /// use librefang_testing::TestAppState;
 ///
 /// let test = TestAppState::new();
@@ -47,31 +48,68 @@ impl TestAppState {
         Self { state, _tmp: tmp }
     }
 
-    /// 构建一个包含所有 API 路由的 axum Router（适合测试）。
+    /// 构建一个包含常用 API 路由的 axum Router（适合测试）。
     ///
     /// 返回的 Router 已嵌套在 `/api` 路径下，和生产环境一致。
+    /// 涵盖 agents CRUD、skills、config、memory、budget、system 等主要端点。
     pub fn router(&self) -> Router {
-        // 构建与 server.rs 中 api_v1_routes() 相同的路由树
-        // 这里只包含常用的测试端点，避免引入太多依赖
+        use axum::routing::{get, post, put};
+        use librefang_api::routes;
+
         let api = Router::new()
-            .route("/health", axum::routing::get(librefang_api::routes::health))
-            .route(
-                "/agents",
-                axum::routing::get(librefang_api::routes::list_agents),
-            )
+            // ── 系统端点 ──
+            .route("/health", get(routes::health))
+            .route("/health/detail", get(routes::health_detail))
+            .route("/status", get(routes::status))
+            .route("/version", get(routes::version))
+            .route("/metrics", get(routes::prometheus_metrics))
+            // ── Agents CRUD ──
+            .route("/agents", get(routes::list_agents).post(routes::spawn_agent))
             .route(
                 "/agents/{id}",
-                axum::routing::get(librefang_api::routes::get_agent),
+                get(routes::get_agent)
+                    .delete(routes::kill_agent)
+                    .patch(routes::patch_agent),
             )
-            .route("/status", axum::routing::get(librefang_api::routes::status))
+            .route("/agents/{id}/message", post(routes::send_message))
+            .route("/agents/{id}/stop", post(routes::stop_agent))
+            .route("/agents/{id}/model", put(routes::set_model))
+            .route("/agents/{id}/mode", put(routes::set_agent_mode))
+            .route("/agents/{id}/session", get(routes::get_agent_session))
             .route(
-                "/version",
-                axum::routing::get(librefang_api::routes::version),
+                "/agents/{id}/sessions",
+                get(routes::list_agent_sessions).post(routes::create_agent_session),
             )
-            .route(
-                "/profiles",
-                axum::routing::get(librefang_api::routes::list_profiles),
-            );
+            .route("/agents/{id}/session/reset", post(routes::reset_session))
+            .route("/agents/{id}/tools", get(routes::get_agent_tools).put(routes::set_agent_tools))
+            .route("/agents/{id}/skills", get(routes::get_agent_skills).put(routes::set_agent_skills))
+            .route("/agents/{id}/logs", get(routes::agent_logs))
+            // ── Profiles ──
+            .route("/profiles", get(routes::list_profiles))
+            .route("/profiles/{name}", get(routes::get_profile))
+            // ── Skills ──
+            .route("/skills", get(routes::list_skills))
+            .route("/skills/create", post(routes::create_skill))
+            // ── Config ──
+            .route("/config", get(routes::get_config))
+            .route("/config/schema", get(routes::config_schema))
+            .route("/config/set", post(routes::config_set))
+            .route("/config/reload", post(routes::config_reload))
+            // ── Memory ──
+            .route("/memory/search", get(routes::memory_search))
+            .route("/memory/stats", get(routes::memory_stats))
+            // ── Budget / Usage ──
+            .route("/usage", get(routes::usage_stats))
+            .route("/usage/summary", get(routes::usage_summary))
+            // ── Tools & Commands ──
+            .route("/tools", get(routes::list_tools))
+            .route("/tools/{name}", get(routes::get_tool))
+            .route("/commands", get(routes::list_commands))
+            // ── Models & Providers ──
+            .route("/models", get(routes::list_models))
+            .route("/providers", get(routes::list_providers))
+            // ── Sessions ──
+            .route("/sessions", get(routes::list_sessions));
 
         Router::new()
             .nest("/api", api)

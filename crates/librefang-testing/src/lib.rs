@@ -15,7 +15,7 @@ pub mod mock_kernel;
 pub mod test_app;
 
 pub use helpers::{assert_json_error, assert_json_ok, test_request};
-pub use mock_driver::MockLlmDriver;
+pub use mock_driver::{FailingLlmDriver, MockLlmDriver};
 pub use mock_kernel::MockKernelBuilder;
 pub use test_app::TestAppState;
 

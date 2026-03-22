@@ -14,7 +14,8 @@ use tempfile::TempDir;
 ///
 /// # 示例
 ///
-/// ```no_run
+/// ```rust,ignore
+/// // ignore: 需要完整 kernel 启动环境（临时目录、SQLite），详见 tests.rs 中的集成测试
 /// use librefang_testing::MockKernelBuilder;
 ///
 /// let (kernel, _tmp) = MockKernelBuilder::new().build();
@@ -37,7 +38,8 @@ impl MockKernelBuilder {
 
     /// 设置自定义的 config 修改函数。
     ///
-    /// ```no_run
+    /// ```rust,ignore
+    /// // ignore: 需要完整 kernel 启动环境（临时目录、SQLite），详见 tests.rs 中的集成测试
     /// use librefang_testing::MockKernelBuilder;
     ///
     /// let (kernel, _tmp) = MockKernelBuilder::new()
