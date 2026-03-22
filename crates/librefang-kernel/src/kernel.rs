@@ -2087,7 +2087,7 @@ system_prompt = "You are a helpful assistant."
         }
 
         // Ephemeral: no tools — prevents side effects (tool writes to memory/disk)
-        let tools = vec![];
+        let tools: Vec<librefang_types::tool::ToolDefinition> = vec![];
         let mut manifest = entry.manifest.clone();
 
         // Reuse the prompt-builder to get a proper system prompt
@@ -2206,6 +2206,7 @@ system_prompt = "You are a helpful assistant."
             None, // no content blocks
             None, // no proactive memory
             None, // no context engine
+            None, // no pending messages
         )
         .await
         .map_err(KernelError::LibreFang)?;
@@ -3744,16 +3745,12 @@ system_prompt = "You are a helpful assistant."
     /// picked up between tool calls and interrupt the remaining sequence.
     /// Returns `Ok(true)` if the message was sent, `Ok(false)` if no active
     /// loop is running for this agent, or `Err` if the agent doesn't exist.
-    pub async fn inject_message(
-        &self,
-        agent_id: AgentId,
-        message: &str,
-    ) -> KernelResult<bool> {
+    pub async fn inject_message(&self, agent_id: AgentId, message: &str) -> KernelResult<bool> {
         // Verify the agent exists
         if self.registry.get(agent_id).is_none() {
-            return Err(KernelError::LibreFang(
-                LibreFangError::AgentNotFound(agent_id.to_string()),
-            ));
+            return Err(KernelError::LibreFang(LibreFangError::AgentNotFound(
+                agent_id.to_string(),
+            )));
         }
         if let Some(tx) = self.injection_senders.get(&agent_id) {
             match tx.try_send(message.to_string()) {
@@ -5165,7 +5162,10 @@ system_prompt = "You are a helpful assistant."
         let depth = TRIGGER_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if depth >= MAX_TRIGGER_DEPTH {
             TRIGGER_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            warn!(depth, "Trigger depth limit reached, skipping evaluation to prevent circular chain");
+            warn!(
+                depth,
+                "Trigger depth limit reached, skipping evaluation to prevent circular chain"
+            );
             return vec![];
         }
 
