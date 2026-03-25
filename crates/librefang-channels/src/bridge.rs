@@ -332,6 +332,282 @@ pub trait ChannelBridgeHandle: Send + Sync {
     }
 }
 
+use std::collections::HashMap;
+use std::time::Instant;
+
+struct PendingMessage {
+    message: ChannelMessage,
+    image_blocks: Option<Vec<ContentBlock>>,
+}
+
+struct SenderBuffer {
+    messages: Vec<PendingMessage>,
+    first_arrived: Instant,
+    timer_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct MessageDebouncer {
+    debounce_ms: u64,
+    debounce_max_ms: u64,
+    flush_tx: mpsc::UnboundedSender<String>,
+}
+
+impl MessageDebouncer {
+    fn new(debounce_ms: u64, debounce_max_ms: u64) -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                debounce_ms,
+                debounce_max_ms,
+                flush_tx,
+            },
+            flush_rx,
+        )
+    }
+
+    fn push(
+        &self,
+        key: &str,
+        pending: PendingMessage,
+        buffers: &mut HashMap<String, SenderBuffer>,
+    ) {
+        use std::time::Duration;
+        let debounce_dur = Duration::from_millis(self.debounce_ms);
+        let max_dur = Duration::from_millis(self.debounce_max_ms);
+
+        let buf = buffers
+            .entry(key.to_string())
+            .or_insert_with(|| SenderBuffer {
+                messages: Vec::new(),
+                first_arrived: Instant::now(),
+                timer_handle: None,
+            });
+        buf.messages.push(pending);
+
+        if let Some(handle) = buf.timer_handle.take() {
+            handle.abort();
+        }
+
+        let elapsed = buf.first_arrived.elapsed();
+        if elapsed >= max_dur {
+            let _ = self.flush_tx.send(key.to_string());
+            return;
+        }
+
+        let remaining_cap = max_dur.saturating_sub(elapsed);
+        let delay = debounce_dur.min(remaining_cap);
+        let flush_tx = self.flush_tx.clone();
+        let flush_key = key.to_string();
+        buf.timer_handle = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = flush_tx.send(flush_key);
+        }));
+    }
+
+    fn on_typing(&self, key: &str, is_typing: bool, buffers: &mut HashMap<String, SenderBuffer>) {
+        use std::time::Duration;
+        let Some(buf) = buffers.get_mut(key) else {
+            return;
+        };
+
+        let max_dur = Duration::from_millis(self.debounce_max_ms);
+        let elapsed = buf.first_arrived.elapsed();
+        if elapsed >= max_dur {
+            let _ = self.flush_tx.send(key.to_string());
+            return;
+        }
+
+        if let Some(handle) = buf.timer_handle.take() {
+            handle.abort();
+        }
+
+        if !is_typing {
+            let remaining_cap = max_dur.saturating_sub(elapsed);
+            let delay = Duration::from_millis(self.debounce_ms).min(remaining_cap);
+            let flush_tx = self.flush_tx.clone();
+            let flush_key = key.to_string();
+            buf.timer_handle = Some(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = flush_tx.send(flush_key);
+            }));
+        }
+    }
+
+    fn drain(
+        &self,
+        key: &str,
+        buffers: &mut HashMap<String, SenderBuffer>,
+    ) -> Option<(ChannelMessage, Option<Vec<ContentBlock>>)> {
+        let buf = buffers.remove(key)?;
+        if buf.messages.is_empty() {
+            return None;
+        }
+
+        let mut messages = buf.messages;
+        if messages.len() == 1 {
+            let pm = messages.remove(0);
+            return Some((pm.message, pm.image_blocks));
+        }
+
+        let first = messages.remove(0);
+        let mut merged_msg = first.message;
+        let mut all_blocks: Vec<ContentBlock> = Vec::new();
+
+        if let Some(blocks) = first.image_blocks {
+            all_blocks.extend(blocks);
+        }
+
+        let mut text_parts = vec![content_to_text(&merged_msg.content)];
+
+        for pm in messages {
+            text_parts.push(content_to_text(&pm.message.content));
+            if let Some(blocks) = pm.image_blocks {
+                all_blocks.extend(blocks);
+            }
+        }
+
+        merged_msg.content = ChannelContent::Text(text_parts.join("\n"));
+        let blocks = if all_blocks.is_empty() {
+            None
+        } else {
+            Some(all_blocks)
+        };
+
+        Some((merged_msg, blocks))
+    }
+}
+
+fn content_to_text(content: &ChannelContent) -> String {
+    match content {
+        ChannelContent::Text(t) => t.clone(),
+        ChannelContent::Command { name, args } => {
+            if args.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {}", args.join(" "))
+            }
+        }
+        ChannelContent::Image { url, caption, .. } => match caption {
+            Some(c) => format!("[Photo: {url}]\n{c}"),
+            None => format!("[Photo: {url}]"),
+        },
+        ChannelContent::File { url, filename } => format!("[File ({filename}): {url}]"),
+        ChannelContent::Voice {
+            url,
+            duration_seconds,
+            caption,
+        } => {
+            let cap = caption.as_deref().unwrap_or("");
+            if cap.is_empty() {
+                format!("[Voice message ({duration_seconds}s): {url}]")
+            } else {
+                format!("[Voice message ({duration_seconds}s): {url}] {cap}")
+            }
+        }
+        ChannelContent::Video {
+            url,
+            caption,
+            duration_seconds,
+            ..
+        } => match caption {
+            Some(c) => format!("[Video ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Video ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Location { lat, lon } => format!("[Location: {lat}, {lon}]"),
+        ChannelContent::FileData { filename, .. } => format!("[File: {filename}]"),
+        ChannelContent::Interactive { text, .. } => text.clone(),
+        ChannelContent::ButtonCallback { action, .. } => format!("[Button: {action}]"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_debounced(
+    debouncer: &MessageDebouncer,
+    key: &str,
+    buffers: &mut HashMap<String, SenderBuffer>,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    router: &Arc<AgentRouter>,
+    adapter: &Arc<dyn ChannelAdapter>,
+    rate_limiter: &ChannelRateLimiter,
+    sanitizer: &Arc<InputSanitizer>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) {
+    let Some((merged_msg, blocks)) = debouncer.drain(key, buffers) else {
+        return;
+    };
+
+    let handle = handle.clone();
+    let router = router.clone();
+    let adapter = adapter.clone();
+    let rate_limiter = rate_limiter.clone();
+    let sanitizer = Arc::clone(sanitizer);
+    let sem = semaphore.clone();
+
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if let Some(mut blocks) = blocks {
+            let text = content_to_text(&merged_msg.content);
+            if !text.is_empty() {
+                blocks.insert(
+                    0,
+                    ContentBlock::Text {
+                        text,
+                        provider_metadata: None,
+                    },
+                );
+            }
+
+            let ct_str = channel_type_str(&merged_msg.channel);
+            let overrides = handle
+                .channel_overrides(
+                    ct_str,
+                    merged_msg
+                        .metadata
+                        .get("account_id")
+                        .and_then(|v| v.as_str()),
+                )
+                .await;
+            let channel_default_format = default_output_format_for_channel(ct_str);
+            let output_format = overrides
+                .as_ref()
+                .and_then(|o| o.output_format)
+                .unwrap_or(channel_default_format);
+            let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
+            let thread_id = if threading_enabled {
+                merged_msg.thread_id.as_deref()
+            } else {
+                None
+            };
+
+            dispatch_with_blocks(
+                blocks,
+                &merged_msg,
+                &handle,
+                &router,
+                adapter.as_ref(),
+                ct_str,
+                thread_id,
+                output_format,
+            )
+            .await;
+        } else {
+            dispatch_message(
+                &merged_msg,
+                &handle,
+                &router,
+                adapter.as_ref(),
+                &rate_limiter,
+                &sanitizer,
+            )
+            .await;
+        }
+    });
+}
+
 /// Owns all running channel adapters and dispatches messages to agents.
 pub struct BridgeManager {
     handle: Arc<dyn ChannelBridgeHandle>,
@@ -401,59 +677,134 @@ impl BridgeManager {
         let adapter_clone = adapter.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
-        // Limit concurrent dispatch tasks to prevent unbounded growth.
-        // 32 is generous — most setups have 1-5 concurrent users.
+        let ct_str = channel_type_str(&adapter.channel_type()).to_string();
+        let overrides = handle.channel_overrides(&ct_str, None).await;
+        let debounce_ms = overrides.as_ref().map(|o| o.debounce_ms).unwrap_or(0);
+        let debounce_max_ms = overrides
+            .as_ref()
+            .map(|o| o.debounce_max_ms)
+            .unwrap_or(30000);
+
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
-        let task = tokio::spawn(async move {
-            let mut stream = std::pin::pin!(stream);
-            loop {
-                tokio::select! {
-                    msg = stream.next() => {
-                        match msg {
-                            Some(message) => {
-                                // Spawn each dispatch as a concurrent task so the stream
-                                // loop is never blocked by slow LLM calls. The kernel's
-                                // per-agent lock ensures session integrity.
-                                let handle = handle.clone();
-                                let router = router.clone();
-                                let adapter = adapter_clone.clone();
-                                let rate_limiter = rate_limiter.clone();
-                                let sanitizer = sanitizer.clone();
-                                let sem = semaphore.clone();
-                                tokio::spawn(async move {
-                                    // Acquire semaphore permit (blocks if 32 tasks are in flight).
-                                    let _permit = match sem.acquire().await {
-                                        Ok(p) => p,
-                                        Err(_) => return, // semaphore closed — shutting down
-                                    };
-                                    dispatch_message(
-                                        &message,
-                                        &handle,
-                                        &router,
-                                        adapter.as_ref(),
-                                        &rate_limiter,
-                                        &sanitizer,
-                                    ).await;
-                                });
+        if debounce_ms == 0 {
+            // Fast path: no debouncing (current behavior)
+            let task = tokio::spawn(async move {
+                let mut stream = std::pin::pin!(stream);
+                loop {
+                    tokio::select! {
+                        msg = stream.next() => {
+                            match msg {
+                                Some(message) => {
+                                    let handle = handle.clone();
+                                    let router = router.clone();
+                                    let adapter = adapter_clone.clone();
+                                    let rate_limiter = rate_limiter.clone();
+                                    let sanitizer = sanitizer.clone();
+                                    let sem = semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = match sem.acquire().await {
+                                            Ok(p) => p,
+                                            Err(_) => return,
+                                        };
+                                        dispatch_message(
+                                            &message,
+                                            &handle,
+                                            &router,
+                                            adapter.as_ref(),
+                                            &rate_limiter,
+                                            &sanitizer,
+                                        ).await;
+                                    });
+                                }
+                                None => {
+                                    info!("Channel adapter {} stream ended", adapter_clone.name());
+                                    break;
+                                }
                             }
-                            None => {
-                                info!("Channel adapter {} stream ended", adapter_clone.name());
+                        }
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("Shutting down channel adapter {}", adapter_clone.name());
                                 break;
                             }
                         }
                     }
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            info!("Shutting down channel adapter {}", adapter_clone.name());
-                            break;
+                }
+            });
+            self.tasks.push(task);
+        } else {
+            // Debounce path
+            let (debouncer, mut flush_rx) = MessageDebouncer::new(debounce_ms, debounce_max_ms);
+            let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+
+            let mut typing_rx = adapter_clone.typing_events();
+
+            let task = tokio::spawn(async move {
+                let mut stream = std::pin::pin!(stream);
+                loop {
+                    tokio::select! {
+                        msg = stream.next() => {
+                            match msg {
+                                Some(message) => {
+                                    let sender_key = format!(
+                                        "{}:{}",
+                                        channel_type_str(&message.channel),
+                                        message.sender.platform_id
+                                    );
+
+                                    let image_blocks = if let ChannelContent::Image {
+                                        ref url, ref caption, ref mime_type
+                                    } = message.content {
+                                        match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await {
+                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => Some(blocks),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    let pending = PendingMessage { message, image_blocks };
+                                    debouncer.push(&sender_key, pending, &mut buffers);
+                                }
+                                None => {
+                                    let keys: Vec<String> = buffers.keys().cloned().collect();
+                                    for key in keys {
+                                        flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore);
+                                    }
+                                    info!("Channel adapter {} stream ended", adapter_clone.name());
+                                    break;
+                                }
+                            }
+                        }
+                        Some(event) = async {
+                            match typing_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending::<Option<crate::types::TypingEvent>>().await,
+                            }
+                        } => {
+                            let sender_key = format!("{}:{}", channel_type_str(&event.channel), event.sender.platform_id);
+                            debouncer.on_typing(&sender_key, event.is_typing, &mut buffers);
+                        }
+                        Some(key) = flush_rx.recv() => {
+                            flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore);
+                        }
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                let keys: Vec<String> = buffers.keys().cloned().collect();
+                                for key in keys {
+                                    flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore);
+                                }
+                                info!("Shutting down channel adapter {}", adapter_clone.name());
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
+            self.tasks.push(task);
+        }
 
-        self.tasks.push(task);
         self.adapters.push(adapter);
         Ok(())
     }

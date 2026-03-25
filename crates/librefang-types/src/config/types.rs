@@ -78,6 +78,16 @@ pub struct ChannelOverrides {
     pub usage_footer: Option<UsageFooterMode>,
     /// Typing indicator mode override.
     pub typing_mode: Option<TypingMode>,
+    /// Message debounce window in milliseconds. Default: 0 (disabled).
+    #[serde(default)]
+    pub debounce_ms: u64,
+    /// Maximum time to buffer messages before forcing a dispatch. Default: 30000ms.
+    #[serde(default = "default_debounce_max_ms")]
+    pub debounce_max_ms: u64,
+}
+
+fn default_debounce_max_ms() -> u64 {
+    30000
 }
 
 /// Controls what usage info appears in response footers.
