@@ -385,7 +385,6 @@ impl MessageDebouncer {
         let buf = buffers.entry(key.to_string()).or_insert_with(|| {
             let flush_tx = self.flush_tx.clone();
             let flush_key = key.to_string();
-            let max_dur = max_dur;
             let max_timer_handle = Some(tokio::spawn(async move {
                 tokio::time::sleep(max_dur).await;
                 let _ = flush_tx.send(flush_key);
@@ -551,11 +550,9 @@ fn flush_debounced(
     sanitizer: &Arc<InputSanitizer>,
     semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some((merged_msg, blocks)) = debouncer.drain(key, buffers) else {
-        return None;
-    };
+    let (merged_msg, blocks) = debouncer.drain(key, buffers)?;
 
-    let channel_handle = handle.clone();
+    let channel_handle = (*handle).clone();
     let router = router.clone();
     let adapter = adapter.clone();
     let rate_limiter = rate_limiter.clone();
@@ -605,7 +602,7 @@ fn flush_debounced(
             dispatch_with_blocks(
                 blocks,
                 &merged_msg,
-                &handle,
+                &channel_handle,
                 &router,
                 adapter.as_ref(),
                 ct_str,
@@ -616,7 +613,7 @@ fn flush_debounced(
         } else {
             dispatch_message(
                 &merged_msg,
-                &handle,
+                &channel_handle,
                 &router,
                 adapter.as_ref(),
                 &rate_limiter,
