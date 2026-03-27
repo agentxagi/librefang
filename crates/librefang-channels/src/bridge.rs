@@ -404,6 +404,9 @@ impl MessageDebouncer {
 
         let elapsed = buf.first_arrived.elapsed();
         if elapsed >= max_dur || buf.messages.len() >= self.max_buffer {
+            if let Some(handle) = buf.max_timer_handle.take() {
+                handle.abort();
+            }
             let _ = self.flush_tx.send(key.to_string());
             return;
         }
@@ -460,6 +463,9 @@ impl MessageDebouncer {
         if let Some(handle) = buf.max_timer_handle {
             handle.abort();
         }
+        if let Some(handle) = buf.timer_handle {
+            handle.abort();
+        }
 
         let mut messages = buf.messages;
         if messages.len() == 1 {
@@ -475,16 +481,57 @@ impl MessageDebouncer {
             all_blocks.extend(blocks);
         }
 
-        let mut text_parts = vec![content_to_text(&merged_msg.content)];
+        let first_is_command = matches!(merged_msg.content, ChannelContent::Command { .. });
+        let mut all_commands_same_name: Option<String> = None;
 
-        for pm in messages {
-            text_parts.push(content_to_text(&pm.message.content));
-            if let Some(blocks) = pm.image_blocks {
-                all_blocks.extend(blocks);
+        if first_is_command {
+            if let ChannelContent::Command { name, .. } = &merged_msg.content {
+                all_commands_same_name = Some(name.clone());
             }
         }
 
-        merged_msg.content = ChannelContent::Text(text_parts.join("\n"));
+        for pm in &messages {
+            if let Some(name) = &all_commands_same_name {
+                if let ChannelContent::Command { name: n, .. } = &pm.message.content {
+                    if n != name {
+                        all_commands_same_name = None;
+                        break;
+                    }
+                } else {
+                    all_commands_same_name = None;
+                    break;
+                }
+            }
+        }
+
+        if let Some(command_name) = all_commands_same_name {
+            let mut cmd_args: Vec<String> = Vec::new();
+            if let ChannelContent::Command { args, .. } = &merged_msg.content {
+                cmd_args.extend(args.clone());
+            }
+            for pm in messages {
+                if let ChannelContent::Command { args, .. } = pm.message.content {
+                    cmd_args.extend(args);
+                }
+                if let Some(blocks) = pm.image_blocks {
+                    all_blocks.extend(blocks);
+                }
+            }
+            merged_msg.content = ChannelContent::Command {
+                name: command_name,
+                args: cmd_args,
+            };
+        } else {
+            let mut text_parts = vec![content_to_text(&merged_msg.content)];
+            for pm in messages {
+                text_parts.push(content_to_text(&pm.message.content));
+                if let Some(blocks) = pm.image_blocks {
+                    all_blocks.extend(blocks);
+                }
+            }
+            merged_msg.content = ChannelContent::Text(text_parts.join("\n"));
+        }
+
         let blocks = if all_blocks.is_empty() {
             None
         } else {
