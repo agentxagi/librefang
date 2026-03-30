@@ -1390,6 +1390,7 @@ impl LibreFangKernel {
             vertex_ai: config.vertex_ai.clone(),
             azure_openai: config.azure_openai.clone(),
             skip_permissions: true,
+            message_timeout_secs: config.default_model.message_timeout_secs,
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -1423,6 +1424,7 @@ impl LibreFangKernel {
                     vertex_ai: config.vertex_ai.clone(),
                     azure_openai: config.azure_openai.clone(),
                     skip_permissions: true,
+                    message_timeout_secs: config.default_model.message_timeout_secs,
                 };
                 match drivers::create_driver(&profile_config) {
                     Ok(profile_driver) => {
@@ -1481,6 +1483,7 @@ impl LibreFangKernel {
                             vertex_ai: config.vertex_ai.clone(),
                             azure_openai: config.azure_openai.clone(),
                             skip_permissions: true,
+                            message_timeout_secs: config.default_model.message_timeout_secs,
                         };
                         match drivers::create_driver(&auto_config) {
                             Ok(d) => {
@@ -1529,6 +1532,7 @@ impl LibreFangKernel {
                 vertex_ai: config.vertex_ai.clone(),
                 azure_openai: config.azure_openai.clone(),
                 skip_permissions: true,
+                message_timeout_secs: config.default_model.message_timeout_secs,
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -7596,6 +7600,7 @@ system_prompt = "You are a helpful assistant."
                 vertex_ai: cfg.vertex_ai.clone(),
                 azure_openai: cfg.azure_openai.clone(),
                 skip_permissions: true,
+                message_timeout_secs: cfg.default_model.message_timeout_secs,
             };
 
             match self.driver_cache.get_or_create(&driver_config) {
@@ -7674,6 +7679,7 @@ system_prompt = "You are a helpful assistant."
                     vertex_ai: cfg.vertex_ai.clone(),
                     azure_openai: cfg.azure_openai.clone(),
                     skip_permissions: true,
+                    message_timeout_secs: cfg.default_model.message_timeout_secs,
                 };
                 match self.driver_cache.get_or_create(&config) {
                     Ok(d) => chain.push((d, fb.model.clone())),
@@ -10365,6 +10371,7 @@ mod tests {
             model: "Qwen3.5-4B-MLX-4bit".to_string(),
             api_key_env: String::new(),
             base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            ..Default::default()
         });
 
         let agent_id = kernel
