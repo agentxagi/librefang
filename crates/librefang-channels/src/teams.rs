@@ -295,6 +295,13 @@ impl ChannelAdapter for TeamsAdapter {
         axum::Router,
         Pin<Box<dyn Stream<Item = ChannelMessage> + Send>>,
     )> {
+        // Verify credentials before registering routes
+        if let Err(e) = self.get_token().await {
+            tracing::error!("Teams adapter authentication failed: {e}");
+            return None;
+        }
+        tracing::info!("Teams adapter authenticated (app_id: {})", self.app_id);
+
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
         let tx = Arc::new(tx);
         let app_id = Arc::new(self.app_id.clone());

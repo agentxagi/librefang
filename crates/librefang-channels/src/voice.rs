@@ -627,6 +627,7 @@ impl ChannelAdapter for VoiceAdapter {
         };
 
         self.stats.connected.store(true, Ordering::Relaxed);
+        *self.started_at.lock().await = Some(chrono::Utc::now());
 
         let app = axum::Router::new()
             .route("/ws", axum::routing::get(ws_handler))
