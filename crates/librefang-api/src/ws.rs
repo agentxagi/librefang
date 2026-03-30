@@ -575,9 +575,8 @@ async fn handle_text_message(
                     // Forward stream events to WebSocket with debouncing
                     let sender_stream = Arc::clone(sender);
                     let verbose_clone = Arc::clone(verbose);
-                    let rl = &state.kernel.config_ref().rate_limit;
-                    let debounce_chars = rl.ws_debounce_chars;
-                    let debounce_ms = rl.ws_debounce_ms;
+                    let debounce_chars = state.kernel.config_ref().rate_limit.ws_debounce_chars;
+                    let debounce_ms = state.kernel.config_ref().rate_limit.ws_debounce_ms;
                     let stream_task = tokio::spawn(async move {
                         let mut text_buffer = String::new();
                         let far_future = tokio::time::Instant::now() + Duration::from_secs(86400);

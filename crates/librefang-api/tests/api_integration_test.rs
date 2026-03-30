@@ -478,12 +478,7 @@ async fn test_build_router_unauthorized_responses_include_api_version_header() {
 async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     let harness = start_full_router("").await;
 
-    let source_dir = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("openclaw-source");
+    let source_dir = harness.state.kernel.home_dir().join("openclaw-source");
     std::fs::create_dir_all(&source_dir).unwrap();
     std::fs::write(
         source_dir.join("openclaw.json"),
@@ -526,26 +521,15 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     assert_eq!(json["status"], "completed");
     assert_eq!(json["dry_run"], false);
 
-    let config_path = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("config.toml");
+    let config_path = harness.state.kernel.home_dir().join("config.toml");
     let agent_path = harness
         .state
         .kernel
-        .config_ref()
-        .home_dir
+        .home_dir()
         .join("agents")
         .join("main")
         .join("agent.toml");
-    let report_path = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("migration_report.md");
+    let report_path = harness.state.kernel.home_dir().join("migration_report.md");
 
     assert!(
         config_path.exists(),
@@ -571,27 +555,11 @@ async fn test_config_reload_reports_proxy_changes_require_restart() {
     let table = config.as_table_mut().unwrap();
     table.insert(
         "home_dir".to_string(),
-        toml::Value::String(
-            server
-                .state
-                .kernel
-                .config_ref()
-                .home_dir
-                .display()
-                .to_string(),
-        ),
+        toml::Value::String(server.state.kernel.home_dir().display().to_string()),
     );
     table.insert(
         "data_dir".to_string(),
-        toml::Value::String(
-            server
-                .state
-                .kernel
-                .config_ref()
-                .data_dir
-                .display()
-                .to_string(),
-        ),
+        toml::Value::String(server.state.kernel.data_dir().display().to_string()),
     );
     table.insert(
         "proxy".to_string(),

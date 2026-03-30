@@ -160,7 +160,8 @@ pub(crate) fn dashboard_session_token(kernel: &LibreFangKernel) -> Option<String
 
 pub(crate) fn valid_api_tokens(kernel: &LibreFangKernel) -> Vec<String> {
     let mut tokens = Vec::new();
-    let explicit_api_key = kernel.config_ref().api_key.trim();
+    let cfg = kernel.config_ref();
+    let explicit_api_key = cfg.api_key.trim();
     if !explicit_api_key.is_empty() {
         tokens.push(explicit_api_key.to_string());
     }
@@ -177,7 +178,7 @@ async fn dashboard_login(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let cfg = &state.kernel.config_ref();
+    let cfg = state.kernel.config_snapshot();
     let cfg_user = resolve_dashboard_credential(
         &cfg.dashboard_user,
         "LIBREFANG_DASHBOARD_USER",
@@ -252,7 +253,7 @@ async fn dashboard_login(
 async fn dashboard_auth_check(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
 ) -> axum::response::Json<serde_json::Value> {
-    let cfg = &state.kernel.config_ref();
+    let cfg = state.kernel.config_ref();
     let du = resolve_dashboard_credential(
         &cfg.dashboard_user,
         "LIBREFANG_DASHBOARD_USER",
@@ -288,7 +289,7 @@ async fn change_password(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
     axum::Json(body): axum::Json<ChangePasswordRequest>,
 ) -> axum::response::Response {
-    let cfg = state.kernel.config_ref();
+    let cfg = state.kernel.config_snapshot();
 
     let cfg_user = resolve_dashboard_credential(
         &cfg.dashboard_user,
@@ -471,7 +472,7 @@ pub async fn build_router(
         skillhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
         webhook_store: crate::webhook_store::WebhookStore::load(
-            kernel.config_ref().home_dir.join("webhooks.json"),
+            kernel.home_dir().join("webhooks.json"),
         ),
         active_sessions: active_sessions.clone(),
         media_drivers: librefang_runtime::media::MediaDriverCache::new_with_urls(
@@ -501,7 +502,8 @@ pub async fn build_router(
             }
         }
         // Add explicitly configured CORS origins from config.toml
-        for origin in &state.kernel.config_ref().cors_origin {
+        let cors_cfg = state.kernel.config_ref();
+        for origin in &cors_cfg.cors_origin {
             if let Ok(v) = origin.parse::<axum::http::HeaderValue>() {
                 origins.push(v);
             } else {
@@ -521,7 +523,7 @@ pub async fn build_router(
         api_key_lock: api_key_lock.clone(),
         active_sessions: active_sessions.clone(),
     };
-    let rl_cfg = &state.kernel.config_ref().rate_limit;
+    let rl_cfg = state.kernel.config_ref().rate_limit.clone();
     let gcra_limiter = rate_limiter::GcraState {
         limiter: rate_limiter::create_rate_limiter(rl_cfg.api_requests_per_minute),
         retry_after_secs: rl_cfg.retry_after_secs,
@@ -639,11 +641,11 @@ pub async fn run_daemon(
     // in and the config has `telemetry.enabled = true`.
     #[cfg(feature = "telemetry")]
     if kernel.config_ref().telemetry.enabled {
-        let cfg = &kernel.config_ref().telemetry;
+        let cfg = kernel.config_ref();
         if let Err(e) = crate::telemetry::init_otel_tracing(
-            &cfg.otlp_endpoint,
-            &cfg.service_name,
-            cfg.sample_rate,
+            &cfg.telemetry.otlp_endpoint,
+            &cfg.telemetry.service_name,
+            cfg.telemetry.sample_rate,
         ) {
             tracing::warn!("Failed to initialize OpenTelemetry tracing: {e}");
         }
@@ -659,7 +661,7 @@ pub async fn run_daemon(
     {
         let k = kernel.clone();
         let st = state.clone();
-        let config_path = kernel.config_ref().home_dir.join("config.toml");
+        let config_path = kernel.home_dir().join("config.toml");
         bg_tasks.push(tokio::spawn(async move {
             let mut last_modified = std::fs::metadata(&config_path)
                 .and_then(|m| m.modified())
@@ -777,9 +779,10 @@ pub async fn run_daemon(
         let kernel = state.kernel.clone();
         bg_tasks.push(tokio::spawn(async move {
             loop {
+                let cfg = kernel.config_snapshot();
                 match librefang_runtime::catalog_sync::sync_catalog_to(
-                    &kernel.config_ref().home_dir,
-                    &kernel.config_ref().registry.registry_mirror,
+                    &cfg.home_dir,
+                    &cfg.registry.registry_mirror,
                 )
                 .await
                 {

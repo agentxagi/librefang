@@ -509,7 +509,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 )]
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return a redacted view of the kernel config
-    let config = &state.kernel.config_ref();
+    let config = state.kernel.config_ref();
 
     // -- channels: show which platforms are configured (instance counts), no tokens --
     let channels = {

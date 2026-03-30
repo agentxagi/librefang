@@ -769,6 +769,18 @@ pub async fn mcp_http(
         // Execute the tool via the kernel's tool runner
         let kernel_handle: Arc<dyn librefang_runtime::kernel_handle::KernelHandle> =
             state.kernel.clone() as Arc<dyn librefang_runtime::kernel_handle::KernelHandle>;
+        // Snapshot config before async call — Guard is !Send and cannot cross .await
+        let cfg = state.kernel.config_snapshot();
+        let tts_opt = if cfg.tts.enabled {
+            Some(state.kernel.tts())
+        } else {
+            None
+        };
+        let docker_opt = if cfg.docker.enabled {
+            Some(&cfg.docker)
+        } else {
+            None
+        };
         let result = librefang_runtime::tool_runner::execute_tool(
             "mcp-http",
             tool_name,
@@ -785,16 +797,8 @@ pub async fn mcp_http(
             Some(state.kernel.media()),
             None, // media_drivers
             None, // exec_policy
-            if state.kernel.config_ref().tts.enabled {
-                Some(state.kernel.tts())
-            } else {
-                None
-            },
-            if state.kernel.config_ref().docker.enabled {
-                Some(&state.kernel.config_ref().docker)
-            } else {
-                None
-            },
+            tts_opt,
+            docker_opt,
             Some(state.kernel.processes()),
             None, // sender_id (MCP HTTP has no sender context)
             None, // channel

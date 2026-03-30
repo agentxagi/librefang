@@ -902,6 +902,12 @@ impl LibreFangKernel {
         &self.home_dir_boot
     }
 
+    /// Data directory path (boot-time immutable).
+    #[inline]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir_boot
+    }
+
     /// Default LLM model configuration.
     #[inline]
     pub fn default_model(&self) -> librefang_types::config::DefaultModelConfig {
@@ -3444,6 +3450,9 @@ system_prompt = "You are a helpful assistant."
             let injection_rx = kernel_clone.setup_injection_channel(agent_id);
 
             let start_time = std::time::Instant::now();
+            // Snapshot config for the duration of the agent loop call
+            // (load_full returns Arc so the data stays alive across .await).
+            let loop_cfg = kernel_clone.config.load_full();
             let result = run_agent_loop_streaming(
                 &manifest,
                 &message_owned,
@@ -3462,13 +3471,13 @@ system_prompt = "You are a helpful assistant."
                 Some(&phase_cb),
                 Some(&kernel_clone.media_engine),
                 Some(&kernel_clone.media_drivers),
-                if kernel_clone.config.tts.enabled {
+                if loop_cfg.tts.enabled {
                     Some(&kernel_clone.tts_engine)
                 } else {
                     None
                 },
-                if kernel_clone.config.docker.enabled {
-                    Some(&kernel_clone.config.docker)
+                if loop_cfg.docker.enabled {
+                    Some(&loop_cfg.docker)
                 } else {
                     None
                 },
@@ -3577,7 +3586,8 @@ system_prompt = "You are a helpful assistant."
                         use librefang_runtime::compactor::{
                             estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
                         };
-                        let config = CompactionConfig::from_toml(&kernel_clone.config.compaction);
+                        let compact_cfg = kernel_clone.config.load();
+                        let config = CompactionConfig::from_toml(&compact_cfg.compaction);
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -6350,6 +6360,15 @@ system_prompt = "You are a helpful assistant."
                     info!("Hot-reload: fallback provider chain updated ({count} provider(s))");
                     // Invalidate cached LLM drivers so the new fallback chain
                     // is used when drivers are next constructed.
+                    self.driver_cache.clear();
+                }
+                HotAction::ReloadProviderApiKeys => {
+                    info!("Hot-reload: provider API keys changed — flushing driver cache");
+                    self.driver_cache.clear();
+                }
+                HotAction::ReloadProxy => {
+                    info!("Hot-reload: proxy config changed — reinitializing HTTP proxy env");
+                    librefang_runtime::http_client::init_proxy(new_config.proxy.clone());
                     self.driver_cache.clear();
                 }
             }

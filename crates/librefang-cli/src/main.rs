@@ -2725,10 +2725,11 @@ fn cmd_start(config: Option<PathBuf>, tail: bool, spawned: bool, foreground: boo
             }
         };
 
-        let listen_addr = kernel.config_ref().api_listen.clone();
-        let daemon_info_path = kernel.config_ref().home_dir.join("daemon.json");
-        let provider = kernel.config_ref().default_model.provider.clone();
-        let model = kernel.config_ref().default_model.model.clone();
+        let cfg = kernel.config_ref();
+        let listen_addr = cfg.api_listen.clone();
+        let daemon_info_path = kernel.home_dir().join("daemon.json");
+        let provider = cfg.default_model.provider.clone();
+        let model = cfg.default_model.model.clone();
         let agent_count = kernel.agent_registry().count();
         let model_count = kernel
             .model_catalog_ref()
@@ -3473,6 +3474,7 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
     } else {
         let kernel = boot_kernel(config);
         let agent_count = kernel.agent_registry().count();
+        let cfg = kernel.config_ref();
 
         if json {
             println!(
@@ -3480,9 +3482,9 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "in-process",
                     "agent_count": agent_count,
-                    "data_dir": kernel.config_ref().data_dir.display().to_string(),
-                    "default_provider": kernel.config_ref().default_model.provider,
-                    "default_model": kernel.config_ref().default_model.model,
+                    "data_dir": cfg.data_dir.display().to_string(),
+                    "default_provider": cfg.default_model.provider,
+                    "default_model": cfg.default_model.model,
                     "daemon": false,
                 }))
                 .unwrap_or_default()
@@ -3493,17 +3495,11 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         ui::section(&i18n::t("section-status-inprocess"));
         ui::blank();
         ui::kv(&i18n::t("label-agents"), &agent_count.to_string());
-        ui::kv(
-            &i18n::t("label-provider"),
-            &kernel.config_ref().default_model.provider,
-        );
-        ui::kv(
-            &i18n::t("label-model"),
-            &kernel.config_ref().default_model.model,
-        );
+        ui::kv(&i18n::t("label-provider"), &cfg.default_model.provider);
+        ui::kv(&i18n::t("label-model"), &cfg.default_model.model);
         ui::kv(
             &i18n::t("label-data-dir"),
-            &kernel.config_ref().data_dir.display().to_string(),
+            &cfg.data_dir.display().to_string(),
         );
         ui::kv_warn(
             &i18n::t("label-daemon"),

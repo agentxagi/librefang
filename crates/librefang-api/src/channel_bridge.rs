@@ -527,8 +527,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         // Look for manifest at ~/.librefang/agents/{name}/agent.toml
         let manifest_path = self
             .kernel
-            .config_ref()
-            .home_dir
+            .home_dir()
             .join("agents")
             .join(manifest_name)
             .join("agent.toml");
@@ -1203,7 +1202,8 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         channel_type: &str,
         account_id: Option<&str>,
     ) -> Option<librefang_types::config::ChannelOverrides> {
-        let channels = &self.kernel.config_ref().channels;
+        let cfg = self.kernel.config_ref();
+        let channels = &cfg.channels;
 
         /// Look up channel overrides, preferring the entry whose `account_id`
         /// matches the message's account_id. Falls back to the first entry
@@ -2567,7 +2567,8 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // ── Sidecar channel adapters ───────────────────────────────
-    for sidecar_config in &kernel.config_ref().sidecar_channels {
+    let sidecar_cfg = kernel.config_ref();
+    for sidecar_config in &sidecar_cfg.sidecar_channels {
         info!(
             name = %sidecar_config.name,
             command = %sidecar_config.command,

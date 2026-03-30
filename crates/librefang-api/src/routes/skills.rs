@@ -871,7 +871,7 @@ pub async fn skillhub_skill_detail(
         .join("skillhub");
     let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
 
-    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let is_installed = client.is_installed(&slug, &skills_dir);
 
     match client.get_skill(&slug).await {
@@ -940,7 +940,7 @@ pub async fn skillhub_install(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::types::ClawHubInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let cache_dir = state
         .kernel
         .config_ref()
@@ -1204,6 +1204,7 @@ pub async fn get_hand(
                 .hands()
                 .check_settings_availability(&hand_id, Some(lang))
                 .unwrap_or_default();
+            let dm = state.kernel.config_ref().default_model.clone();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1239,17 +1240,17 @@ pub async fn get_hand(
                             "name": agent_manifest.name,
                             "description": agent_manifest.description,
                             "provider": if agent_manifest.model.provider == "default" {
-                                &state.kernel.config_ref().default_model.provider
+                                &dm.provider
                             } else { &agent_manifest.model.provider },
                             "model": if agent_manifest.model.model == "default" {
-                                &state.kernel.config_ref().default_model.model
+                                &dm.model
                             } else { &agent_manifest.model.model },
                         })
                     } else {
                         serde_json::json!(null)
                     },
                     "agents": def.agents.iter().map(|(role, a)| {
-                        let dm = &state.kernel.config_ref().default_model;
+                        let dm = &dm;
                         let agent_i18n = i18n_entry.and_then(|l| l.agents.get(role.as_str()));
                         let resolved_agent_name = agent_i18n
                             .and_then(|ai| ai.name.as_deref())
@@ -2557,13 +2558,10 @@ pub async fn get_mcp_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Find the configured entry by name
-    let entry = state
-        .kernel
-        .config_ref()
-        .mcp_servers
-        .iter()
-        .find(|s| s.name == name);
+    // Find the configured entry by name — use config_snapshot() because
+    // the result is held across an .await below.
+    let cfg = state.kernel.config_snapshot();
+    let entry = cfg.mcp_servers.iter().find(|s| s.name == name);
 
     let entry = match entry {
         Some(e) => e,
