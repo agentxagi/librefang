@@ -48,11 +48,18 @@ dashboard-build:
 dash:
     cd crates/librefang-api/dashboard && pnpm install && pnpm dev
 
-# Build release CLI and install to ~/.librefang/bin (uses thin LTO to avoid OOM)
+# Build release CLI and install to ~/.librefang/bin
+# On Windows, use: just install-win
 install: dashboard-build
     cargo build --profile release-local -p librefang-cli
-    mkdir -p ~/.librefang/bin
-    cp target/release-local/librefang ~/.librefang/bin/librefang
+    @mkdir -p ~/.librefang/bin
+    @cp -f target/release-local/librefang ~/.librefang/bin/librefang
+
+# Windows-specific install (run in PowerShell or CMD)
+install-win: dashboard-build
+    cargo build --profile release-local -p librefang-cli
+    @if not exist "%USERPROFILE%\.librefang\bin" mkdir "%USERPROFILE%\.librefang\bin"
+    @copy /Y target\release-local\librefang.exe "%USERPROFILE%\.librefang\bin\librefang.exe"
 
 # Remove build artifacts
 clean:
