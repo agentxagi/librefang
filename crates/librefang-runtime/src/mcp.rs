@@ -14,8 +14,7 @@ use librefang_types::config::{
 use librefang_types::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -41,10 +40,13 @@ pub struct McpServerConfig {
     /// the parent environment and pass it through.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Extra HTTP headers to send with every SSE / Streamable-HTTP request.
+    /// Extra HTTP headers to send with Streamable-HTTP requests.
     /// Each entry is `"Header-Name: value"`.  Useful for authentication
     /// (`Authorization: Bearer <token>`), API keys (`X-Api-Key: ...`),
     /// or any custom headers required by a remote MCP server.
+    ///
+    /// **Note:** Only used by the Streamable HTTP (`Http`) transport.
+    /// SSE and Stdio transports ignore this field.
     #[serde(default)]
     pub headers: Vec<String>,
 }
@@ -426,22 +428,37 @@ impl McpConnection {
             if let Some((name, value)) = header_str.split_once(':') {
                 let name = name.trim();
                 let value = value.trim();
-                if let (Ok(hn), Ok(hv)) = (
+                match (
                     HeaderName::from_bytes(name.as_bytes()),
                     HeaderValue::from_str(value),
                 ) {
-                    custom_headers.insert(hn, hv);
+                    (Ok(hn), Ok(hv)) => {
+                        custom_headers.insert(hn, hv);
+                    }
+                    _ => {
+                        warn!(
+                            header = %header_str,
+                            "Skipping malformed MCP header (expected \"Name: value\")"
+                        );
+                    }
                 }
+            } else {
+                warn!(
+                    header = %header_str,
+                    "Skipping MCP header missing colon separator (expected \"Name: value\")"
+                );
             }
         }
 
-        let config = StreamableHttpClientTransportConfig {
-            uri: Arc::from(url),
-            custom_headers,
-            ..Default::default()
-        };
+        let config =
+            StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
 
-        let transport = StreamableHttpClientTransport::from_config(config);
+        // Use the proxy-aware HTTP client so that proxy config is respected,
+        // matching how connect_sse() and connect_http_compat() work.
+        let client = crate::http_client::proxied_client_builder()
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client for Streamable HTTP: {e}"))?;
+        let transport = StreamableHttpClientTransport::with_client(client, config);
 
         let client = ()
             .into_dyn()

@@ -2468,8 +2468,9 @@ pub struct McpServerConfigEntry {
     /// Environment variables to pass through (e.g., ["GITHUB_PERSONAL_ACCESS_TOKEN"]).
     #[serde(default)]
     pub env: Vec<String>,
-    /// Extra HTTP headers for SSE / Streamable-HTTP transports.
+    /// Extra HTTP headers for Streamable-HTTP transport.
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
+    /// Only used by the `Http` transport variant; ignored by SSE and Stdio.
     #[serde(default)]
     pub headers: Vec<String>,
 }
