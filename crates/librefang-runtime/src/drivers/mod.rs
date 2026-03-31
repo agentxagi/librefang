@@ -508,7 +508,7 @@ static PROVIDER_REGISTRY: &[ProviderEntry] = &[
     ProviderEntry {
         name: "zai",
         aliases: &["z.ai"],
-        base_url: "https://api.z.ai/api/paas/v4",
+        base_url: "https://api.z.ai/api/coding/paas/v4",
         api_key_env: "ZHIPU_API_KEY",
         key_required: true,
         api_format: ApiFormat::OpenAI,
@@ -1061,6 +1061,14 @@ mod tests {
         let d = provider_defaults("huggingface").unwrap();
         assert_eq!(d.base_url, "https://api-inference.huggingface.co/v1");
         assert_eq!(d.api_key_env, "HF_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_provider_defaults_zai_uses_coding_plan_endpoint() {
+        let d = provider_defaults("zai").unwrap();
+        assert_eq!(d.base_url, "https://api.z.ai/api/coding/paas/v4");
+        assert_eq!(d.api_key_env, "ZHIPU_API_KEY");
         assert!(d.key_required);
     }
 

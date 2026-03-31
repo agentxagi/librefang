@@ -60,9 +60,9 @@ pub struct ModelRoutingConfig {
 impl Default for ModelRoutingConfig {
     fn default() -> Self {
         Self {
-            simple_model: "claude-haiku-4-5-20251001".to_string(),
-            medium_model: "claude-sonnet-4-20250514".to_string(),
-            complex_model: "claude-sonnet-4-20250514".to_string(),
+            simple_model: "zai/glm-4.7".to_string(),
+            medium_model: "zai/glm-5-turbo".to_string(),
+            complex_model: "zai/glm-5-turbo".to_string(),
             simple_threshold: 100,
             complex_threshold: 500,
         }
@@ -915,6 +915,8 @@ mod tests {
     fn test_model_routing_config_defaults() {
         let cfg = ModelRoutingConfig::default();
         assert!(!cfg.simple_model.is_empty());
+        assert_eq!(cfg.medium_model, "zai/glm-5-turbo");
+        assert_eq!(cfg.complex_model, "zai/glm-5-turbo");
         assert!(cfg.simple_threshold < cfg.complex_threshold);
     }
 
