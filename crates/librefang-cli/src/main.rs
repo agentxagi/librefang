@@ -3,6 +3,7 @@
 //! When a daemon is running (`librefang start`), the CLI talks to it over HTTP.
 //! Otherwise, commands boot an in-process kernel (single-shot mode).
 
+mod desktop_install;
 mod dotenv;
 mod http_client;
 pub mod i18n;
@@ -616,19 +617,29 @@ enum SkillCommands {
     Install {
         /// Skill name, local path, or git URL.
         source: String,
+        /// Install into a specific hand's workspace instead of globally.
+        #[arg(long)]
+        hand: Option<String>,
     },
     /// List installed skills.
     #[command(
-        long_about = "List all skills currently installed in this LibreFang instance.\n\nExamples:\n  librefang skill list"
+        long_about = "List all skills currently installed in this LibreFang instance.\n\nExamples:\n  librefang skill list\n  librefang skill list --hand clip"
     )]
-    List,
+    List {
+        /// List skills installed in a specific hand's workspace.
+        #[arg(long)]
+        hand: Option<String>,
+    },
     /// Remove an installed skill.
     #[command(
-        long_about = "Remove an installed skill by name.\n\nExamples:\n  librefang skill remove web-search"
+        long_about = "Remove an installed skill by name.\n\nExamples:\n  librefang skill remove web-search\n  librefang skill remove web-search --hand clip"
     )]
     Remove {
         /// Skill name.
         name: String,
+        /// Remove from a specific hand's workspace instead of globally.
+        #[arg(long)]
+        hand: Option<String>,
     },
     /// Search FangHub for skills.
     #[command(
@@ -1614,9 +1625,9 @@ fn main() {
         },
         Some(Commands::Migrate(args)) => cmd_migrate(args),
         Some(Commands::Skill(sub)) => match sub {
-            SkillCommands::Install { source } => cmd_skill_install(&source),
-            SkillCommands::List => cmd_skill_list(),
-            SkillCommands::Remove { name } => cmd_skill_remove(&name),
+            SkillCommands::Install { source, hand } => cmd_skill_install(&source, hand.as_deref()),
+            SkillCommands::List { hand } => cmd_skill_list(hand.as_deref()),
+            SkillCommands::Remove { name, hand } => cmd_skill_remove(&name, hand.as_deref()),
             SkillCommands::Search { query } => cmd_skill_search(&query),
             SkillCommands::Test { path, tool, input } => cmd_skill_test(path, tool, input),
             SkillCommands::Publish {
@@ -2027,7 +2038,7 @@ fn cmd_init_upgrade() {
         }
     };
 
-    let existing: toml::Value = match existing_raw.parse() {
+    let existing: toml::Value = match toml::from_str(&existing_raw) {
         Ok(v) => v,
         Err(e) => {
             ui::error(&format!("Failed to parse config.toml: {e}"));
@@ -2038,7 +2049,7 @@ fn cmd_init_upgrade() {
 
     let (provider, api_key_env, model) = detect_best_provider();
     let default_config_str = render_init_default_config(&provider, &model, &api_key_env);
-    let defaults: toml::Value = match default_config_str.parse() {
+    let defaults: toml::Value = match toml::from_str(&default_config_str) {
         Ok(v) => v,
         Err(e) => {
             ui::error(&format!("Failed to parse default config template: {e}"));
@@ -2358,61 +2369,14 @@ fn cmd_init_interactive(librefang_dir: &std::path::Path) {
 
 /// Launch the librefang-desktop Tauri app, connecting to the running daemon.
 fn launch_desktop_app(_librefang_dir: &std::path::Path) {
-    // Look for the desktop binary next to our own executable.
-    let desktop_bin = {
-        let exe = std::env::current_exe().ok();
-        let dir = exe.as_ref().and_then(|e| e.parent());
+    if let Some(path) = desktop_install::find_desktop_binary() {
+        desktop_install::launch(&path);
+        return;
+    }
 
-        #[cfg(windows)]
-        let name = "librefang-desktop.exe";
-        #[cfg(not(windows))]
-        let name = "librefang-desktop";
-
-        dir.map(|d| d.join(name))
-    };
-
-    match desktop_bin {
-        Some(ref path) if path.exists() => {
-            ui::success(&i18n::t("desktop-launching"));
-            match std::process::Command::new(path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    ui::success(&i18n::t("desktop-started"));
-                }
-                Err(e) => {
-                    ui::error(&i18n::t_args(
-                        "desktop-launch-fail",
-                        &[("error", &e.to_string())],
-                    ));
-                    ui::hint(&i18n::t("hint-try-dashboard"));
-                }
-            }
-        }
-        _ => {
-            ui::error(&i18n::t("desktop-not-found"));
-            ui::hint(&i18n::t("hint-install-desktop"));
-            ui::hint(&i18n::t("hint-fallback-web-dashboard"));
-            ui::blank();
-            if let Some(base) = find_daemon() {
-                let url = format!("{base}/");
-                if !open_in_browser(&url) {
-                    // Browser launch failed entirely (e.g., sandbox EPERM,
-                    // no display server, container environment).
-                    ui::hint(&i18n::t("hint-could-not-open-browser"));
-                }
-                // Always print the URL so the user can open it manually,
-                // even when open_in_browser reported success — the spawned
-                // opener may still fail asynchronously.
-                ui::hint(&i18n::t_args("hint-dashboard-url", &[("url", &url)]));
-            } else {
-                ui::hint(&i18n::t("daemon-not-running-start"));
-                ui::hint(&i18n::t("hint-then-open-dashboard"));
-            }
-        }
+    // Not installed — offer to download
+    if let Some(installed) = desktop_install::prompt_and_install() {
+        desktop_install::launch(&installed);
     }
 }
 
@@ -4267,40 +4231,23 @@ fn cmd_doctor(json: bool, repair: bool) {
         }
         let skills_dir = cli_librefang_home().join("skills");
         let mut skill_reg = librefang_skills::registry::SkillRegistry::new(skills_dir.clone());
-        skill_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        let bundled_count = skill_reg.count();
-        if !json {
-            ui::check_ok(&format!("Bundled skills loaded: {bundled_count}"));
-        }
-        checks.push(
-            serde_json::json!({"check": "bundled_skills", "status": "ok", "count": bundled_count}),
-        );
-
-        // Check workspace skills if home dir available
-        if skills_dir.exists() {
-            match skill_reg.load_workspace_skills(&skills_dir) {
-                Ok(_) => {
-                    let total = skill_reg.count();
-                    let ws_count = total.saturating_sub(bundled_count);
-                    if ws_count > 0 {
-                        if !json {
-                            ui::check_ok(&format!("Workspace skills loaded: {ws_count}"));
-                        }
-                        checks.push(serde_json::json!({"check": "workspace_skills", "status": "ok", "count": ws_count}));
-                    }
+        match skill_reg.load_all() {
+            Ok(count) => {
+                if !json {
+                    ui::check_ok(&format!("Skills loaded: {count}"));
                 }
-                Err(e) => {
-                    if !json {
-                        ui::check_warn(&format!("Failed to load workspace skills: {e}"));
-                    }
-                    checks.push(serde_json::json!({"check": "workspace_skills", "status": "warn", "error": e.to_string()}));
+                checks.push(serde_json::json!({"check": "skills", "status": "ok", "count": count}));
+            }
+            Err(e) => {
+                if !json {
+                    ui::check_warn(&format!("Failed to load skills: {e}"));
                 }
+                checks.push(serde_json::json!({"check": "skills", "status": "warn", "error": e.to_string()}));
             }
         }
 
-        // Check for prompt injection issues in skill definitions
-        // Only flag Critical-severity warnings (Warning-level hits are expected
-        // in bundled skills that mention shell commands in educational context).
+        // Check for prompt injection issues in skill definitions.
+        // Only flag Critical-severity warnings.
         let skills = skill_reg.list();
         let mut injection_warnings = 0;
         for skill in &skills {
@@ -4341,7 +4288,8 @@ fn cmd_doctor(json: bool, repair: bool) {
         let librefang_dir = cli_librefang_home();
         let mut ext_registry =
             librefang_extensions::registry::IntegrationRegistry::new(&librefang_dir);
-        ext_registry.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
+        ext_registry
+            .load_templates(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
         let _ = ext_registry.load_installed();
         let template_count = ext_registry.template_count();
         let installed_count = ext_registry.installed_count();
@@ -5030,9 +4978,24 @@ fn cmd_migrate(args: MigrateArgs) {
 // Skill commands
 // ---------------------------------------------------------------------------
 
-fn cmd_skill_install(source: &str) {
+/// Resolve the skills directory: global or per-hand workspace.
+fn resolve_skills_dir(hand: Option<&str>) -> PathBuf {
     let home = librefang_home();
-    let skills_dir = home.join("skills");
+    match hand {
+        None => home.join("skills"),
+        Some(hand_id) => {
+            let hand_dir = home.join("workspaces").join("hands").join(hand_id);
+            if !hand_dir.exists() {
+                eprintln!("Hand '{hand_id}' not found at {}", hand_dir.display());
+                std::process::exit(1);
+            }
+            hand_dir.join("skills")
+        }
+    }
+}
+
+fn cmd_skill_install(source: &str, hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
     std::fs::create_dir_all(&skills_dir).unwrap_or_else(|e| {
         eprintln!("Error creating skills directory: {e}");
         std::process::exit(1);
@@ -5057,7 +5020,14 @@ fn cmd_skill_install(source: &str) {
                             eprintln!("Failed to write manifest: {e}");
                             std::process::exit(1);
                         }
-                        println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        if let Some(h) = hand {
+                            println!(
+                                "Installed OpenClaw skill '{}' to hand '{h}'",
+                                manifest.skill.name
+                            );
+                        } else {
+                            println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Failed to convert OpenClaw skill: {e}");
@@ -5083,10 +5053,17 @@ fn cmd_skill_install(source: &str) {
 
         let dest = skills_dir.join(&manifest.skill.name);
         copy_dir_recursive(&source_path, &dest);
-        println!(
-            "Installed skill: {} v{}",
-            manifest.skill.name, manifest.skill.version
-        );
+        if let Some(h) = hand {
+            println!(
+                "Installed skill '{}' v{} to hand '{h}'",
+                manifest.skill.name, manifest.skill.version
+            );
+        } else {
+            println!(
+                "Installed skill: {} v{}",
+                manifest.skill.name, manifest.skill.version
+            );
+        }
     } else {
         // Remote install from FangHub
         println!("Installing {source} from FangHub...");
@@ -5095,7 +5072,13 @@ fn cmd_skill_install(source: &str) {
             librefang_skills::marketplace::MarketplaceConfig::default(),
         );
         match rt.block_on(client.install(source, &skills_dir)) {
-            Ok(version) => println!("Installed {source} {version}"),
+            Ok(version) => {
+                if let Some(h) = hand {
+                    println!("Installed {source} {version} to hand '{h}'");
+                } else {
+                    println!("Installed {source} {version}");
+                }
+            }
             Err(e) => {
                 eprintln!("Failed to install skill: {e}");
                 std::process::exit(1);
@@ -5104,15 +5087,24 @@ fn cmd_skill_install(source: &str) {
     }
 }
 
-fn cmd_skill_list() {
-    let home = librefang_home();
-    let skills_dir = home.join("skills");
+fn cmd_skill_list(hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
 
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     match registry.load_all() {
-        Ok(0) => println!("No skills installed."),
+        Ok(0) => {
+            if let Some(h) = hand {
+                println!("No skills installed for hand '{h}'.");
+            } else {
+                println!("No skills installed.");
+            }
+        }
         Ok(count) => {
-            println!("{count} skill(s) installed:\n");
+            if let Some(h) = hand {
+                println!("{count} skill(s) installed for hand '{h}':\n");
+            } else {
+                println!("{count} skill(s) installed:\n");
+            }
             println!(
                 "{:<20} {:<10} {:<8} DESCRIPTION",
                 "NAME", "VERSION", "TOOLS"
@@ -5135,14 +5127,19 @@ fn cmd_skill_list() {
     }
 }
 
-fn cmd_skill_remove(name: &str) {
-    let home = librefang_home();
-    let skills_dir = home.join("skills");
+fn cmd_skill_remove(name: &str, hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
 
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     let _ = registry.load_all();
     match registry.remove(name) {
-        Ok(()) => println!("Removed skill: {name}"),
+        Ok(()) => {
+            if let Some(h) = hand {
+                println!("Removed skill '{name}' from hand '{h}'");
+            } else {
+                println!("Removed skill: {name}");
+            }
+        }
         Err(e) => {
             eprintln!("Failed to remove skill: {e}");
             std::process::exit(1);
@@ -6992,7 +6989,7 @@ pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) {
 fn cmd_integration_add(name: &str, key: Option<&str>) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     // Check template exists
@@ -7078,7 +7075,7 @@ fn cmd_integration_add(name: &str, key: Option<&str>) {
 fn cmd_integration_remove(name: &str) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     match librefang_extensions::installer::remove_integration(&mut registry, name) {
@@ -7102,7 +7099,7 @@ fn cmd_integration_remove(name: &str) {
 fn cmd_integrations_list(query: Option<&str>) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     let dotenv_path = home.join(".env");
@@ -9939,23 +9936,20 @@ mod tests {
     }
 
     #[test]
-    fn test_doctor_skill_registry_loads_bundled() {
+    fn test_doctor_skill_registry_loads() {
         let skills_dir = std::env::temp_dir().join("librefang-doctor-test-skills");
         let mut skill_reg = librefang_skills::registry::SkillRegistry::new(skills_dir);
-        let count =
-            skill_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        // Skills are loaded from disk at runtime; count depends on registry files being present
+        let count = skill_reg.load_all().unwrap_or(0);
         assert_eq!(skill_reg.count(), count);
     }
 
     #[test]
-    fn test_doctor_extension_registry_loads_bundled() {
+    fn test_doctor_extension_registry_loads_templates() {
         let tmp = std::env::temp_dir().join("librefang-doctor-test-ext");
         let _ = std::fs::create_dir_all(&tmp);
         let mut ext_reg = librefang_extensions::registry::IntegrationRegistry::new(&tmp);
         let count =
-            ext_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        // Integrations are loaded from disk at runtime; count depends on registry files being present
+            ext_reg.load_templates(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
         assert_eq!(ext_reg.template_count(), count);
     }
 
