@@ -3917,7 +3917,13 @@ after_turn = "hooks/after_turn.py"
                 after_turn: Some("hooks/after_turn.py".to_string()), // missing
                 ..Default::default()
             },
-            ..Default::default()
+            description: None,
+            author: None,
+            requirements: None,
+            env: std::collections::HashMap::new(),
+            librefang_min_version: None,
+            integrity: std::collections::HashMap::new(),
+            plugin_depends: Vec::new(),
         };
 
         assert!(!check_hooks_exist(&plugin_dir, &manifest));
@@ -3934,7 +3940,13 @@ after_turn = "hooks/after_turn.py"
                 ingest: Some("../../etc/passwd".to_string()),
                 ..Default::default()
             },
-            ..Default::default()
+            description: None,
+            author: None,
+            requirements: None,
+            env: std::collections::HashMap::new(),
+            librefang_min_version: None,
+            integrity: std::collections::HashMap::new(),
+            plugin_depends: Vec::new(),
         };
         assert!(!check_hooks_exist(&plugin_dir, &manifest_escape));
     }

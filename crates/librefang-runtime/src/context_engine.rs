@@ -1449,7 +1449,7 @@ impl ScriptableContextEngine {
             &self.compact_script,
             &self.on_event_script,
         ];
-        for script in hooks.iter().copied().flatten() {
+        for script in hooks.iter().filter_map(|opt| opt.as_deref()) {
             let resolved = Self::resolve_script_path(script);
             self.process_pool.evict(&resolved).await;
         }
@@ -4249,8 +4249,8 @@ print(json.dumps({"type": payload.get("type"), "message": payload.get("message")
             &hook_schemas,
             None,
             None,
-            "test",
-            "test-correlation-id",
+            "",
+            "",
             false,
         )
         .await
