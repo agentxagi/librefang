@@ -623,6 +623,16 @@ export function ChannelsPage() {
   const configuredCount = useMemo(() => channels.filter(c => c.configured).length, [channels]);
   const unconfiguredCount = useMemo(() => channels.filter(c => !c.configured).length, [channels]);
 
+  // Auto-switch to "unconfigured" tab when no channels are configured,
+  // so new users see the setup buttons instead of an empty page.
+  const hasInitTab = useRef(false);
+  useEffect(() => {
+    if (!hasInitTab.current && channels.length > 0) {
+      hasInitTab.current = true;
+      if (configuredCount === 0) setActiveTab("unconfigured");
+    }
+  }, [channels.length, configuredCount]);
+
   // Filter, search, and sort
   const filteredChannels = useMemo(
     () => [...channels]
