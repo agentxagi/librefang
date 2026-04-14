@@ -1612,7 +1612,8 @@ export function ChatPage() {
           )}
 
           {/* Message area */}
-          <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 sm:space-y-6 scrollbar-thin">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6 scrollbar-thin">
+            <div className="w-full space-y-4 sm:space-y-6">
             {!selectedAgentId ? (
               <div className="h-full flex flex-col items-center justify-center text-center relative">
                 <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-main/50" />
@@ -1655,6 +1656,7 @@ export function ChatPage() {
                 <div ref={messagesEndRef} />
               </div>
             )}
+            </div>
           </div>
 
           {/* Input area */}
