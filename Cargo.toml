@@ -14,6 +14,7 @@ members = [
     "crates/librefang-wire",
     "crates/librefang-api",
     "crates/librefang-kernel",
+    "crates/librefang-kernel-router",
     "crates/librefang-kernel-metering",
     "crates/librefang-cli",
     "crates/librefang-channels",
