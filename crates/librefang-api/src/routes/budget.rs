@@ -55,6 +55,7 @@ pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
             serde_json::json!({
                 "agent_id": e.id.to_string(),
                 "name": e.name,
+                "is_hand": e.is_hand,
                 "total_tokens": summary.total_input_tokens + summary.total_output_tokens,
                 "input_tokens": summary.total_input_tokens,
                 "output_tokens": summary.total_output_tokens,
@@ -334,8 +335,8 @@ pub async fn agent_budget_status(
             },
             "tokens": {
                 "used": tokens_used,
-                "limit": quota.max_llm_tokens_per_hour,
-                "pct": if quota.max_llm_tokens_per_hour > 0 { tokens_used as f64 / quota.max_llm_tokens_per_hour as f64 } else { 0.0 },
+                "limit": quota.effective_token_limit(),
+                "pct": if quota.effective_token_limit() > 0 { tokens_used as f64 / quota.effective_token_limit() as f64 } else { 0.0 },
             },
         })),
     )
@@ -369,7 +370,7 @@ pub async fn agent_budget_ranking(State(state): State<Arc<AppState>>) -> impl In
                     "hourly_limit": entry.manifest.resources.max_cost_per_hour_usd,
                     "daily_limit": entry.manifest.resources.max_cost_per_day_usd,
                     "monthly_limit": entry.manifest.resources.max_cost_per_month_usd,
-                    "max_llm_tokens_per_hour": entry.manifest.resources.max_llm_tokens_per_hour,
+                    "max_llm_tokens_per_hour": entry.manifest.resources.effective_token_limit(),
                 }))
             } else {
                 None

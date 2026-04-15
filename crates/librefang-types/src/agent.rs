@@ -127,9 +127,10 @@ pub enum HookEvent {
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
-    /// A fixed namespace UUID for deriving deterministic hand-agent IDs.
-    /// Generated once via UUID v4; never changes.
-    const HAND_NAMESPACE: Uuid = Uuid::from_bytes([
+    /// Fixed namespace UUID for all deterministic agent ID derivation.
+    /// Uses a single namespace with typed prefixes to avoid collisions
+    /// between agents, hands, and hand-roles sharing the same name.
+    const NAMESPACE: Uuid = Uuid::from_bytes([
         0x9b, 0x6a, 0xe3, 0x2d, 0x7a, 0x4f, 0x4c, 0x1e, 0x8d, 0x0f, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5,
         0xf6,
     ]);
@@ -139,12 +140,25 @@ impl AgentId {
         Self(Uuid::new_v4())
     }
 
-    /// Generate a deterministic AgentId for a hand agent.
+    /// Generate a deterministic AgentId from an agent name.
     ///
-    /// Uses UUID v5 (SHA-1) with a fixed namespace so the same `hand_id`
+    /// Uses UUID v5 (SHA-1) so the same agent name always produces the same
+    /// ID across daemon restarts, preserving session history associations.
+    pub fn from_name(name: &str) -> Self {
+        Self(Uuid::new_v5(
+            &Self::NAMESPACE,
+            format!("agent:{name}").as_bytes(),
+        ))
+    }
+
+    /// Generate a deterministic AgentId for a hand.
+    ///
+    /// Uses UUID v5 with a `hand:` prefix so the same `hand_id`
     /// always maps to the same UUID across daemon restarts.
     pub fn from_hand_id(hand_id: &str) -> Self {
-        Self(Uuid::new_v5(&Self::HAND_NAMESPACE, hand_id.as_bytes()))
+        // Backward compat: existing hands used bare hand_id without prefix.
+        // Keep the same input to preserve existing IDs.
+        Self(Uuid::new_v5(&Self::NAMESPACE, hand_id.as_bytes()))
     }
 
     /// Generate a deterministic agent ID for a specific role within a multi-agent hand instance.
@@ -159,7 +173,7 @@ impl AgentId {
             Some(id) => format!("{hand_id}:{role}:{id}"),
             None => format!("{hand_id}:{role}"),
         };
-        Self(Uuid::new_v5(&Self::HAND_NAMESPACE, input.as_bytes()))
+        Self(Uuid::new_v5(&Self::NAMESPACE, input.as_bytes()))
     }
 }
 
@@ -187,10 +201,30 @@ impl std::str::FromStr for AgentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
 
+/// Fixed UUID v5 namespace for deriving per-channel session IDs.
+/// Generated once via `uuidgen`, never changes — ensures deterministic session
+/// keys across restarts. Intentionally NOT an RFC 4122 well-known namespace
+/// (DNS/URL/OID/X500) to avoid collisions with other UUID v5 consumers.
+const CHANNEL_SESSION_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0xa3, 0x4e, 0x7c, 0x01, 0x8f, 0x2b, 0x4d, 0x6a, 0x91, 0x5c, 0xd7, 0x3e, 0xf4, 0x0a, 0xb8, 0x52,
+]);
+
 impl SessionId {
     /// Create a new random SessionId.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Derive a deterministic session ID from an agent ID and channel name.
+    ///
+    /// Uses UUID v5 (SHA-1 based) so the same `(agent_id, channel)` pair always
+    /// produces the same `SessionId`, even across process restarts.
+    pub fn for_channel(agent_id: AgentId, channel: &str) -> Self {
+        let name = format!("{}:{}", agent_id.0, channel.to_lowercase());
+        Self(uuid::Uuid::new_v5(
+            &CHANNEL_SESSION_NAMESPACE,
+            name.as_bytes(),
+        ))
     }
 }
 
@@ -204,6 +238,38 @@ impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// How sessions are resolved for non-channel (automated) invocations.
+///
+/// Controls whether background ticks, triggers, and `agent_send` calls
+/// reuse the agent's persistent session or create a fresh one each time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Reuse the agent's persistent session (default, backward-compatible).
+    #[default]
+    Persistent,
+    /// Create a fresh session for each invocation.
+    New,
+}
+
+/// Web search augmentation mode.
+///
+/// Controls whether the agent loop automatically searches the web using the
+/// user's message and injects results into the LLM context before the call.
+/// This enables models that don't support tool/function calling (e.g. Ollama
+/// Gemma4) to benefit from web search without needing to invoke the `web_search` tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchAugmentationMode {
+    /// Disabled.
+    Off,
+    /// Augment only when the model catalog reports `supports_tools == false` (default).
+    #[default]
+    Auto,
+    /// Always search the web before every LLM call.
+    Always,
 }
 
 /// The current lifecycle state of an agent.
@@ -279,7 +345,7 @@ pub enum ScheduleMode {
 }
 
 fn default_check_interval() -> u64 {
-    60
+    300
 }
 
 /// Resource limits for an agent.
@@ -293,7 +359,12 @@ pub struct ResourceQuota {
     /// Maximum tool calls per minute.
     pub max_tool_calls_per_minute: u32,
     /// Maximum LLM tokens per hour.
-    pub max_llm_tokens_per_hour: u64,
+    ///
+    /// - `None` = not configured (inherit global default from `[budget]`).
+    /// - `Some(0)` = explicitly unlimited.
+    /// - `Some(n)` = limit to `n` tokens per hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_llm_tokens_per_hour: Option<u64>,
     /// Maximum network bytes per hour.
     pub max_network_bytes_per_hour: u64,
     /// Maximum cost in USD per hour.
@@ -310,12 +381,25 @@ impl Default for ResourceQuota {
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_time_ms: 30_000,             // 30 seconds
             max_tool_calls_per_minute: 60,
-            max_llm_tokens_per_hour: 0, // unlimited by default
+            max_llm_tokens_per_hour: None, // inherit global default
             max_network_bytes_per_hour: 100 * 1024 * 1024, // 100 MB
-            max_cost_per_hour_usd: 0.0, // unlimited by default
-            max_cost_per_day_usd: 0.0,  // unlimited
-            max_cost_per_month_usd: 0.0, // unlimited
+            max_cost_per_hour_usd: 0.0,    // unlimited by default
+            max_cost_per_day_usd: 0.0,     // unlimited
+            max_cost_per_month_usd: 0.0,   // unlimited
         }
+    }
+}
+
+impl ResourceQuota {
+    /// Return the effective hourly token limit as a plain `u64`.
+    ///
+    /// * `None` and `Some(0)` both yield `0` (unlimited).
+    /// * `Some(n)` yields `n`.
+    ///
+    /// Callers that enforce the limit should skip enforcement when the
+    /// returned value is `0`.
+    pub fn effective_token_limit(&self) -> u64 {
+        self.max_llm_tokens_per_hour.unwrap_or(0)
     }
 }
 
@@ -363,6 +447,7 @@ impl ToolProfile {
             Self::Messaging => vec![
                 "agent_send",
                 "agent_list",
+                "channel_send",
                 "memory_store",
                 "memory_list",
                 "memory_recall",
@@ -376,6 +461,7 @@ impl ToolProfile {
                 "web_search",
                 "agent_send",
                 "agent_list",
+                "channel_send",
                 "memory_store",
                 "memory_list",
                 "memory_recall",
@@ -431,6 +517,16 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Provider-specific extension parameters that are flattened directly
+    /// into the API request body.
+    ///
+    /// For example, Qwen 3.6's `enable_memory` parameter for agent memory
+    /// support. When serialized, these keys are merged into the top-level
+    /// API request body via `#[serde(flatten)]`. If a key conflicts with a
+    /// standard field (e.g. `temperature`), the `extra_params` value takes
+    /// precedence because it is serialized last.
+    #[serde(default, flatten)]
+    pub extra_params: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for ModelConfig {
@@ -443,12 +539,14 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            extra_params: std::collections::HashMap::new(),
         }
     }
 }
 
 /// A fallback model entry in a chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FallbackModel {
     pub provider: String,
     pub model: String,
@@ -456,6 +554,10 @@ pub struct FallbackModel {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Provider-specific extension parameters that are flattened directly
+    /// into the API request body.
+    #[serde(default, flatten)]
+    pub extra_params: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Tool configuration within an agent manifest.
@@ -481,6 +583,11 @@ pub struct AgentManifest {
     pub module: String,
     /// Scheduling mode.
     pub schedule: ScheduleMode,
+    /// Session mode for automated (non-channel) invocations.
+    /// Controls whether background ticks, triggers, and `agent_send` calls
+    /// reuse the agent's persistent session or create a fresh one.
+    #[serde(default)]
+    pub session_mode: SessionMode,
     /// LLM model configuration.
     pub model: ModelConfig,
     /// Fallback model chain — tried in order if the primary model fails.
@@ -570,6 +677,15 @@ pub struct AgentManifest {
     /// global ones within each position group.
     #[serde(default)]
     pub context_injection: Vec<crate::config::ContextInjection>,
+    /// Whether this agent was spawned by a Hand. Persisted in the manifest so
+    /// it survives restarts without requiring tag-based detection.
+    #[serde(default)]
+    pub is_hand: bool,
+    /// Web search augmentation mode — automatically search the web using the
+    /// user's message and inject results into the LLM context before the call.
+    /// Useful for models that don't support tool/function calling (e.g. Ollama).
+    #[serde(default)]
+    pub web_search_augmentation: WebSearchAugmentationMode,
 }
 
 fn default_true() -> bool {
@@ -585,6 +701,7 @@ impl Default for AgentManifest {
             author: String::new(),
             module: "builtin:chat".to_string(),
             schedule: ScheduleMode::default(),
+            session_mode: SessionMode::default(),
             model: ModelConfig::default(),
             fallback_models: Vec::new(),
             resources: ResourceQuota::default(),
@@ -612,6 +729,8 @@ impl Default for AgentManifest {
             inherit_parent_context: true,
             thinking: None,
             context_injection: Vec::new(),
+            is_hand: false,
+            web_search_augmentation: WebSearchAugmentationMode::default(),
         }
     }
 }
@@ -740,6 +859,9 @@ pub struct AgentEntry {
     /// When onboarding was completed.
     #[serde(default)]
     pub onboarding_completed_at: Option<DateTime<Utc>>,
+    /// Whether this agent was spawned by a Hand (true) or is a regular agent (false).
+    #[serde(default)]
+    pub is_hand: bool,
 }
 
 /// A stored prompt version for an agent.
@@ -1011,14 +1133,16 @@ mod tests {
     fn test_tool_profile_messaging() {
         let tools = ToolProfile::Messaging.tools();
         assert!(tools.contains(&"agent_send".to_string()));
+        assert!(tools.contains(&"channel_send".to_string()));
         assert!(tools.contains(&"memory_recall".to_string()));
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
-        assert_eq!(tools.len(), 11);
+        assert!(tools.contains(&"channel_send".to_string()));
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -1164,6 +1288,7 @@ mod tests {
             model: "llama-3.3-70b".to_string(),
             api_key_env: Some("GROQ_API_KEY".to_string()),
             base_url: None,
+            extra_params: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&fb).unwrap();
         let back: FallbackModel = serde_json::from_str(&json).unwrap();
@@ -1181,6 +1306,7 @@ mod tests {
                 model: "llama-3.3-70b".to_string(),
                 api_key_env: None,
                 base_url: None,
+                extra_params: std::collections::HashMap::new(),
             }],
             ..Default::default()
         };
@@ -1208,6 +1334,7 @@ mod tests {
             identity: AgentIdentity::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
@@ -1271,6 +1398,7 @@ mod tests {
             },
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
@@ -1592,5 +1720,98 @@ model = "llama-3.3-70b-versatile"
         let resolved = manifest.thinking.clone().unwrap_or(global);
         assert_eq!(resolved.budget_tokens, 5_000);
         assert!(resolved.stream_thinking);
+    }
+
+    #[test]
+    fn test_model_config_extra_params_roundtrip() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("enable_memory".to_string(), serde_json::json!(true));
+        extra.insert("memory_max_window".to_string(), serde_json::json!(50));
+
+        let config = ModelConfig {
+            provider: "qwen".to_string(),
+            model: "qwen3.6".to_string(),
+            max_tokens: 4096,
+            temperature: 0.7,
+            system_prompt: "test".to_string(),
+            api_key_env: None,
+            base_url: None,
+            extra_params: extra,
+        };
+
+        // Serialize to TOML
+        let toml_str = toml::to_string(&config).unwrap();
+        assert!(toml_str.contains("enable_memory = true"));
+        assert!(toml_str.contains("memory_max_window = 50"));
+
+        // Deserialize back
+        let parsed: ModelConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.extra_params.get("enable_memory").unwrap(),
+            &serde_json::json!(true)
+        );
+        assert_eq!(
+            parsed.extra_params.get("memory_max_window").unwrap(),
+            &serde_json::json!(50)
+        );
+    }
+
+    #[test]
+    fn test_model_config_extra_params_empty_by_default() {
+        let config = ModelConfig::default();
+        assert!(config.extra_params.is_empty());
+    }
+
+    #[test]
+    fn test_session_id_for_channel_deterministic() {
+        let agent = AgentId(uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let s1 = SessionId::for_channel(agent, "telegram");
+        let s2 = SessionId::for_channel(agent, "telegram");
+        assert_eq!(
+            s1, s2,
+            "Same (agent, channel) must produce identical SessionId"
+        );
+    }
+
+    #[test]
+    fn test_session_id_for_channel_differs_by_channel() {
+        let agent = AgentId(uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let telegram = SessionId::for_channel(agent, "telegram");
+        let whatsapp = SessionId::for_channel(agent, "whatsapp");
+        assert_ne!(
+            telegram, whatsapp,
+            "Different channels must produce different SessionIds"
+        );
+    }
+
+    #[test]
+    fn test_session_id_for_channel_differs_by_agent() {
+        let agent_a =
+            AgentId(uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let agent_b =
+            AgentId(uuid::Uuid::parse_str("f1f2f3f4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let sa = SessionId::for_channel(agent_a, "telegram");
+        let sb = SessionId::for_channel(agent_b, "telegram");
+        assert_ne!(
+            sa, sb,
+            "Different agents must produce different SessionIds for same channel"
+        );
+    }
+
+    #[test]
+    fn test_session_id_for_channel_cron_distinct() {
+        let agent = AgentId(uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let cron = SessionId::for_channel(agent, "cron");
+        let telegram = SessionId::for_channel(agent, "telegram");
+        let whatsapp = SessionId::for_channel(agent, "whatsapp");
+        assert_ne!(cron, telegram, "Cron session must differ from telegram");
+        assert_ne!(cron, whatsapp, "Cron session must differ from whatsapp");
+    }
+
+    #[test]
+    fn test_session_id_for_channel_is_uuid_v5() {
+        let agent = AgentId(uuid::Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap());
+        let sid = SessionId::for_channel(agent, "telegram");
+        assert_eq!(sid.0.get_version_num(), 5, "SessionId must be UUID v5");
     }
 }

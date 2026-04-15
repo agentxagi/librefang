@@ -1,18 +1,33 @@
 import { Link, Outlet } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Globe, Sun, Moon, Search, ChevronLeft, ChevronRight, ChevronDown, Menu, Home, Layers, MessageCircle, Clock, CheckCircle, Calendar, Shield, Users, User, Server, Network, Bell, Hand, BarChart3, Database, Activity, FileText, Settings, Puzzle, Cpu, Lock, Share2, Gauge, LogOut, UserCircle } from "lucide-react";
+import { Globe, Sun, Moon, Search, ChevronLeft, ChevronRight, ChevronDown, Menu, Home, Layers, MessageCircle, CheckCircle, Calendar, Shield, Users, User, Server, Network, Bell, Hand, BarChart3, Database, Activity, FileText, Settings, Puzzle, Cpu, Lock, Share2, Gauge, LogOut, UserCircle, X, Sparkles, Terminal, Plug } from "lucide-react";
 import { useUIStore } from "./lib/store";
 import { CommandPalette, useCommandPalette } from "./components/ui/CommandPalette";
-import { checkDashboardAuthMode, clearApiKey, dashboardLogin, getVersionInfo, setApiKey, setOnUnauthorized, verifyStoredAuth, type AuthMode } from "./api";
+import { ShortcutsHelp } from "./components/ui/ShortcutsHelp";
+import { useKeyboardShortcuts } from "./lib/useKeyboardShortcuts";
+import { changePassword, checkDashboardAuthMode, clearApiKey, dashboardLogin, getDashboardUsername, getStatus, getVersionInfo, setApiKey, setOnUnauthorized, verifyStoredAuth, type AuthMode } from "./api";
+import { NotificationCenter } from "./components/NotificationCenter";
 
 function AuthDialog({ mode, onAuthenticated }: { mode: AuthMode; onAuthenticated: () => void }) {
   const { t } = useTranslation();
   const [key, setKey] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [errorKey, setErrorKey] = useState<"invalid_api_key" | "invalid_credentials" | null>(null);
+  const [authMethod, setAuthMethod] = useState<"credentials" | "api_key">(
+    mode === "api_key" ? "api_key" : "credentials",
+  );
+  const [errorKey, setErrorKey] = useState<"invalid_api_key" | "invalid_credentials" | "invalid_totp" | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [totpRequired, setTotpRequired] = useState(false);
+  const [totpCode, setTotpCode] = useState("");
+
+  useEffect(() => {
+    setAuthMethod(mode === "api_key" ? "api_key" : "credentials");
+    setErrorKey(null);
+    setTotpRequired(false);
+    setTotpCode("");
+  }, [mode]);
 
   async function handleApiKeySubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -44,27 +59,44 @@ function AuthDialog({ mode, onAuthenticated }: { mode: AuthMode; onAuthenticated
     setErrorKey(null);
 
     try {
+      if (totpRequired) {
+        if (!totpCode || totpCode.length !== 6) {
+          setErrorKey("invalid_totp");
+          return;
+        }
+        const result = await dashboardLogin(username.trim(), password, totpCode);
+        if (!result.ok) {
+          setErrorKey("invalid_totp");
+          return;
+        }
+        onAuthenticated();
+        return;
+      }
+
       if (!username.trim() || !password) {
         setErrorKey("invalid_credentials");
         return;
       }
 
       const result = await dashboardLogin(username.trim(), password);
+      if (result.requires_totp) {
+        setTotpRequired(true);
+        setTotpCode("");
+        return;
+      }
       if (!result.ok) {
         setErrorKey("invalid_credentials");
         return;
       }
 
-      // The login response already proves the credential path succeeded.
-      // Avoid immediately probing session-backed auth before the new session
-      // is fully visible server-side.
       onAuthenticated();
     } finally {
       setSubmitting(false);
     }
   }
 
-  const isCredentials = mode === "credentials";
+  const isHybrid = mode === "hybrid";
+  const isCredentials = authMethod === "credentials";
 
   return (
     <div className="fixed inset-0 z-200 flex items-center justify-center bg-black/70 backdrop-blur-md">
@@ -77,8 +109,49 @@ function AuthDialog({ mode, onAuthenticated }: { mode: AuthMode; onAuthenticated
             <h2 className="text-xl font-black tracking-tight">{t(isCredentials ? "auth.credentials_title" : "auth.title")}</h2>
             <p className="text-sm text-text-dim mt-1">{t(isCredentials ? "auth.credentials_description" : "auth.description")}</p>
           </div>
+          {isHybrid && (
+            <div className="mb-4 grid grid-cols-2 gap-2 rounded-xl bg-main p-1">
+              <button
+                type="button"
+                onClick={() => { setAuthMethod("credentials"); setErrorKey(null); setKey(""); setTotpRequired(false); setTotpCode(""); }}
+                className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  isCredentials ? "bg-brand text-white shadow-sm" : "text-text-dim hover:text-brand"
+                }`}
+              >
+                {t("auth.credentials_tab")}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setAuthMethod("api_key"); setErrorKey(null); setUsername(""); setPassword(""); setTotpRequired(false); setTotpCode(""); }}
+                className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  !isCredentials ? "bg-brand text-white shadow-sm" : "text-text-dim hover:text-brand"
+                }`}
+              >
+                {t("auth.api_key_tab")}
+              </button>
+            </div>
+          )}
           <form onSubmit={isCredentials ? handleCredentialsSubmit : handleApiKeySubmit} className="space-y-4">
-            {isCredentials ? (
+            {isCredentials && totpRequired ? (
+              <>
+                <p className="text-sm text-text-dim text-center">{t("auth.totp_prompt")}</p>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  value={totpCode}
+                  onChange={(e) => { setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6)); setErrorKey(null); }}
+                  placeholder="000000"
+                  autoFocus
+                  className={`w-full rounded-xl border px-4 py-3 text-center text-2xl font-mono tracking-[0.5em] focus:ring-2 outline-none transition-colors ${
+                    errorKey === "invalid_totp"
+                      ? "border-error focus:border-error focus:ring-error/10"
+                      : "border-border-subtle bg-main focus:border-brand focus:ring-brand/10"
+                  }`}
+                />
+              </>
+            ) : isCredentials ? (
               <>
                 <input
                   type="text"
@@ -123,11 +196,177 @@ function AuthDialog({ mode, onAuthenticated }: { mode: AuthMode; onAuthenticated
             )}
             <button
               type="submit"
-              disabled={submitting || (isCredentials ? !username.trim() || !password : !key.trim())}
+              disabled={submitting || (isCredentials ? (totpRequired ? totpCode.length !== 6 : !username.trim() || !password) : !key.trim())}
               className="w-full rounded-xl bg-brand py-3 text-sm font-bold text-white hover:bg-brand/90 transition-colors shadow-lg shadow-brand/20"
             >
-              {t("auth.submit")}
+              {totpRequired ? t("auth.verify_totp") : t("auth.submit")}
             </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChangePasswordModal({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation();
+  const [currentUsername, setCurrentUsername] = useState("");
+  const [newUsername, setNewUsername] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  useEffect(() => {
+    getDashboardUsername().then((u) => {
+      setCurrentUsername(u);
+      setNewUsername(u);
+    });
+  }, []);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setMessage(null);
+
+    const changedUsername = newUsername.trim() !== currentUsername.trim() ? newUsername.trim() : null;
+    const changedPassword = newPassword || null;
+
+    if (!changedUsername && !changedPassword) {
+      setMessage({ type: "error", text: t("settings.pw_no_changes") });
+      return;
+    }
+    if (changedPassword) {
+      if (newPassword !== confirmPassword) {
+        setMessage({ type: "error", text: t("settings.pw_mismatch") });
+        return;
+      }
+      if (newPassword.length < 8) {
+        setMessage({ type: "error", text: t("settings.pw_too_short") });
+        return;
+      }
+    }
+    if (changedUsername && changedUsername.length < 2) {
+      setMessage({ type: "error", text: t("settings.username_too_short") });
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const res = await changePassword(currentPassword, changedPassword, changedUsername);
+      if (res.ok) {
+        setMessage({ type: "success", text: t("settings.pw_success") });
+        setTimeout(() => { clearApiKey(); window.location.reload(); }, 1500);
+      } else {
+        setMessage({ type: "error", text: res.error || t("settings.pw_failed") });
+      }
+    } catch (err: any) {
+      setMessage({ type: "error", text: err.message || t("settings.pw_failed") });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const inputClass = "w-full rounded-xl border border-border-subtle bg-main px-4 py-3 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none transition-colors placeholder:text-text-dim/40";
+
+  return (
+    <div className="fixed inset-0 z-200 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="w-full max-w-md mx-4 animate-fade-in-scale">
+        <div className="rounded-2xl border border-border-subtle bg-surface shadow-2xl">
+          {/* Header */}
+          <div className="flex items-center justify-between px-6 pt-6 pb-4">
+            <h2 className="text-base font-black tracking-tight">{t("settings.change_credentials")}</h2>
+            <button
+              onClick={onClose}
+              className="h-7 w-7 flex items-center justify-center rounded-lg text-text-dim hover:text-brand hover:bg-surface-hover transition-colors"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          <form onSubmit={handleSubmit}>
+            <div className="px-6 space-y-5">
+              {/* Username */}
+              <div>
+                <label className="block text-xs font-semibold text-text-dim mb-1.5">{t("settings.new_username")}</label>
+                <input
+                  type="text"
+                  value={newUsername}
+                  onChange={(e) => { setNewUsername(e.target.value); setMessage(null); }}
+                  autoComplete="username"
+                  autoFocus
+                  className={inputClass}
+                />
+              </div>
+
+              {/* New password */}
+              <div>
+                <div className="flex items-baseline justify-between mb-1.5">
+                  <label className="text-xs font-semibold text-text-dim">{t("settings.pw_new")}</label>
+                  <span className="text-[10px] text-text-dim/50">{t("settings.pw_leave_blank")}</span>
+                </div>
+                <input
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => { setNewPassword(e.target.value); setMessage(null); }}
+                  placeholder="••••••••"
+                  autoComplete="new-password"
+                  className={inputClass}
+                />
+              </div>
+
+              {/* Confirm password — always visible, grayed out when no new password */}
+              <div className={newPassword ? "" : "opacity-40 pointer-events-none"}>
+                <label className="block text-xs font-semibold text-text-dim mb-1.5">{t("settings.pw_confirm")}</label>
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => { setConfirmPassword(e.target.value); setMessage(null); }}
+                  placeholder="••••••••"
+                  autoComplete="new-password"
+                  tabIndex={newPassword ? 0 : -1}
+                  className={`${inputClass} ${newPassword && confirmPassword && newPassword !== confirmPassword ? "border-error focus:border-error focus:ring-error/10" : ""}`}
+                />
+              </div>
+            </div>
+
+            {/* Verify identity section */}
+            <div className="mx-6 mt-5 rounded-xl bg-surface-hover/60 border border-border-subtle px-4 py-3.5">
+              <label className="block text-[10px] font-bold uppercase tracking-widest text-text-dim mb-2">{t("settings.pw_verify_identity")}</label>
+              <input
+                type="password"
+                value={currentPassword}
+                onChange={(e) => { setCurrentPassword(e.target.value); setMessage(null); }}
+                placeholder={t("settings.pw_current_placeholder")}
+                autoComplete="current-password"
+                className={inputClass}
+              />
+            </div>
+
+            {/* Error / success */}
+            {message && (
+              <p className={`mx-6 mt-3 text-xs font-semibold ${message.type === "success" ? "text-success" : "text-error"}`}>
+                {message.text}
+              </p>
+            )}
+
+            {/* Actions */}
+            <div className="flex gap-3 px-6 py-5">
+              <button
+                type="button"
+                onClick={onClose}
+                className="flex-1 rounded-xl border border-border-subtle py-2.5 text-sm font-bold text-text-dim hover:bg-surface-hover transition-colors"
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="submit"
+                disabled={submitting || !currentPassword}
+                className="flex-1 rounded-xl bg-brand py-2.5 text-sm font-bold text-white hover:bg-brand/90 transition-colors disabled:opacity-50"
+              >
+                {submitting ? t("common.saving") : t("common.save")}
+              </button>
+            </div>
           </form>
         </div>
       </div>
@@ -155,6 +394,12 @@ export function App() {
   const [appVersion, setAppVersion] = useState("");
   const [hostname, setHostname] = useState("");
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const terminalEnabled = useUIStore((s) => s.terminalEnabled);
+  const setTerminalEnabled = useUIStore((s) => s.setTerminalEnabled);
+
+  useKeyboardShortcuts({ onShowHelp: () => setShowShortcuts(true) });
 
   // Wire up global 401 handler so any failed request re-shows login
   useEffect(() => {
@@ -199,6 +444,14 @@ export function App() {
       setHostname(v.hostname ?? "");
     }).catch(() => {});
 
+    getStatus().then((s) => {
+      setTerminalEnabled(s.terminal_enabled !== false);
+    }).catch(() => {
+      // If status fetch fails, assume terminal is available (fail-open).
+      // The WebSocket connection itself will enforce actual policy.
+      setTerminalEnabled(true);
+    });
+
     return () => {
       cancelled = true;
       setOnUnauthorized(null);
@@ -219,57 +472,89 @@ export function App() {
   }`;
   const navActive = "border-brand/20 bg-brand/10 text-brand font-semibold shadow-sm shadow-brand/5";
 
-  const navGroups = useMemo(() => [
+  const navGroups = useMemo(() => {
+    const advancedItems = [
+      { to: "/comms", label: t("nav.comms"), icon: Activity },
+      ...(terminalEnabled ? [{ to: "/terminal" as const, label: t("nav.terminal"), icon: Terminal }] : []),
+      { to: "/network", label: t("nav.network"), icon: Share2 },
+      { to: "/a2a", label: t("nav.a2a"), icon: Globe },
+      { to: "/telemetry", label: t("nav.telemetry"), icon: Gauge },
+    ];
+    return [
     {
       key: "core",
       label: t("nav.core"),
       items: [
         { to: "/overview", label: t("nav.overview"), icon: Home },
-        { to: "/hands", label: t("nav.hands"), icon: Hand },
-        { to: "/workflows", label: t("nav.workflows"), icon: Layers },
         { to: "/chat", label: t("nav.chat"), icon: MessageCircle },
-        { to: "/sessions", label: t("nav.sessions"), icon: Clock },
+        { to: "/agents", label: t("nav.agents"), icon: Users },
         { to: "/approvals", label: t("nav.approvals"), icon: CheckCircle },
+        { to: "/hands", label: t("nav.hands"), icon: Hand },
       ],
     },
     {
-      key: "automation",
-      label: t("nav.automation"),
+      key: "configure",
+      label: t("nav.configure"),
       items: [
+        { to: "/providers", label: t("nav.providers"), icon: Server },
+        { to: "/models", label: t("nav.models"), icon: Cpu },
+        { to: "/media", label: t("nav.media"), icon: Sparkles },
+        { to: "/channels", label: t("nav.channels"), icon: Network },
+        { to: "/skills", label: t("nav.skills"), icon: Bell },
+        { to: "/plugins", label: t("nav.plugins"), icon: Puzzle },
+        { to: "/mcp-servers", label: t("nav.mcp_servers"), icon: Plug },
+      ],
+    },
+    {
+      key: "config",
+      label: t("nav.config"),
+      items: [
+        { to: "/config/general", label: t("config.cat_general"), icon: Settings },
+        { to: "/config/memory", label: t("config.cat_memory"), icon: Database },
+        { to: "/config/tools", label: t("config.cat_tools"), icon: Sparkles },
+        { to: "/config/channels", label: t("config.cat_channels"), icon: Network },
+        { to: "/config/security", label: t("config.cat_security"), icon: Shield },
+        { to: "/config/network", label: t("config.cat_network"), icon: Share2 },
+        { to: "/config/infra", label: t("config.cat_infra"), icon: Server },
+        { to: "/settings", label: t("nav.settings"), icon: Settings },
+      ],
+    },
+    {
+      key: "automate",
+      label: t("nav.automate"),
+      items: [
+        { to: "/workflows", label: t("nav.workflows"), icon: Layers },
         { to: "/scheduler", label: t("nav.scheduler"), icon: Calendar },
         { to: "/goals", label: t("nav.goals"), icon: Shield },
       ],
     },
     {
-      key: "resources",
-      label: t("nav.resources"),
-      items: [
-        { to: "/agents", label: t("nav.agents"), icon: Users },
-        { to: "/providers", label: t("nav.providers"), icon: Server },
-        { to: "/models", label: t("nav.models"), icon: Cpu },
-        { to: "/channels", label: t("nav.channels"), icon: Network },
-        { to: "/skills", label: t("nav.skills"), icon: Bell },
-        { to: "/plugins", label: t("nav.plugins"), icon: Puzzle },
-      ],
-    },
-    {
-      key: "system",
-      label: t("nav.system"),
+      key: "observe",
+      label: t("nav.observe"),
       items: [
         { to: "/analytics", label: t("nav.analytics"), icon: BarChart3 },
         { to: "/memory", label: t("nav.memory"), icon: Database },
-        { to: "/comms", label: t("nav.comms"), icon: Activity },
-        { to: "/network", label: t("nav.network"), icon: Share2 },
-        { to: "/a2a", label: t("nav.a2a"), icon: Globe },
-        { to: "/runtime", label: t("nav.runtime"), icon: Activity },
-        { to: "/telemetry", label: t("nav.telemetry"), icon: Gauge },
         { to: "/logs", label: t("nav.logs"), icon: FileText },
+        { to: "/runtime", label: t("nav.runtime"), icon: Activity },
       ],
     },
-  ], [t]);
+    {
+      key: "advanced",
+      label: t("nav.advanced"),
+      items: advancedItems,
+    },
+  ]; }, [t, terminalEnabled]);
 
   return (
     <div className="flex h-screen flex-col bg-main text-slate-900 dark:text-slate-100 lg:flex-row transition-colors duration-300 overflow-hidden">
+      {/* Skip to content — visible only when focused (keyboard users) */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[200] focus:rounded-lg focus:bg-brand focus:px-4 focus:py-2 focus:text-sm focus:font-bold focus:text-white focus:shadow-lg focus:outline-none"
+      >
+        {t("nav.skip_to_content", { defaultValue: "Skip to content" })}
+      </a>
+
       {/* Sidebar Overlay (Mobile) */}
       {isMobileMenuOpen && (
         <div 
@@ -301,7 +586,9 @@ export function App() {
           <button
             onClick={toggleSidebar}
             className="hidden lg:flex h-9 w-9 items-center justify-center rounded-xl text-text-dim hover:text-brand hover:bg-surface-hover transition-colors"
-            title={isSidebarCollapsed ? "Expand" : "Collapse"}
+            title={isSidebarCollapsed ? t("nav.expand_sidebar", { defaultValue: "Expand sidebar" }) : t("nav.collapse_sidebar", { defaultValue: "Collapse sidebar" })}
+            aria-label={isSidebarCollapsed ? t("nav.expand_sidebar", { defaultValue: "Expand sidebar" }) : t("nav.collapse_sidebar", { defaultValue: "Collapse sidebar" })}
+            aria-expanded={!isSidebarCollapsed}
           >
             {isSidebarCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
           </button>
@@ -313,10 +600,11 @@ export function App() {
           <button
             onClick={() => setPaletteOpen(true)}
             className={`mb-4 flex w-full items-center gap-2 rounded-xl border border-border-subtle bg-surface-hover px-3 py-2.5 text-text-dim hover:border-brand/30 hover:text-brand ${isSidebarCollapsed ? "lg:max-h-0 lg:opacity-0 lg:overflow-hidden lg:p-0! lg:m-0! lg:mb-0!" : "lg:max-h-20 lg:opacity-100"} transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] overflow-hidden`}
-            title="Search (Cmd+K)"
+            title={`${t("common.search")} (⌘K)`}
+            aria-label={`${t("common.search")} (⌘K)`}
           >
             <Search className="h-4 w-4" />
-            <span className="flex-1 text-left text-xs font-medium">Search</span>
+            <span className="flex-1 text-left text-xs font-medium">{t("common.search")}</span>
             <kbd className="text-[10px] font-mono bg-main px-1.5 py-0.5 rounded">⌘K</kbd>
           </button>
 
@@ -341,6 +629,7 @@ export function App() {
                           className={navBase}
                           activeProps={{ className: `${navBase} ${navActive}` }}
                           onClick={() => setMobileMenuOpen(false)}
+                          title={isSidebarCollapsed ? item.label : undefined}
                         >
                           {item.icon && <item.icon className="h-4 w-4 transition-transform group-hover:scale-110 group-hover:text-brand shrink-0" />}
                           <span className={`flex-1 ${isSidebarCollapsed ? "lg:max-h-0 lg:opacity-0 lg:overflow-hidden lg:p-0! lg:m-0! lg:mb-0!" : "lg:max-h-20 lg:opacity-100"} transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] overflow-hidden`}>{item.label}</span>
@@ -362,6 +651,7 @@ export function App() {
                           className={navBase}
                           activeProps={{ className: `${navBase} ${navActive}` }}
                           onClick={() => setMobileMenuOpen(false)}
+                          title={isSidebarCollapsed ? item.label : undefined}
                         >
                           {item.icon && <item.icon className="h-4 w-4 transition-transform group-hover:scale-110 group-hover:text-brand shrink-0" />}
                           <span className={`flex-1 ${isSidebarCollapsed ? "lg:max-h-0 lg:opacity-0 lg:overflow-hidden lg:p-0! lg:m-0! lg:mb-0!" : "lg:max-h-20 lg:opacity-100"} transition-all duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] overflow-hidden`}>{item.label}</span>
@@ -404,6 +694,8 @@ export function App() {
             <button
               onClick={() => setMobileMenuOpen(true)}
               className="flex h-9 w-9 items-center justify-center rounded-xl text-text-dim hover:text-brand hover:bg-surface-hover transition-colors duration-200 lg:hidden"
+              aria-label={t("nav.open_menu", { defaultValue: "Open navigation menu" })}
+              aria-expanded={isMobileMenuOpen}
             >
               <Menu className="h-5 w-5" />
             </button>
@@ -415,10 +707,12 @@ export function App() {
             </div>
           </div>
           <div className="flex items-center gap-1">
+            <NotificationCenter />
             <button
               onClick={() => setLanguage(language === "en" ? "zh" : "en")}
               className="flex h-9 w-9 items-center justify-center rounded-xl text-text-dim hover:text-brand hover:bg-surface-hover transition-colors duration-200"
               title={t("common.change_language")}
+              aria-label={t("common.change_language")}
             >
               <Globe className="h-4 w-4" />
             </button>
@@ -426,6 +720,7 @@ export function App() {
               onClick={toggleTheme}
               className="flex h-9 w-9 items-center justify-center rounded-xl text-text-dim hover:text-brand hover:bg-surface-hover transition-colors duration-200"
               title={t("common.toggle_theme")}
+              aria-label={t("common.toggle_theme")}
             >
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </button>
@@ -434,6 +729,9 @@ export function App() {
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
                 className="flex h-9 w-9 items-center justify-center rounded-xl text-text-dim hover:text-brand hover:bg-surface-hover transition-colors duration-200"
                 title={t("nav.user_center")}
+                aria-label={t("nav.user_center")}
+                aria-expanded={userMenuOpen}
+                aria-haspopup="menu"
               >
                 <UserCircle className="h-5 w-5" />
               </button>
@@ -449,6 +747,13 @@ export function App() {
                       <Settings className="h-3.5 w-3.5" />
                       {t("nav.settings")}
                     </Link>
+                    <button
+                      onClick={() => { setUserMenuOpen(false); setShowChangePassword(true); }}
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-xs font-medium text-text-dim hover:text-brand hover:bg-surface-hover transition-colors"
+                    >
+                      <Lock className="h-3.5 w-3.5" />
+                      {t("settings.change_password")}
+                    </button>
                     {authMode !== "none" && (
                       <button
                         onClick={() => { clearApiKey(); window.location.reload(); }}
@@ -466,14 +771,16 @@ export function App() {
         </header>
 
         {/* Main Content */}
-        <main className="flex-1 overflow-y-auto overflow-x-hidden bg-main">
-          <div className="mx-auto max-w-7xl p-3 sm:p-4 lg:p-8">
+        <main id="main-content" className="flex-1 overflow-y-auto overflow-x-hidden bg-main" tabIndex={-1}>
+          <div className="w-full p-3 sm:p-4 lg:p-8">
             <Outlet />
           </div>
         </main>
       </div>
 
       <CommandPalette isOpen={isPaletteOpen} onClose={() => setPaletteOpen(false)} />
+      <ShortcutsHelp isOpen={showShortcuts} onClose={() => setShowShortcuts(false)} />
+      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} />}
       {authChecked && authNeeded && (
         <AuthDialog mode={authMode} onAuthenticated={() => { setAuthNeeded(false); window.location.hash = "#/overview"; }} />
       )}

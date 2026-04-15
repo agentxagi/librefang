@@ -20,7 +20,10 @@ const MAX_TOOL_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 
 /// Maximum length of an action summary (chars).
-const MAX_ACTION_SUMMARY_LEN: usize = 512;
+pub const MAX_ACTION_SUMMARY_LEN: usize = 512;
+
+/// Maximum length of modify-and-retry feedback (chars).
+pub const MAX_APPROVAL_FEEDBACK_LEN: usize = 4096;
 
 /// Minimum approval timeout in seconds.
 const MIN_TIMEOUT_SECS: u64 = 10;
@@ -39,6 +42,45 @@ const MAX_CHANNEL_NAME_LEN: usize = 64;
 
 /// Maximum number of tools in a single channel rule allow/deny list.
 const MAX_CHANNEL_RULE_TOOLS: usize = 50;
+
+// ---------------------------------------------------------------------------
+// SecondFactor
+// ---------------------------------------------------------------------------
+
+/// Second-factor verification scope.
+///
+/// Controls where TOTP verification is enforced:
+/// - `Totp` = approvals only (backward-compatible default when TOTP is enabled)
+/// - `Login` = dashboard login only
+/// - `Both` = approvals + dashboard login
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondFactor {
+    /// No second factor required (default).
+    #[default]
+    None,
+    /// TOTP required for tool approvals only.
+    Totp,
+    /// TOTP required for dashboard login only.
+    Login,
+    /// TOTP required for both approvals and dashboard login.
+    Both,
+}
+
+impl SecondFactor {
+    /// Whether TOTP is required for dashboard login.
+    pub fn requires_login_totp(self) -> bool {
+        matches!(self, SecondFactor::Login | SecondFactor::Both)
+    }
+
+    /// Whether TOTP is required for tool approvals.
+    pub fn requires_approval_totp(self) -> bool {
+        matches!(self, SecondFactor::Totp | SecondFactor::Both)
+    }
+}
+
+/// Maximum TOTP grace period in seconds (1 hour).
+const MAX_TOTP_GRACE_PERIOD_SECS: u64 = 3600;
 
 // ---------------------------------------------------------------------------
 // RiskLevel
@@ -71,12 +113,153 @@ impl RiskLevel {
 // ---------------------------------------------------------------------------
 
 /// Decision on an approval request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Simple variants serialize as plain strings (`"approved"`, `"denied"`, etc.)
+/// for backward compatibility. `ModifyAndRetry` serializes as
+/// `{"type": "modify_and_retry", "feedback": "..."}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approved,
     Denied,
     TimedOut,
+    /// Human requests modification — agent should retry with feedback.
+    ModifyAndRetry {
+        feedback: String,
+    },
+    /// Timeout fallback: skip the tool, agent continues without it.
+    Skipped,
+}
+
+impl Serialize for ApprovalDecision {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::ModifyAndRetry { feedback } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "modify_and_retry")?;
+                map.serialize_entry("feedback", feedback)?;
+                map.end()
+            }
+            other => serializer.serialize_str(other.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovalDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de;
+
+        struct Visitor;
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = ApprovalDecision;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a string like "approved" or an object like {"type": "modify_and_retry", "feedback": "..."}"#)
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "approved" => Ok(ApprovalDecision::Approved),
+                    "denied" => Ok(ApprovalDecision::Denied),
+                    "timed_out" => Ok(ApprovalDecision::TimedOut),
+                    "skipped" => Ok(ApprovalDecision::Skipped),
+                    other => Err(E::unknown_variant(
+                        other,
+                        &[
+                            "approved",
+                            "denied",
+                            "timed_out",
+                            "skipped",
+                            "modify_and_retry",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut typ: Option<String> = None;
+                let mut feedback: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => typ = Some(map.next_value()?),
+                        "feedback" => feedback = Some(map.next_value()?),
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                match typ.as_deref() {
+                    Some("modify_and_retry") => Ok(ApprovalDecision::ModifyAndRetry {
+                        feedback: feedback.unwrap_or_default(),
+                    }),
+                    Some("approved") => Ok(ApprovalDecision::Approved),
+                    Some("denied") => Ok(ApprovalDecision::Denied),
+                    Some("timed_out") => Ok(ApprovalDecision::TimedOut),
+                    Some("skipped") => Ok(ApprovalDecision::Skipped),
+                    Some(other) => Err(de::Error::unknown_variant(
+                        other,
+                        &[
+                            "approved",
+                            "denied",
+                            "timed_out",
+                            "skipped",
+                            "modify_and_retry",
+                        ],
+                    )),
+                    None => Err(de::Error::missing_field("type")),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl ApprovalDecision {
+    /// Whether the decision grants permission to proceed.
+    pub fn is_approved(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+
+    /// Whether the decision is terminal (no further action possible).
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::ModifyAndRetry { .. })
+    }
+
+    /// String label for display and storage.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::ModifyAndRetry { .. } => "modify_and_retry",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutFallback
+// ---------------------------------------------------------------------------
+
+/// Behavior when an approval request times out.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutFallback {
+    /// Deny the request (current default behavior).
+    #[default]
+    Deny,
+    /// Skip the tool — agent continues without executing it.
+    Skip,
+    /// Extend timeout and re-notify. `extra_timeout_secs` is added each escalation.
+    Escalate {
+        #[serde(default = "default_escalation_timeout")]
+        extra_timeout_secs: u64,
+    },
+}
+
+fn default_escalation_timeout() -> u64 {
+    120
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +285,12 @@ pub struct ApprovalRequest {
     /// Channel name (e.g. "telegram", "discord") that originated the request.
     #[serde(default)]
     pub channel: Option<String>,
+    /// Notification targets for this specific request (overrides policy defaults).
+    #[serde(default)]
+    pub route_to: Vec<NotificationTarget>,
+    /// Number of times this request has been escalated (max 3).
+    #[serde(default)]
+    pub escalation_count: u8,
 }
 
 impl ApprovalRequest {
@@ -290,6 +479,76 @@ impl ChannelToolRule {
 }
 
 // ---------------------------------------------------------------------------
+// Notification types
+// ---------------------------------------------------------------------------
+
+/// A target for delivering notifications (approval requests, alerts, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationTarget {
+    /// Channel type (e.g. "telegram", "slack", "email").
+    pub channel_type: String,
+    /// Recipient identifier (chat_id, channel name, email address).
+    pub recipient: String,
+    /// Optional thread/topic ID (adapter-specific).
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// Per-agent notification routing rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentNotificationRule {
+    /// Glob pattern matching agent names (e.g. "social-*", "*").
+    pub agent_pattern: String,
+    /// Channels to notify for matching agents.
+    pub channels: Vec<NotificationTarget>,
+    /// Event types to notify for (e.g. "approval_requested", "task_completed", "task_failed").
+    pub events: Vec<String>,
+}
+
+/// Notification engine configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationConfig {
+    /// Channels to notify when an approval is requested.
+    #[serde(default)]
+    pub approval_channels: Vec<NotificationTarget>,
+    /// Channels to notify for task completion/failure alerts.
+    #[serde(default)]
+    pub alert_channels: Vec<NotificationTarget>,
+    /// Per-agent notification overrides.
+    #[serde(default)]
+    pub agent_rules: Vec<AgentNotificationRule>,
+}
+
+/// Rule for routing approval requests to specific notification targets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApprovalRoutingRule {
+    /// Tool name glob pattern (e.g. "shell_*", "file_delete").
+    pub tool_pattern: String,
+    /// Targets to route matching approval requests to.
+    pub route_to: Vec<NotificationTarget>,
+}
+
+/// Persistent audit log entry for an approval decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalAuditEntry {
+    pub id: String,
+    pub request_id: String,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub description: String,
+    pub action_summary: String,
+    pub risk_level: String,
+    pub decision: String,
+    pub decided_by: Option<String>,
+    pub decided_at: String,
+    pub requested_at: String,
+    pub feedback: Option<String>,
+    /// Whether TOTP second-factor was used for this decision.
+    #[serde(default)]
+    pub second_factor_used: bool,
+}
+
+// ---------------------------------------------------------------------------
 // ApprovalPolicy
 // ---------------------------------------------------------------------------
 
@@ -297,11 +556,11 @@ impl ChannelToolRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApprovalPolicy {
-    /// Tools that always require approval. Default: `["shell_exec"]`.
+    /// Tools that always require approval. Default: `["shell_exec", "file_write", "file_delete", "apply_patch"]`.
     ///
     /// Accepts either a list of tool names or a boolean shorthand:
     /// - `require_approval = false` → empty list (no tools require approval)
-    /// - `require_approval = true`  → `["shell_exec"]` (the default set)
+    /// - `require_approval = true`  → `["shell_exec", "file_write", "file_delete", "apply_patch"]` (the default set)
     #[serde(deserialize_with = "deserialize_require_approval")]
     pub require_approval: Vec<String>,
     /// Timeout in seconds. Default: 60, range: 10..=300.
@@ -324,24 +583,64 @@ pub struct ApprovalPolicy {
     /// matches the request's channel, the default `require_approval` list applies.
     #[serde(default)]
     pub channel_rules: Vec<ChannelToolRule>,
+    /// Behavior when an approval request times out.
+    #[serde(default)]
+    pub timeout_fallback: TimeoutFallback,
+    /// Rules for routing approval requests to specific notification targets.
+    #[serde(default)]
+    pub routing: Vec<ApprovalRoutingRule>,
+    /// Second-factor verification method for approvals.
+    #[serde(default)]
+    pub second_factor: SecondFactor,
+    /// Issuer name shown in authenticator apps (e.g. "LibreFang").
+    #[serde(default = "default_totp_issuer")]
+    pub totp_issuer: String,
+    /// Grace period in seconds after a successful TOTP verification.
+    /// Subsequent approvals within this window skip the TOTP check.
+    #[serde(default = "default_totp_grace_period")]
+    pub totp_grace_period_secs: u64,
+    /// Tools that require TOTP verification (glob patterns supported).
+    /// Empty list means ALL tools in `require_approval` need TOTP.
+    /// Example: `["shell_exec", "file_delete"]` — only these tools need TOTP.
+    #[serde(default)]
+    pub totp_tools: Vec<String>,
 }
 
 impl Default for ApprovalPolicy {
     fn default() -> Self {
         Self {
-            require_approval: vec!["shell_exec".to_string()],
+            require_approval: vec![
+                "shell_exec".to_string(),
+                "file_write".to_string(),
+                "file_delete".to_string(),
+                "apply_patch".to_string(),
+            ],
             timeout_secs: 60,
             auto_approve_autonomous: false,
             auto_approve: false,
             trusted_senders: Vec::new(),
             channel_rules: Vec::new(),
+            timeout_fallback: TimeoutFallback::default(),
+            routing: Vec::new(),
+            second_factor: SecondFactor::default(),
+            totp_issuer: default_totp_issuer(),
+            totp_grace_period_secs: default_totp_grace_period(),
+            totp_tools: Vec::new(),
         }
     }
 }
 
+fn default_totp_issuer() -> String {
+    "LibreFang".to_string()
+}
+
+fn default_totp_grace_period() -> u64 {
+    300
+}
+
 /// Custom deserializer that accepts:
 /// - A list of strings: `["shell_exec", "file_write"]`
-/// - A boolean: `false` → `[]`, `true` → `["shell_exec"]`
+/// - A boolean: `false` → `[]`, `true` → `["shell_exec", "file_write", "file_delete", "apply_patch"]`
 fn deserialize_require_approval<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -359,7 +658,12 @@ where
 
         fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
             Ok(if v {
-                vec!["shell_exec".to_string()]
+                vec![
+                    "shell_exec".to_string(),
+                    "file_write".to_string(),
+                    "file_delete".to_string(),
+                    "apply_patch".to_string(),
+                ]
             } else {
                 vec![]
             })
@@ -383,6 +687,23 @@ impl ApprovalPolicy {
         if self.auto_approve {
             self.require_approval.clear();
         }
+    }
+
+    /// Check if a specific tool requires TOTP verification.
+    ///
+    /// Returns `true` if `second_factor` is `Totp` AND (totp_tools is empty
+    /// OR the tool matches a pattern in totp_tools).
+    pub fn tool_requires_totp(&self, tool_name: &str) -> bool {
+        if !self.second_factor.requires_approval_totp() {
+            return false;
+        }
+        if self.totp_tools.is_empty() {
+            return true; // All tools require TOTP
+        }
+        use crate::capability::glob_matches;
+        self.totp_tools
+            .iter()
+            .any(|pattern| glob_matches(pattern, tool_name))
     }
 
     /// Check if the given sender is trusted (auto-approve bypass).
@@ -451,6 +772,24 @@ impl ApprovalPolicy {
                 .map_err(|e| format!("channel_rules[{i}]: {e}"))?;
         }
 
+        // -- totp_tools --
+        for (i, name) in self.totp_tools.iter().enumerate() {
+            validate_tool_name(name, &format!("totp_tools[{i}]"))?;
+        }
+
+        // -- totp_grace_period_secs --
+        if self.totp_grace_period_secs > MAX_TOTP_GRACE_PERIOD_SECS {
+            return Err(format!(
+                "totp_grace_period_secs too large ({}, max {MAX_TOTP_GRACE_PERIOD_SECS})",
+                self.totp_grace_period_secs
+            ));
+        }
+
+        // -- totp_issuer --
+        if self.second_factor != SecondFactor::None && self.totp_issuer.is_empty() {
+            return Err("totp_issuer must not be empty when second_factor is enabled".into());
+        }
+
         Ok(())
     }
 }
@@ -477,6 +816,8 @@ mod tests {
             timeout_secs: 60,
             sender_id: None,
             channel: None,
+            route_to: Vec::new(),
+            escalation_count: 0,
         }
     }
 
@@ -528,17 +869,59 @@ mod tests {
             ApprovalDecision::Approved,
             ApprovalDecision::Denied,
             ApprovalDecision::TimedOut,
+            ApprovalDecision::Skipped,
         ] {
             let json = serde_json::to_string(&decision).unwrap();
             let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
             assert_eq!(decision, back);
         }
+        // ModifyAndRetry with data
+        let modify = ApprovalDecision::ModifyAndRetry {
+            feedback: "Use a safer approach".into(),
+        };
+        let json = serde_json::to_string(&modify).unwrap();
+        let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(modify, back);
     }
 
     #[test]
     fn decision_rename_all() {
-        let json = serde_json::to_string(&ApprovalDecision::TimedOut).unwrap();
-        assert_eq!(json, "\"timed_out\"");
+        // Simple variants serialize as plain strings (backward-compatible)
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::TimedOut).unwrap(),
+            "\"timed_out\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::Skipped).unwrap(),
+            "\"skipped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApprovalDecision::Approved).unwrap(),
+            "\"approved\""
+        );
+    }
+
+    #[test]
+    fn decision_modify_and_retry_serde() {
+        // ModifyAndRetry serializes as an object
+        let modify = ApprovalDecision::ModifyAndRetry {
+            feedback: "try safer".into(),
+        };
+        let json = serde_json::to_string(&modify).unwrap();
+        assert!(json.contains("modify_and_retry"));
+        assert!(json.contains("try safer"));
+        // Deserialize back
+        let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(modify, back);
+    }
+
+    #[test]
+    fn decision_backward_compat_string_deser() {
+        // Old-format plain strings should still deserialize
+        let d: ApprovalDecision = serde_json::from_str("\"approved\"").unwrap();
+        assert_eq!(d, ApprovalDecision::Approved);
+        let d: ApprovalDecision = serde_json::from_str("\"timed_out\"").unwrap();
+        assert_eq!(d, ApprovalDecision::TimedOut);
     }
 
     // -----------------------------------------------------------------------
@@ -714,10 +1097,14 @@ mod tests {
     fn policy_default_valid() {
         let policy = ApprovalPolicy::default();
         assert!(policy.validate().is_ok());
-        assert_eq!(policy.require_approval, vec!["shell_exec".to_string()]);
+        assert_eq!(
+            policy.require_approval,
+            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+        );
         assert_eq!(policy.timeout_secs, 60);
         assert!(!policy.auto_approve_autonomous);
         assert!(!policy.auto_approve);
+        assert_eq!(policy.timeout_fallback, TimeoutFallback::Deny);
     }
 
     #[test]
@@ -725,7 +1112,10 @@ mod tests {
         // An empty JSON object should deserialize to defaults via #[serde(default)].
         let policy: ApprovalPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(policy.timeout_secs, 60);
-        assert_eq!(policy.require_approval, vec!["shell_exec".to_string()]);
+        assert_eq!(
+            policy.require_approval,
+            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+        );
         assert!(!policy.auto_approve_autonomous);
     }
 
@@ -739,9 +1129,12 @@ mod tests {
 
     #[test]
     fn policy_require_approval_bool_true() {
-        // require_approval = true → ["shell_exec"]
+        // require_approval = true → default set
         let policy: ApprovalPolicy = serde_json::from_str(r#"{"require_approval": true}"#).unwrap();
-        assert_eq!(policy.require_approval, vec!["shell_exec"]);
+        assert_eq!(
+            policy.require_approval,
+            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+        );
     }
 
     #[test]
@@ -872,6 +1265,12 @@ mod tests {
                 allowed_tools: vec!["file_read".into()],
                 denied_tools: vec!["shell_exec".into()],
             }],
+            timeout_fallback: TimeoutFallback::default(),
+            routing: Vec::new(),
+            second_factor: SecondFactor::default(),
+            totp_issuer: "LibreFang".into(),
+            totp_grace_period_secs: 300,
+            totp_tools: Vec::new(),
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
@@ -1154,5 +1553,108 @@ mod tests {
         }];
         let err = policy.validate().unwrap_err();
         assert!(err.contains("at most one '*' wildcard"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // TimeoutFallback
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn timeout_fallback_default_is_deny() {
+        assert_eq!(TimeoutFallback::default(), TimeoutFallback::Deny);
+    }
+
+    #[test]
+    fn timeout_fallback_serde_roundtrip() {
+        for v in [TimeoutFallback::Deny, TimeoutFallback::Skip] {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: TimeoutFallback = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NotificationTarget
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn notification_target_serde() {
+        let target = NotificationTarget {
+            channel_type: "telegram".into(),
+            recipient: "123456".into(),
+            thread_id: None,
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        let back: NotificationTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(target, back);
+    }
+
+    // -----------------------------------------------------------------------
+    // ApprovalAuditEntry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audit_entry_serde() {
+        let entry = ApprovalAuditEntry {
+            id: "1".into(),
+            request_id: "req-1".into(),
+            agent_id: "agent-1".into(),
+            tool_name: "shell_exec".into(),
+            description: "test".into(),
+            action_summary: "echo hello".into(),
+            risk_level: "high".into(),
+            decision: "approved".into(),
+            decided_by: Some("admin".into()),
+            decided_at: "2024-01-01T00:00:00Z".into(),
+            requested_at: "2024-01-01T00:00:00Z".into(),
+            feedback: None,
+            second_factor_used: false,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ApprovalAuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.decision, "approved");
+    }
+
+    // -----------------------------------------------------------------------
+    // ApprovalDecision helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decision_is_approved() {
+        assert!(ApprovalDecision::Approved.is_approved());
+        assert!(!ApprovalDecision::Denied.is_approved());
+        assert!(!ApprovalDecision::TimedOut.is_approved());
+        assert!(!ApprovalDecision::Skipped.is_approved());
+        assert!(!(ApprovalDecision::ModifyAndRetry {
+            feedback: "x".into()
+        })
+        .is_approved());
+    }
+
+    #[test]
+    fn decision_is_terminal() {
+        assert!(ApprovalDecision::Approved.is_terminal());
+        assert!(ApprovalDecision::Denied.is_terminal());
+        assert!(ApprovalDecision::TimedOut.is_terminal());
+        assert!(ApprovalDecision::Skipped.is_terminal());
+        assert!(!(ApprovalDecision::ModifyAndRetry {
+            feedback: "x".into()
+        })
+        .is_terminal());
+    }
+
+    #[test]
+    fn decision_as_str() {
+        assert_eq!(ApprovalDecision::Approved.as_str(), "approved");
+        assert_eq!(ApprovalDecision::Denied.as_str(), "denied");
+        assert_eq!(ApprovalDecision::TimedOut.as_str(), "timed_out");
+        assert_eq!(ApprovalDecision::Skipped.as_str(), "skipped");
+        assert_eq!(
+            ApprovalDecision::ModifyAndRetry {
+                feedback: "x".into()
+            }
+            .as_str(),
+            "modify_and_retry"
+        );
     }
 }

@@ -1,4 +1,3 @@
-use crate::build_web;
 use crate::changelog;
 use crate::common::repo_root;
 use crate::sync_versions;
@@ -114,7 +113,7 @@ fn compute_calver() -> String {
         "{}.{}.{}",
         now.format("%Y"),
         now.format("%-m"),
-        now.format("%d"),
+        now.format("%-d"),
     )
 }
 
@@ -310,7 +309,7 @@ pub fn run(args: ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate CalVer early, before using version in git tags/branches
     let calver_re =
-        Regex::new(r"^[0-9]{4}\.[0-9]{1,2}(\.[0-9]{2,4})?(-(beta|rc)[0-9]+|-lts(\.[0-9]+)?)?$")
+        Regex::new(r"^[0-9]{4}\.[0-9]{1,2}(\.[0-9]{1,4})?(-(beta|rc)[0-9]+|-lts(\.[0-9]+)?)?$")
             .unwrap();
     if !calver_re.is_match(&version) {
         return Err(format!(
@@ -357,8 +356,8 @@ pub fn run(args: ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ref pt) = prev_tag {
             println!(
-                "  Review:  https://github.com/librefang/librefang/compare/{}...main",
-                pt
+                "  Review:  https://github.com/librefang/librefang/compare/{}...{}",
+                pt, tag
             );
         }
         println!();
@@ -593,17 +592,7 @@ pip install librefang-sdk
         None
     };
 
-    // --- Build dashboard ---
-    println!();
-    println!("Building React dashboard...");
-    let build_result = build_web::run(build_web::BuildWebArgs {
-        dashboard: true,
-        web: false,
-        docs: false,
-    });
-    if let Err(e) = build_result {
-        println!("  Warning: dashboard build failed: {}", e);
-    }
+    // Dashboard is built by CI (dashboard-build.yml), not embedded in release commits.
 
     // --- Git add + commit + tag ---
     println!();
@@ -619,7 +608,6 @@ pip install librefang-sdk
         "sdk/rust/README.md",
         "packages/whatsapp-gateway/package.json",
         "crates/librefang-desktop/tauri.conf.json",
-        "crates/librefang-api/static/react/",
     ];
 
     for file in &files_to_add {

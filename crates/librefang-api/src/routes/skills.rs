@@ -5,8 +5,10 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
     axum::Router::new()
         // Skills
         .route("/skills", axum::routing::get(list_skills))
+        .route("/skills/registry", axum::routing::get(list_skill_registry))
         .route("/skills/install", axum::routing::post(install_skill))
         .route("/skills/uninstall", axum::routing::post(uninstall_skill))
+        .route("/skills/reload", axum::routing::post(reload_skills))
         .route("/skills/create", axum::routing::post(create_skill))
         // Marketplace / ClawHub
         .route(
@@ -48,6 +50,7 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
         // Hands (browser automation engine)
         .route("/hands", axum::routing::get(list_hands))
         .route("/hands/install", axum::routing::post(install_hand))
+        .route("/hands/{hand_id}", axum::routing::delete(uninstall_hand))
         .route("/hands/active", axum::routing::get(list_active_hands))
         .route("/hands/{hand_id}", axum::routing::get(get_hand))
         .route(
@@ -113,6 +116,23 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
             axum::routing::get(get_mcp_server)
                 .put(update_mcp_server)
                 .delete(delete_mcp_server),
+        )
+        // MCP OAuth auth endpoints
+        .route(
+            "/mcp/servers/{name}/auth/status",
+            axum::routing::get(super::mcp_auth::auth_status),
+        )
+        .route(
+            "/mcp/servers/{name}/auth/start",
+            axum::routing::post(super::mcp_auth::auth_start),
+        )
+        .route(
+            "/mcp/servers/{name}/auth/callback",
+            axum::routing::get(super::mcp_auth::auth_callback),
+        )
+        .route(
+            "/mcp/servers/{name}/auth/revoke",
+            axum::routing::delete(super::mcp_auth::auth_revoke),
         )
         // Integrations
         .route("/integrations", axum::routing::get(list_integrations))
@@ -198,9 +218,6 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 Some(librefang_skills::SkillSource::OpenClaw) => {
                     serde_json::json!({"type": "openclaw"})
                 }
-                Some(librefang_skills::SkillSource::Bundled) => {
-                    serde_json::json!({"type": "bundled"})
-                }
                 Some(librefang_skills::SkillSource::Local)
                 | Some(librefang_skills::SkillSource::Native)
                 | None => {
@@ -239,12 +256,48 @@ pub async fn install_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SkillInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.home_dir().join("skills");
-    let config = librefang_skills::marketplace::MarketplaceConfig::default();
-    let client = librefang_skills::marketplace::MarketplaceClient::new(config);
+    let home = state.kernel.home_dir();
+    let skills_dir = if let Some(ref hand_id) = req.hand {
+        let hand_dir = home.join("workspaces").join("hands").join(hand_id);
+        if !hand_dir.exists() {
+            return ApiErrorResponse::not_found(format!("Hand '{hand_id}' not found"))
+                .into_json_tuple();
+        }
+        hand_dir.join("skills")
+    } else {
+        home.join("skills")
+    };
+    if let Err(e) = std::fs::create_dir_all(&skills_dir) {
+        return ApiErrorResponse::internal(format!("Failed to create skills dir: {e}"))
+            .into_json_tuple();
+    }
 
-    match client.install(&req.name, &skills_dir).await {
-        Ok(version) => {
+    // Install from local registry (~/.librefang/registry/skills/{name}/)
+    let registry_src = home.join("registry").join("skills").join(&req.name);
+    if !registry_src.exists() {
+        return ApiErrorResponse::not_found(format!(
+            "Skill '{}' not found in local registry",
+            req.name
+        ))
+        .into_json_tuple();
+    }
+
+    let dest = skills_dir.join(&req.name);
+    if dest.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Skill '{}' is already installed", req.name),
+                "status": "already_installed",
+            })),
+        );
+    }
+
+    // Copy the skill directory from registry to skills
+    match copy_dir_recursive(&registry_src, &dest) {
+        Ok(()) => {
+            let version = "latest".to_string();
+
             // Hot-reload so agents see the new skill immediately
             state.kernel.reload_skills();
             (
@@ -253,11 +306,14 @@ pub async fn install_skill(
                     "status": "installed",
                     "name": req.name,
                     "version": version,
+                    "hand": req.hand,
                 })),
             )
         }
         Err(e) => {
             tracing::warn!("Skill install failed: {e}");
+            // Clean up partial copy
+            let _ = std::fs::remove_dir_all(&dest);
             ApiErrorResponse::internal(format!("Install failed: {e}")).into_json_tuple()
         }
     }
@@ -296,6 +352,112 @@ pub async fn uninstall_skill(
     }
 }
 
+/// POST /api/skills/reload — Rescan `~/.librefang/skills/` and refresh the
+/// in-memory registry. Use this after dropping a skill directory into the
+/// skills folder manually (install/uninstall via API already reload
+/// automatically). Returns the new installed skill count.
+#[utoipa::path(
+    post,
+    path = "/api/skills/reload",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Rescan the skills directory from disk", body = serde_json::Value)
+    )
+)]
+pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.kernel.reload_skills();
+    let count = state
+        .kernel
+        .skill_registry_ref()
+        .read()
+        .map(|r| r.count())
+        .unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "reloaded", "count": count})),
+    )
+}
+
+/// GET /api/skills/registry — List official skills from the local registry cache (~/.librefang/registry/skills).
+#[utoipa::path(
+    get,
+    path = "/api/skills/registry",
+    tag = "skills",
+    responses(
+        (status = 200, description = "Official skills available in the FangHub registry", body = serde_json::Value)
+    )
+)]
+pub async fn list_skill_registry(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let registry_skills_dir = state.kernel.home_dir().join("registry").join("skills");
+
+    if !registry_skills_dir.exists() {
+        return Json(serde_json::json!({ "skills": [], "total": 0 }));
+    }
+
+    let mut skills: Vec<serde_json::Value> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&registry_skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let skill_md_path = path.join("SKILL.md");
+            if !skill_md_path.exists() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&skill_md_path) {
+                if let Some((name, description)) = parse_skill_md_frontmatter(&content) {
+                    let skill_name = if name.is_empty() { &dir_name } else { &name };
+                    let installed_dir = state.kernel.home_dir().join("skills").join(skill_name);
+                    let is_installed = installed_dir.exists();
+                    skills.push(serde_json::json!({
+                        "name": skill_name,
+                        "description": description,
+                        "version": null,
+                        "author": null,
+                        "tags": [],
+                        "is_installed": is_installed,
+                    }));
+                }
+            }
+        }
+    }
+
+    let total = skills.len();
+    Json(serde_json::json!({ "skills": skills, "total": total }))
+}
+
+/// Parse YAML frontmatter from a SKILL.md file. Returns `(name, description)`.
+fn parse_skill_md_frontmatter(content: &str) -> Option<(String, String)> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after_open = &trimmed[3..];
+    let close = after_open.find("---")?;
+    let frontmatter = &after_open[..close];
+    let mut name = String::new();
+    let mut description = String::new();
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("name:") {
+            name = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("description:") {
+            description = val.trim().to_string();
+        }
+    }
+    if name.is_empty() && description.is_empty() {
+        return None;
+    }
+    Some((name, description))
+}
+
 /// GET /api/marketplace/search — Search the FangHub marketplace.
 #[utoipa::path(
     get,
@@ -309,36 +471,45 @@ pub async fn uninstall_skill(
     )
 )]
 pub async fn marketplace_search(
+    State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let query = params.get("q").cloned().unwrap_or_default();
-    if query.is_empty() {
-        return Json(serde_json::json!({"results": [], "total": 0}));
+    let query = params.get("q").cloned().unwrap_or_default().to_lowercase();
+    let registry_dir = state.kernel.home_dir().join("registry").join("skills");
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&registry_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("skill.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(manifest) = toml::from_str::<librefang_skills::SkillManifest>(&content) {
+                    let name = &manifest.skill.name;
+                    let desc = &manifest.skill.description;
+                    if query.is_empty()
+                        || name.to_lowercase().contains(&query)
+                        || desc.to_lowercase().contains(&query)
+                    {
+                        results.push(serde_json::json!({
+                            "name": name,
+                            "description": desc,
+                            "stars": 0,
+                            "url": "",
+                        }));
+                    }
+                }
+            }
+        }
     }
 
-    let config = librefang_skills::marketplace::MarketplaceConfig::default();
-    let client = librefang_skills::marketplace::MarketplaceClient::new(config);
-
-    match client.search(&query).await {
-        Ok(results) => {
-            let items: Vec<serde_json::Value> = results
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "name": r.name,
-                        "description": r.description,
-                        "stars": r.stars,
-                        "url": r.url,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"results": items, "total": items.len()}))
-        }
-        Err(e) => {
-            tracing::warn!("Marketplace search failed: {e}");
-            Json(serde_json::json!({"results": [], "total": 0, "error": format!("{e}")}))
-        }
-    }
+    let total = results.len();
+    Json(serde_json::json!({"results": results, "total": total}))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +591,7 @@ pub async fn clawhub_search(
             let status = if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
-                StatusCode::OK
+                StatusCode::BAD_GATEWAY
             };
             (
                 status,
@@ -499,7 +670,7 @@ pub async fn clawhub_browse(
             let status = if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
-                StatusCode::OK
+                StatusCode::BAD_GATEWAY
             };
             (
                 status,
@@ -651,7 +822,21 @@ pub async fn clawhub_install(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::types::ClawHubInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.home_dir().join("skills");
+    let home = state.kernel.home_dir();
+    let skills_dir = if let Some(ref hand_id) = req.hand {
+        let hand_dir = home.join("workspaces").join("hands").join(hand_id);
+        if !hand_dir.exists() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Hand '{hand_id}' not found")})),
+            );
+        }
+        let dir = hand_dir.join("skills");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    } else {
+        home.join("skills")
+    };
     let cache_dir = state.kernel.home_dir().join(".cache").join("clawhub");
     let client = librefang_skills::clawhub::ClawHubClient::new(cache_dir);
 
@@ -745,12 +930,7 @@ pub async fn skillhub_search(
         }
     }
 
-    let cache_dir = state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join(".cache")
-        .join("skillhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("skillhub");
     let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
 
     match client.search(&query, limit).await {
@@ -784,7 +964,7 @@ pub async fn skillhub_search(
             let status = if is_clawhub_rate_limit(&e) {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
-                StatusCode::OK
+                StatusCode::BAD_GATEWAY
             };
             (
                 status,
@@ -814,12 +994,7 @@ pub async fn skillhub_browse(
         }
     }
 
-    let cache_dir = state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join(".cache")
-        .join("skillhub");
+    let cache_dir = state.kernel.home_dir().join(".cache").join("skillhub");
     let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
 
     match client.browse(sort, limit).await {
@@ -851,7 +1026,7 @@ pub async fn skillhub_browse(
             let msg = format!("{e}");
             tracing::warn!("Skillhub browse failed: {msg}");
             (
-                StatusCode::OK,
+                StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"items": [], "error": msg})),
             )
         }
@@ -871,7 +1046,7 @@ pub async fn skillhub_skill_detail(
         .join("skillhub");
     let client = librefang_skills::skillhub::SkillhubClient::with_defaults(cache_dir);
 
-    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let skills_dir = state.kernel.home_dir().join("skills");
     let is_installed = client.is_installed(&slug, &skills_dir);
 
     match client.get_skill(&slug).await {
@@ -940,7 +1115,21 @@ pub async fn skillhub_install(
     State(state): State<Arc<AppState>>,
     Json(req): Json<crate::types::ClawHubInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config_ref().home_dir.join("skills");
+    let home = state.kernel.home_dir();
+    let skills_dir = if let Some(ref hand_id) = req.hand {
+        let hand_dir = home.join("workspaces").join("hands").join(hand_id);
+        if !hand_dir.exists() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Hand '{hand_id}' not found")})),
+            );
+        }
+        let dir = hand_dir.join("skills");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    } else {
+        home.join("skills")
+    };
     let cache_dir = state
         .kernel
         .config_ref()
@@ -1065,6 +1254,7 @@ pub async fn list_hands(
         .unwrap_or("en");
 
     let defs = state.kernel.hands().list_definitions();
+    let home_dir = state.kernel.home_dir().to_path_buf();
     let hands: Vec<serde_json::Value> = defs
         .iter()
         .map(|d| {
@@ -1080,6 +1270,16 @@ pub async fn list_hands(
                 .unwrap_or(false);
             let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
             let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
+
+            // A hand is user-installed (uninstallable) if its HAND.toml lives
+            // in `home/workspaces/{id}/`. Built-ins synced from the registry
+            // live under `home/registry/hands/{id}/` and are recreated on
+            // every sync, so the UI should not offer to uninstall them.
+            let is_custom = home_dir
+                .join("workspaces")
+                .join(&d.id)
+                .join("HAND.toml")
+                .exists();
 
             let i18n_entry = d.i18n.get(lang);
             let resolved_name = i18n_entry
@@ -1099,6 +1299,7 @@ pub async fn list_hands(
                 "requirements_met": requirements_met,
                 "active": active,
                 "degraded": degraded,
+                "is_custom": is_custom,
                 "requirements": reqs.iter().map(|(r, ok)| {
                     let mut req = serde_json::json!({
                         "key": r.check_value,
@@ -1134,17 +1335,53 @@ pub async fn list_hands(
         (status = 200, description = "List active hand instances", body = serde_json::Value)
     )
 )]
-pub async fn list_active_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_active_hands(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Split on `,`/`;` to isolate the primary tag, then try the full tag
+    // ("zh-CN") before falling back to the base ("zh") so hand i18n maps with
+    // region codes resolve correctly instead of silently dropping to the
+    // default name.
+    let primary = headers
+        .get("accept-language")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(&[',', ';'][..]).next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "en".to_string());
+    let base = primary.split('-').next().unwrap_or("en").to_string();
+
     let instances = state.kernel.hands().list_instances();
     let items: Vec<serde_json::Value> = instances
         .iter()
         .map(|i| {
+            let def = state.kernel.hands().get_definition(&i.hand_id);
+            let hand_name = def.as_ref().map(|d| {
+                d.i18n
+                    .get(&primary)
+                    .or_else(|| d.i18n.get(&base))
+                    .and_then(|l| l.name.as_deref())
+                    .unwrap_or(&d.name)
+                    .to_string()
+            });
+            let hand_icon = def.as_ref().map(|d| d.icon.clone());
+
+            let agent_ids: std::collections::BTreeMap<String, String> = i
+                .agent_ids
+                .iter()
+                .map(|(role, id)| (role.clone(), id.to_string()))
+                .collect();
+
             serde_json::json!({
                 "instance_id": i.instance_id,
                 "hand_id": i.hand_id,
+                "hand_name": hand_name,
+                "hand_icon": hand_icon,
                 "status": format!("{}", i.status),
                 "agent_id": i.agent_id().map(|a: librefang_types::agent::AgentId| a.to_string()),
                 "agent_name": i.agent_name(),
+                "agent_ids": agent_ids,
+                "coordinator_role": i.coordinator_role(),
                 "activated_at": i.activated_at.to_rfc3339(),
                 "updated_at": i.updated_at.to_rfc3339(),
             })
@@ -1204,6 +1441,7 @@ pub async fn get_hand(
                 .hands()
                 .check_settings_availability(&hand_id, Some(lang))
                 .unwrap_or_default();
+            let dm = state.kernel.config_ref().default_model.clone();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1239,17 +1477,17 @@ pub async fn get_hand(
                             "name": agent_manifest.name,
                             "description": agent_manifest.description,
                             "provider": if agent_manifest.model.provider == "default" {
-                                &state.kernel.config_ref().default_model.provider
+                                &dm.provider
                             } else { &agent_manifest.model.provider },
                             "model": if agent_manifest.model.model == "default" {
-                                &state.kernel.config_ref().default_model.model
+                                &dm.model
                             } else { &agent_manifest.model.model },
                         })
                     } else {
                         serde_json::json!(null)
                     },
                     "agents": def.agents.iter().map(|(role, a)| {
-                        let dm = &state.kernel.config_ref().default_model;
+                        let dm = &dm;
                         let agent_i18n = i18n_entry.and_then(|l| l.agents.get(role.as_str()));
                         let resolved_agent_name = agent_i18n
                             .and_then(|ai| ai.name.as_deref())
@@ -1599,6 +1837,56 @@ pub async fn install_hand_deps(
             }).collect::<Vec<_>>(),
         })),
     )
+}
+
+/// DELETE /api/hands/{hand_id} — Uninstall a user-installed hand.
+///
+/// Only hands that live under `home_dir/workspaces/{id}/` can be removed.
+/// Built-in hands (shipped by librefang-registry under `home_dir/registry/hands/`)
+/// cannot be uninstalled because the next registry sync would recreate them.
+/// Hands with live instances must be deactivated first.
+#[utoipa::path(
+    delete,
+    path = "/api/hands/{hand_id}",
+    tag = "hands",
+    params(
+        ("hand_id" = String, Path, description = "Hand ID"),
+    ),
+    responses(
+        (status = 200, description = "Hand uninstalled", body = serde_json::Value),
+        (status = 404, description = "Hand not found or is a built-in"),
+        (status = 409, description = "Hand is still active — deactivate first"),
+    )
+)]
+pub async fn uninstall_hand(
+    State(state): State<Arc<AppState>>,
+    Path(hand_id): Path<String>,
+) -> impl IntoResponse {
+    let home_dir = state.kernel.home_dir().to_path_buf();
+    match state.kernel.hands().uninstall_hand(&home_dir, &hand_id) {
+        Ok(()) => {
+            librefang_kernel::router::invalidate_hand_route_cache();
+            state.kernel.persist_hand_state();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "hand_id": hand_id,
+                })),
+            )
+        }
+        Err(librefang_hands::HandError::NotFound(id)) => {
+            ApiErrorResponse::not_found(format!("Hand not found: {id}")).into_json_tuple()
+        }
+        Err(librefang_hands::HandError::BuiltinHand(id)) => ApiErrorResponse::not_found(format!(
+            "Hand '{id}' is a built-in and cannot be uninstalled"
+        ))
+        .into_json_tuple(),
+        Err(librefang_hands::HandError::AlreadyActive(msg)) => {
+            ApiErrorResponse::conflict(msg).into_json_tuple()
+        }
+        Err(e) => ApiErrorResponse::bad_request(format!("{e}")).into_json_tuple(),
+    }
 }
 
 /// POST /api/hands/install — Install a hand from TOML content.
@@ -2263,6 +2551,7 @@ pub async fn hand_send_message(
                     memories_saved: result.memories_saved,
                     memories_used: result.memories_used,
                     memory_conflicts: result.memory_conflicts,
+                    thinking: None,
                 })),
             )
         }
@@ -2301,23 +2590,67 @@ pub async fn hand_get_session(
                 .messages
                 .iter()
                 .map(|m| {
-                    let content = match &m.content {
-                        librefang_types::message::MessageContent::Text(t) => t.clone(),
-                        librefang_types::message::MessageContent::Blocks(blocks) => blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                librefang_types::message::ContentBlock::Text { text, .. } => {
-                                    Some(text.clone())
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
+                    let (content, blocks) = match &m.content {
+                        librefang_types::message::MessageContent::Text(t) => (t.clone(), None),
+                        librefang_types::message::MessageContent::Blocks(blocks) => {
+                            // Text-only content for backward compatibility
+                            let text = blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    librefang_types::message::ContentBlock::Text {
+                                        text, ..
+                                    } => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            // Structured blocks for rich rendering
+                            let structured: Vec<serde_json::Value> = blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    librefang_types::message::ContentBlock::Text {
+                                        text, ..
+                                    } => Some(serde_json::json!({
+                                        "type": "text", "text": text
+                                    })),
+                                    librefang_types::message::ContentBlock::ToolUse {
+                                        id,
+                                        name,
+                                        input,
+                                        ..
+                                    } => Some(serde_json::json!({
+                                        "type": "tool_use", "id": id, "name": name, "input": input
+                                    })),
+                                    librefang_types::message::ContentBlock::ToolResult {
+                                        tool_use_id,
+                                        tool_name,
+                                        content,
+                                        is_error,
+                                        ..
+                                    } => Some(serde_json::json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": tool_use_id,
+                                        "name": tool_name,
+                                        "content": content,
+                                        "is_error": is_error,
+                                    })),
+                                    _ => None,
+                                })
+                                .collect();
+                            let has_non_text = structured
+                                .iter()
+                                .any(|b| b["type"].as_str() != Some("text"));
+                            (text, if has_non_text { Some(structured) } else { None })
+                        }
                     };
-                    serde_json::json!({
+                    let mut msg = serde_json::json!({
                         "role": format!("{:?}", m.role).to_lowercase(),
                         "content": content,
-                    })
+                    });
+                    if let Some(blocks) = blocks {
+                        msg["blocks"] = serde_json::Value::Array(blocks);
+                    }
+                    msg
                 })
                 .collect();
             (
@@ -2488,6 +2821,19 @@ fn serialize_mcp_transport(
     )
 )]
 pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Snapshot auth states so we can include them in the response
+    let auth_states = state.kernel.mcp_auth_states_ref().lock().await;
+    let auth_snapshot: std::collections::HashMap<String, serde_json::Value> = auth_states
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                serde_json::to_value(v).unwrap_or(serde_json::json!({"state": "not_required"})),
+            )
+        })
+        .collect();
+    drop(auth_states);
+
     // Get configured servers from config
     let config_servers: Vec<serde_json::Value> = state
         .kernel
@@ -2496,11 +2842,16 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
         .iter()
         .map(|s| {
             let transport = s.transport.as_ref().map(serialize_mcp_transport);
+            let auth_state = auth_snapshot
+                .get(&s.name)
+                .cloned()
+                .unwrap_or(serde_json::json!({"state": "not_required"}));
             serde_json::json!({
                 "name": s.name,
                 "transport": transport,
                 "timeout_secs": s.timeout_secs,
                 "env": s.env,
+                "auth_state": auth_state,
             })
         })
         .collect();
@@ -2557,13 +2908,10 @@ pub async fn get_mcp_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    // Find the configured entry by name
-    let entry = state
-        .kernel
-        .config_ref()
-        .mcp_servers
-        .iter()
-        .find(|s| s.name == name);
+    // Find the configured entry by name — use config_snapshot() because
+    // the result is held across an .await below.
+    let cfg = state.kernel.config_snapshot();
+    let entry = cfg.mcp_servers.iter().find(|s| s.name == name);
 
     let entry = match entry {
         Some(e) => e,
@@ -2665,7 +3013,7 @@ pub async fn add_mcp_server(
     }
 
     // Trigger config reload
-    let reload_status = match state.kernel.reload_config() {
+    let reload_status = match state.kernel.reload_config().await {
         Ok(plan) => {
             if plan.restart_required {
                 "applied_partial"
@@ -2761,8 +3109,11 @@ pub async fn update_mcp_server(
         ))
         .into_json_tuple();
     }
+    // Drop ErrorTranslator before .await — FluentBundle is !Send and cannot
+    // be held across an async suspension point.
+    drop(t);
 
-    let reload_status = match state.kernel.reload_config() {
+    let reload_status = match state.kernel.reload_config().await {
         Ok(plan) => {
             if plan.restart_required {
                 "applied_partial"
@@ -2822,6 +3173,19 @@ pub async fn delete_mcp_server(
         .into_json_tuple();
     }
 
+    // Resolve server URL before removing config (needed for vault cleanup)
+    let server_url = state
+        .kernel
+        .config_ref()
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .and_then(|s| match &s.transport {
+            Some(librefang_types::config::McpTransportEntry::Http { url }) => Some(url.clone()),
+            Some(librefang_types::config::McpTransportEntry::Sse { url }) => Some(url.clone()),
+            _ => None,
+        });
+
     let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = remove_mcp_server_config(&config_path, &name) {
         return ApiErrorResponse::internal(t.t_args(
@@ -2830,8 +3194,42 @@ pub async fn delete_mcp_server(
         ))
         .into_json_tuple();
     }
+    drop(t);
 
-    let reload_status = match state.kernel.reload_config() {
+    // Clean up OAuth vault tokens, auth state, and live connections
+    if let Some(ref url) = server_url {
+        let provider = librefang_kernel::mcp_oauth_provider::KernelOAuthProvider::new(
+            state.kernel.home_dir().to_path_buf(),
+        );
+        for field in &[
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "token_endpoint",
+            "client_id",
+            "pkce_verifier",
+            "pkce_state",
+            "redirect_uri",
+        ] {
+            let _ = provider.vault_remove(
+                &librefang_kernel::mcp_oauth_provider::KernelOAuthProvider::vault_key(url, field),
+            );
+        }
+    }
+    state
+        .kernel
+        .mcp_auth_states_ref()
+        .lock()
+        .await
+        .remove(&name);
+    state
+        .kernel
+        .mcp_connections_ref()
+        .lock()
+        .await
+        .retain(|c| c.name() != name);
+
+    let reload_status = match state.kernel.reload_config().await {
         Ok(plan) => {
             if plan.restart_required {
                 "applied_partial"
@@ -3426,6 +3824,17 @@ pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> 
         .iter()
         .map(|t| {
             let installed = registry.is_installed(&t.id);
+            let transport = match &t.transport {
+                librefang_extensions::McpTransportTemplate::Stdio { command, args } => {
+                    serde_json::json!({ "type": "stdio", "command": command, "args": args })
+                }
+                librefang_extensions::McpTransportTemplate::Sse { url } => {
+                    serde_json::json!({ "type": "sse", "url": url })
+                }
+                librefang_extensions::McpTransportTemplate::Http { url } => {
+                    serde_json::json!({ "type": "http", "url": url })
+                }
+            };
             serde_json::json!({
                 "id": t.id,
                 "name": t.name,
@@ -3434,6 +3843,7 @@ pub async fn list_available_integrations(State(state): State<Arc<AppState>>) -> 
                 "category": t.category.to_string(),
                 "installed": installed,
                 "tags": t.tags,
+                "transport": transport,
                 "required_env": t.required_env.iter().map(|e| serde_json::json!({
                     "name": e.name,
                     "label": e.label,
@@ -3925,4 +4335,137 @@ pub async fn uninstall_extension(
             "name": name,
         })),
     )
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librefang_types::config::{McpServerConfigEntry, McpTransportEntry};
+
+    /// Regression for #2319: adding an MCP server through the UI wrote each
+    /// entry as a JSON-stringified blob inside `mcp_servers = ['{"name":...}']`
+    /// instead of a `[[mcp_servers]]` TOML table, because the top-level object
+    /// hit the catch-all in `json_to_toml_value` and got stringified. After
+    /// the fix, the on-disk file must round-trip back into a real
+    /// `McpServerConfigEntry` via `toml::from_str`.
+    #[test]
+    fn upsert_mcp_server_writes_inline_table_not_stringified_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let entry = McpServerConfigEntry {
+            name: "nocodb".to_string(),
+            transport: Some(McpTransportEntry::Stdio {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "mcp-remote".to_string(),
+                    "http://nocodb:8080/mcp/abc".to_string(),
+                ],
+            }),
+            timeout_secs: 30,
+            env: vec![],
+            headers: vec!["xc-mcp-token: secret".to_string()],
+            oauth: None,
+        };
+
+        upsert_mcp_server_config(&config_path, &entry).expect("upsert should succeed");
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("mcp_servers = ['{"),
+            "mcp_servers must not be written as stringified JSON — got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("mcp_servers = [\"{"),
+            "mcp_servers must not be written as stringified JSON — got:\n{raw}"
+        );
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            mcp_servers: Vec<McpServerConfigEntry>,
+        }
+        let parsed: Wrapper =
+            toml::from_str(&raw).expect("config.toml must deserialize into McpServerConfigEntry");
+        assert_eq!(parsed.mcp_servers.len(), 1);
+        let roundtripped = &parsed.mcp_servers[0];
+        assert_eq!(roundtripped.name, "nocodb");
+        assert_eq!(roundtripped.timeout_secs, 30);
+        assert_eq!(roundtripped.headers, vec!["xc-mcp-token: secret"]);
+        match &roundtripped.transport {
+            Some(McpTransportEntry::Stdio { command, args }) => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, &["-y", "mcp-remote", "http://nocodb:8080/mcp/abc"]);
+            }
+            other => panic!("expected stdio transport, got {other:?}"),
+        }
+    }
+
+    /// A second upsert for the same name must replace the entry in-place,
+    /// not produce a second row — this is how the user ended up with three
+    /// stale duplicate blobs in the bug report.
+    #[test]
+    fn upsert_mcp_server_replaces_existing_entry_with_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let v1 = McpServerConfigEntry {
+            name: "nocodb".to_string(),
+            transport: Some(McpTransportEntry::Http {
+                url: "http://old:8080/mcp".to_string(),
+            }),
+            timeout_secs: 10,
+            env: vec![],
+            headers: vec![],
+            oauth: None,
+        };
+        upsert_mcp_server_config(&config_path, &v1).unwrap();
+
+        let v2 = McpServerConfigEntry {
+            name: "nocodb".to_string(),
+            transport: Some(McpTransportEntry::Http {
+                url: "http://new:9090/mcp".to_string(),
+            }),
+            timeout_secs: 60,
+            env: vec![],
+            headers: vec![],
+            oauth: None,
+        };
+        upsert_mcp_server_config(&config_path, &v2).unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            mcp_servers: Vec<McpServerConfigEntry>,
+        }
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: Wrapper = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.mcp_servers.len(),
+            1,
+            "upsert must replace, not append"
+        );
+        assert_eq!(parsed.mcp_servers[0].timeout_secs, 60);
+        match &parsed.mcp_servers[0].transport {
+            Some(McpTransportEntry::Http { url }) => assert_eq!(url, "http://new:9090/mcp"),
+            other => panic!("expected http transport, got {other:?}"),
+        }
+    }
 }

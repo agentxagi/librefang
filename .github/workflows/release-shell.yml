@@ -24,10 +24,35 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/wait-for-release
 
+  # ── Build React dashboard (shared by all binary jobs) ───────────────────
+  build_dashboard:
+    name: Build Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - name: Install dependencies
+        working-directory: crates/librefang-api/dashboard
+        run: pnpm install --frozen-lockfile
+      - name: Build dashboard
+        working-directory: crates/librefang-api/dashboard
+        run: pnpm run build
+      - name: Upload dashboard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
+          retention-days: 1
+
   # ── CLI Binary (macOS) ────────────────────────────────────────────────────
   cli_mac:
     name: CLI / ${{ matrix.target }}
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -38,6 +63,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -59,12 +88,23 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Linux) ──────────────────────────────────────────────────
   cli_linux:
     name: CLI / ${{ matrix.target }}
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -77,6 +117,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -104,16 +148,31 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Android / Termux) ───────────────────────────────────────
   cli_android:
     name: CLI / aarch64-linux-android
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cross
         run: cargo install cross --locked
@@ -131,12 +190,23 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-aarch64-linux-android.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-aarch64-linux-android.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Linux) - Mini (12 channels) ───────────────────────────────
   cli_linux_mini:
     name: CLI / ${{ matrix.target }} (mini)
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -146,6 +216,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -165,12 +239,23 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}-mini.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}-mini.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Linux, musl — fully static) ─────────────────────────────
   cli_musl:
     name: CLI / ${{ matrix.target }} (static)
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -181,6 +266,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -208,12 +297,23 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Windows) ────────────────────────────────────────────────
   cli_windows:
     name: CLI / ${{ matrix.target }}
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -224,6 +324,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -242,12 +346,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (macOS) - Mini ─────────────────────────────────────────────
   cli_mac_mini:
     name: CLI / ${{ matrix.target }} (mini)
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -257,6 +372,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -278,12 +397,23 @@ jobs:
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}-mini.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}-mini.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary (Windows) - Mini ───────────────────────────────────────────
   cli_windows_mini:
     name: CLI / ${{ matrix.target }} (mini)
-    needs: [wait_for_release]
+    needs: [wait_for_release, build_dashboard]
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -293,6 +423,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: crates/librefang-api/static/react/
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -311,7 +445,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF#refs/tags/}" librefang-${{ matrix.target }}-mini.* --clobber
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for attempt in $(seq 1 5); do
+            if gh release upload "$TAG" librefang-${{ matrix.target }}-mini.* --clobber; then
+              echo "✓ Upload succeeded (attempt $attempt)"
+              exit 0
+            fi
+            echo "Upload failed (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Upload failed after 5 attempts"
+          exit 1
 
   # ── CLI Binary → npm ────────────────────────────────────────────────────
   cli_npm:
@@ -637,4 +782,3 @@ jobs:
           git add .
           git commit -m "chore: update formula channels to ${{ github.ref_name }}" || echo "No changes"
           git push
-

@@ -119,6 +119,10 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::post(clone_agent),
         )
         .route(
+            "/agents/{id}/reload",
+            axum::routing::post(reload_agent_manifest),
+        )
+        .route(
             "/agents/{id}/files",
             axum::routing::get(list_agent_files),
         )
@@ -152,6 +156,7 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         )
 }
 use crate::middleware::RequestLanguage;
+use crate::stream_dedup::StreamDedup;
 use crate::types::*;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -210,6 +215,7 @@ async fn resolve_manifest(
                 .kernel
                 .config_ref()
                 .home_dir
+                .join("workspaces")
                 .join("agents")
                 .join(&safe_name)
                 .join("agent.toml");
@@ -270,7 +276,7 @@ async fn resolve_manifest(
     }
 
     // Parse TOML
-    let manifest: AgentManifest = match toml::from_str(&manifest_toml) {
+    let mut manifest: AgentManifest = match toml::from_str(&manifest_toml) {
         Ok(m) => m,
         Err(e) => {
             let _ = e;
@@ -280,6 +286,14 @@ async fn resolve_manifest(
             });
         }
     };
+
+    // Allow callers to override the manifest name, enabling multiple agents
+    // from the same template with distinct names.
+    if let Some(ref custom_name) = req.name {
+        if !custom_name.trim().is_empty() {
+            manifest.name = custom_name.trim().to_string();
+        }
+    }
 
     let name = manifest.name.clone();
     Ok(ResolvedManifest { manifest, name })
@@ -490,6 +504,21 @@ pub async fn bulk_delete_agents(
                 continue;
             }
         };
+        // Same guard as the single-agent kill path: hand-spawned agents
+        // must be removed by deactivating their owning hand, not directly.
+        if let Some(entry) = state.kernel.agent_registry().get(agent_id) {
+            if entry.is_hand {
+                results.push(BulkActionResult {
+                    agent_id: id_str.clone(),
+                    success: false,
+                    message: None,
+                    error: Some(
+                        "Cannot delete a hand-spawned agent directly; deactivate or uninstall the owning hand instead.".to_string(),
+                    ),
+                });
+                continue;
+            }
+        }
         match state.kernel.kill_agent(agent_id) {
             Ok(()) => {
                 results.push(BulkActionResult {
@@ -676,7 +705,7 @@ pub async fn bulk_stop_agents(
 }
 
 /// Enrich an `AgentEntry` into a JSON value with catalog data.
-fn enrich_agent_json(
+pub(crate) fn enrich_agent_json(
     e: &librefang_types::agent::AgentEntry,
     dm: &librefang_types::config::DefaultModelConfig,
     catalog: &Option<
@@ -695,20 +724,21 @@ fn enrich_agent_json(
         e.manifest.model.model.as_str()
     };
 
-    let (tier, auth_status) = catalog
+    let (tier, auth_status, supports_thinking) = catalog
         .as_ref()
         .map(|cat| {
-            let tier = cat
-                .find_model(model)
+            let model_entry = cat.find_model(model);
+            let tier = model_entry
                 .map(|m| format!("{:?}", m.tier).to_lowercase())
                 .unwrap_or_else(|| "unknown".to_string());
+            let thinking = model_entry.map(|m| m.supports_thinking).unwrap_or(false);
             let auth = cat
                 .get_provider(provider)
                 .map(|p| p.auth_status.to_string())
                 .unwrap_or_else(|| "unknown".to_string());
-            (tier, auth)
+            (tier, auth, thinking)
         })
-        .unwrap_or(("unknown".to_string(), "unknown".to_string()));
+        .unwrap_or(("unknown".to_string(), "unknown".to_string(), false));
 
     let ready =
         matches!(e.state, librefang_types::agent::AgentState::Running) && auth_status != "missing";
@@ -716,6 +746,7 @@ fn enrich_agent_json(
     serde_json::json!({
         "id": e.id.to_string(),
         "name": e.name,
+        "is_hand": e.is_hand,
         "state": format!("{:?}", e.state),
         "mode": e.mode,
         "created_at": e.created_at.to_rfc3339(),
@@ -724,6 +755,7 @@ fn enrich_agent_json(
         "model_name": model,
         "model_tier": tier,
         "auth_status": auth_status,
+        "supports_thinking": supports_thinking,
         "ready": ready,
         "profile": e.manifest.profile,
         "identity": {
@@ -731,6 +763,7 @@ fn enrich_agent_json(
             "avatar_url": e.identity.avatar_url,
             "color": e.identity.color,
         },
+        "web_search_augmentation": e.manifest.web_search_augmentation,
     })
 }
 
@@ -786,6 +819,11 @@ pub async fn list_agents(
     let mut agents: Vec<librefang_types::agent::AgentEntry> = state.kernel.agent_registry().list();
 
     // -- Filtering --
+    // Exclude hand agents by default; pass ?include_hands=true to include them.
+    if !params.include_hands.unwrap_or(false) {
+        agents.retain(|e| !e.is_hand);
+    }
+
     if let Some(ref q) = params.q {
         let q_lower = q.to_lowercase();
         agents.retain(|e| {
@@ -1142,6 +1180,9 @@ pub async fn send_message(
         (req.message.clone(), false)
     };
 
+    let thinking_override = req.thinking;
+    let show_thinking = req.show_thinking.unwrap_or(true);
+
     let result = if is_ephemeral {
         // Ephemeral "side question" — use a temp session, no persistence
         state
@@ -1153,14 +1194,24 @@ pub async fn send_message(
         if let Some(sender) = sender_context.as_ref() {
             state
                 .kernel
-                .send_message_with_sender_context(agent_id, &effective_message, sender)
+                .send_message_with_sender_context_and_thinking(
+                    agent_id,
+                    &effective_message,
+                    sender,
+                    thinking_override,
+                )
                 .await
         } else {
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
             state
                 .kernel
-                .send_message_with_handle(agent_id, &effective_message, Some(kernel_handle))
+                .send_message_with_thinking_override(
+                    agent_id,
+                    &effective_message,
+                    Some(kernel_handle),
+                    thinking_override,
+                )
                 .await
         }
     };
@@ -1184,7 +1235,13 @@ pub async fn send_message(
                 );
             }
 
-            // Strip <think>...</think> blocks from model output
+            // Extract reasoning trace (optional) and strip <think>...</think>
+            // blocks from the final model output.
+            let thinking_trace = if show_thinking {
+                crate::ws::extract_think_content(&result.response)
+            } else {
+                None
+            };
             let cleaned = crate::ws::strip_think_tags(&result.response);
 
             // Guard: ensure we never return an empty response to the client
@@ -1210,6 +1267,7 @@ pub async fn send_message(
                     memories_saved: result.memories_saved,
                     memories_used: result.memories_used,
                     memory_conflicts: result.memory_conflicts,
+                    thinking: thinking_trace,
                 })),
             )
         }
@@ -1245,6 +1303,12 @@ fn request_sender_context(req: &MessageRequest) -> Option<SenderContext> {
         was_mentioned: req.was_mentioned,
         thread_id: None,
         account_id: None,
+        // Phase 2 §C — forward the optional group participant roster from the
+        // gateway POST body so the addressee guard can fire downstream. Empty
+        // when the caller (Telegram, direct API) doesn't populate it; the
+        // guard then becomes a no-op and cannot produce false positives.
+        group_participants: req.group_participants.clone().unwrap_or_default(),
+        ..Default::default()
     })
 }
 
@@ -1413,9 +1477,10 @@ pub async fn get_agent_session(
                                         msg.get_mut("tools").and_then(|v| v.as_array_mut())
                                     {
                                         if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
-                                            let preview: String =
-                                                result.chars().take(2000).collect();
-                                            tool_obj["result"] = serde_json::Value::String(preview);
+                                            // Cap at 100 KB to keep session responses manageable
+                                            let capped: String =
+                                                result.chars().take(102_400).collect();
+                                            tool_obj["result"] = serde_json::Value::String(capped);
                                             tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }
@@ -1486,6 +1551,22 @@ pub async fn kill_agent(
             );
         }
     };
+
+    // Hand-spawned runtime agents are owned by their hand instance. Killing
+    // one directly leaves the hand registry pointing at a dangling id that
+    // can respawn or produce stale instance state — require callers to
+    // deactivate or uninstall the owning hand instead. The dashboard hides
+    // Delete for hand agents already; this closes the direct-API loophole.
+    if let Some(entry) = state.kernel.agent_registry().get(agent_id) {
+        if entry.is_hand {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Cannot delete a hand-spawned agent directly; deactivate or uninstall the owning hand instead."
+                })),
+            );
+        }
+    }
 
     match state.kernel.kill_agent(agent_id) {
         Ok(()) => (
@@ -1641,11 +1722,36 @@ pub async fn get_agent(
         }
     };
 
+    let dm = {
+        let dm_override = state
+            .kernel
+            .default_model_override_ref()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        effective_default_model(
+            &state.kernel.config_ref().default_model,
+            dm_override.as_ref(),
+        )
+    };
+    let resolved_provider =
+        if entry.manifest.model.provider.is_empty() || entry.manifest.model.provider == "default" {
+            dm.provider.as_str()
+        } else {
+            entry.manifest.model.provider.as_str()
+        };
+    let resolved_model =
+        if entry.manifest.model.model.is_empty() || entry.manifest.model.model == "default" {
+            dm.model.as_str()
+        } else {
+            entry.manifest.model.model.as_str()
+        };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "id": entry.id.to_string(),
             "name": entry.name,
+            "is_hand": entry.is_hand,
             "state": format!("{:?}", entry.state),
             "mode": entry.mode,
             "profile": entry.manifest.profile,
@@ -1653,8 +1759,10 @@ pub async fn get_agent(
             "last_active": entry.last_active.to_rfc3339(),
             "session_id": entry.session_id.0.to_string(),
             "model": {
-                "provider": entry.manifest.model.provider,
-                "model": entry.manifest.model.model,
+                "provider": resolved_provider,
+                "model": resolved_model,
+                "max_tokens": entry.manifest.model.max_tokens,
+                "temperature": entry.manifest.model.temperature,
             },
             "capabilities": {
                 "tools": entry.manifest.capabilities.tools,
@@ -1675,6 +1783,7 @@ pub async fn get_agent(
             "mcp_servers": entry.manifest.mcp_servers,
             "mcp_servers_mode": if entry.manifest.mcp_servers.is_empty() { "all" } else { "allowlist" },
             "fallback_models": entry.manifest.fallback_models,
+            "web_search_augmentation": entry.manifest.web_search_augmentation,
         })),
     )
 }
@@ -1764,44 +1873,57 @@ pub async fn send_message_stream(
         }
     };
 
-    let sse_stream = stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(event) => {
-                let sse_event: Result<Event, std::convert::Infallible> = Ok(match event {
-                    StreamEvent::TextDelta { text } => Event::default()
+    // Defense against the agent loop emitting the same text span twice in a
+    // single streaming turn (observed when multi-iteration loops re-assert a
+    // final sentence after a tool step). The dedup window is per-request, so
+    // legitimate repetitions across turns stay unaffected.
+    let sse_stream = stream::unfold((rx, StreamDedup::new()), |(mut rx, mut dedup)| async move {
+        loop {
+            let event = rx.recv().await?;
+            let sse_event: Result<Event, std::convert::Infallible> = Ok(match event {
+                StreamEvent::TextDelta { text } => {
+                    if dedup.is_duplicate(&text) {
+                        tracing::debug!(
+                            len = text.len(),
+                            preview = %text.chars().take(40).collect::<String>(),
+                            "stream dedup: dropping duplicate TextDelta",
+                        );
+                        continue;
+                    }
+                    dedup.record_sent(&text);
+                    Event::default()
                         .event("chunk")
                         .json_data(serde_json::json!({"content": text, "done": false}))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::ToolUseStart { name, .. } => Event::default()
-                        .event("tool_use")
-                        .json_data(serde_json::json!({"tool": name}))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::ToolUseEnd { name, input, .. } => Event::default()
-                        .event("tool_result")
-                        .json_data(serde_json::json!({"tool": name, "input": input}))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::ContentComplete { usage, .. } => Event::default()
-                        .event("done")
-                        .json_data(serde_json::json!({
-                            "done": true,
-                            "usage": {
-                                "input_tokens": usage.input_tokens,
-                                "output_tokens": usage.output_tokens,
-                            }
-                        }))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    StreamEvent::PhaseChange { phase, detail } => Event::default()
-                        .event("phase")
-                        .json_data(serde_json::json!({
-                            "phase": phase,
-                            "detail": detail,
-                        }))
-                        .unwrap_or_else(|_| Event::default().data("error")),
-                    _ => Event::default().comment("skip"),
-                });
-                Some((sse_event, rx))
-            }
-            None => None,
+                        .unwrap_or_else(|_| Event::default().data("error"))
+                }
+                StreamEvent::ToolUseStart { name, .. } => Event::default()
+                    .event("tool_use")
+                    .json_data(serde_json::json!({"tool": name}))
+                    .unwrap_or_else(|_| Event::default().data("error")),
+                StreamEvent::ToolUseEnd { name, input, .. } => Event::default()
+                    .event("tool_result")
+                    .json_data(serde_json::json!({"tool": name, "input": input}))
+                    .unwrap_or_else(|_| Event::default().data("error")),
+                StreamEvent::ContentComplete { usage, .. } => Event::default()
+                    .event("done")
+                    .json_data(serde_json::json!({
+                        "done": true,
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                        }
+                    }))
+                    .unwrap_or_else(|_| Event::default().data("error")),
+                StreamEvent::PhaseChange { phase, detail } => Event::default()
+                    .event("phase")
+                    .json_data(serde_json::json!({
+                        "phase": phase,
+                        "detail": detail,
+                    }))
+                    .unwrap_or_else(|_| Event::default().data("error")),
+                _ => Event::default().comment("skip"),
+            });
+            return Some((sse_event, (rx, dedup)));
         }
     });
 
@@ -2295,6 +2417,15 @@ pub async fn set_model(
         }
     };
     let explicit_provider = body["provider"].as_str();
+    // Check agent exists — kernel returns a generic error for missing
+    // agents that the match arm below would wrap as 500. Validate up
+    // front so the caller gets a 404 for the common case.
+    if state.kernel.agent_registry().get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
+        );
+    }
     match state
         .kernel
         .set_agent_model(agent_id, model, explicit_provider)
@@ -2472,6 +2603,16 @@ pub async fn set_agent_tools(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": t.t("api-error-agent-missing-tools")})),
+        );
+    }
+
+    // Check agent exists — kernel returns a generic error for missing
+    // agents that the match arm below would wrap as 500. Validate up
+    // front so the caller gets a 404 for the common case.
+    if state.kernel.agent_registry().get(agent_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
         );
     }
 
@@ -2867,6 +3008,24 @@ pub async fn patch_agent(
             );
         }
     }
+    if let Some(mcp_servers) = match patch_agent_mcp_servers(&body) {
+        Ok(servers) => servers,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            );
+        }
+    } {
+        if let Err(e) = state.kernel.set_agent_mcp_servers(agent_id, mcp_servers) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
+                ),
+            );
+        }
+    }
 
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.agent_registry().get(agent_id) {
@@ -2885,6 +3044,31 @@ pub async fn patch_agent(
             Json(serde_json::json!({"error": t.t("api-error-agent-vanished")})),
         )
     }
+}
+
+fn patch_agent_mcp_servers(body: &serde_json::Value) -> Result<Option<Vec<String>>, &'static str> {
+    let raw = body.get("mcp_servers").or_else(|| {
+        body.get("capabilities")
+            .and_then(|caps| caps.get("mcp_servers"))
+    });
+
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let items = raw
+        .as_array()
+        .ok_or("mcp_servers must be an array of strings")?;
+
+    let mut servers = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item
+            .as_str()
+            .ok_or("mcp_servers must be an array of strings")?;
+        servers.push(name.to_string());
+    }
+
+    Ok(Some(servers))
 }
 
 // ---------------------------------------------------------------------------
@@ -3010,8 +3194,15 @@ pub struct PatchAgentConfigRequest {
     pub provider: Option<String>,
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
+    /// Maximum tokens for LLM response. Controls conversation window size.
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature (0.0–2.0). Lower values are more deterministic.
+    pub temperature: Option<f32>,
     #[schema(value_type = Option<Vec<serde_json::Value>>)]
     pub fallback_models: Option<Vec<librefang_types::agent::FallbackModel>>,
+    /// Web search augmentation mode: "off", "auto", or "always".
+    #[schema(value_type = Option<String>)]
+    pub web_search_augmentation: Option<librefang_types::agent::WebSearchAugmentationMode>,
 }
 
 /// PATCH /api/agents/{id}/config — Hot-update agent name, description, system prompt, and identity.
@@ -3187,52 +3378,70 @@ pub async fn patch_agent_config(
         }
     }
 
-    // Update model/provider — use set_agent_model for catalog-based provider
-    // resolution when provider is not explicitly provided (fixes #387/#466:
-    // changing model from another provider without specifying provider now
-    // auto-resolves the correct provider from the model catalog).
+    // Update model/provider — always go through set_agent_model so that
+    // provider-change semantics (prefix stripping, canonical-session cleanup,
+    // and clearing of stale per-agent api_key_env / base_url overrides) are
+    // applied uniformly. Bypassing it via update_model_and_provider was the
+    // root cause of #2380: switching to a non-default provider via the
+    // dashboard left stale CLOUDVERSE_API_KEY / cloudverse base_url on the
+    // manifest, so the new provider's request was sent to the old URL with
+    // the old credentials and rejected with "Missing Authentication header".
     if let Some(ref new_model) = req.model {
         if !new_model.is_empty() {
-            if let Some(ref new_provider) = req.provider {
-                if !new_provider.is_empty() {
-                    // Explicit provider given — use it directly
-                    if state
-                        .kernel
-                        .agent_registry()
-                        .update_model_and_provider(
-                            agent_id,
-                            new_model.clone(),
-                            new_provider.clone(),
-                        )
-                        .is_err()
-                    {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
-                        );
-                    }
-                } else {
-                    // Provider is empty string — resolve from catalog
-                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(
-                                serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
-                            ),
-                        );
-                    }
-                }
-            } else {
-                // No provider field at all — resolve from catalog
-                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
-                        ),
-                    );
-                }
+            let explicit_provider = req.provider.as_deref().filter(|p| !p.is_empty());
+            if let Err(e) = state
+                .kernel
+                .set_agent_model(agent_id, new_model, explicit_provider)
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
+                    ),
+                );
             }
+        }
+    }
+
+    // Validate and update temperature (sampling randomness)
+    if let Some(temperature) = req.temperature {
+        if !(0.0..=2.0).contains(&temperature) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "temperature must be between 0.0 and 2.0"})),
+            );
+        }
+        if state
+            .kernel
+            .agent_registry()
+            .update_temperature(agent_id, temperature)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
+            );
+        }
+    }
+
+    // Update max_tokens (response length / conversation window limit)
+    if let Some(max_tokens) = req.max_tokens {
+        if max_tokens == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "max_tokens must be greater than 0"})),
+            );
+        }
+        if state
+            .kernel
+            .agent_registry()
+            .update_max_tokens(agent_id, max_tokens)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
+            );
         }
     }
 
@@ -3242,6 +3451,21 @@ pub async fn patch_agent_config(
             .kernel
             .agent_registry()
             .update_fallback_models(agent_id, fallbacks)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
+            );
+        }
+    }
+
+    // Update web search augmentation mode
+    if let Some(mode) = req.web_search_augmentation {
+        if state
+            .kernel
+            .agent_registry()
+            .update_web_search_augmentation(agent_id, mode)
             .is_err()
         {
             return (
@@ -3420,6 +3644,49 @@ pub async fn clone_agent(
             "name": req.new_name,
         })),
     )
+}
+
+/// POST /api/agents/{id}/reload — Re-read the agent's agent.toml from disk.
+///
+/// Picks up manual edits to fields like `skills`, `mcp_servers`, `tools`,
+/// or `system_prompt` without restarting the daemon. Runtime-only fields
+/// (workspace path, tags) are preserved.
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/reload",
+    tag = "agents",
+    params(("id" = String, Path, description = "Agent ID")),
+    responses(
+        (status = 200, description = "Agent manifest reloaded from agent.toml", body = serde_json::Value)
+    )
+)]
+pub async fn reload_agent_manifest(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> impl IntoResponse {
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
+            );
+        }
+    };
+    match state.kernel.reload_agent_from_disk(agent_id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "reloaded", "agent_id": id})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
+            ),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3879,13 +4146,35 @@ pub(crate) static UPLOAD_REGISTRY: LazyLock<DashMap<String, UploadMeta>> =
 #[allow(dead_code)]
 const MAX_UPLOAD_SIZE: usize = 10 * 1024 * 1024;
 
-/// Allowed content type prefixes for upload.
-const ALLOWED_CONTENT_TYPES: &[&str] = &["image/", "text/", "application/pdf", "audio/"];
+/// Non-media MIME types also accepted on `/api/agents/{id}/upload` — text
+/// files and PDFs that the agent loop consumes directly. Media types are
+/// sourced from `librefang_types::media::{ALLOWED_IMAGE_TYPES,
+/// ALLOWED_AUDIO_TYPES}` so the upload endpoint, the channel bridge, and
+/// `MediaAttachment::validate()` can never drift.
+const EXTRA_ALLOWED_UPLOAD_TYPES: &[&str] =
+    &["text/plain", "text/markdown", "text/csv", "application/pdf"];
 
+/// Exact-match MIME allowlist for `/api/agents/{id}/upload`.
+///
+/// Historically this was the prefix list `["image/", "text/",
+/// "application/pdf", "audio/"]`, which accepted any `image/*` subtype —
+/// including `image/svg+xml` (scriptable → XSS / SSRF via `<use
+/// xlink:href>`), `image/x-icon`, `image/tiff`, `image/heic` — and every
+/// `text/*` subtype including `text/html` and `text/xml`. That
+/// contradicted the SECURITY.md promise of *"Media type whitelist
+/// (png/jpeg/gif/webp)"*.
+///
+/// The new check is exact-match against the canonical
+/// `librefang_types::media::ALLOWED_IMAGE_TYPES` +
+/// `ALLOWED_AUDIO_TYPES` constants, so the upload endpoint and
+/// `MediaAttachment::validate()` share a single source of truth and
+/// cannot drift.
 fn is_allowed_content_type(ct: &str) -> bool {
-    ALLOWED_CONTENT_TYPES
-        .iter()
-        .any(|prefix| ct.starts_with(prefix))
+    use librefang_types::media::{mime_base, ALLOWED_AUDIO_TYPES, ALLOWED_IMAGE_TYPES};
+    let base = mime_base(ct);
+    ALLOWED_IMAGE_TYPES.contains(&base.as_str())
+        || ALLOWED_AUDIO_TYPES.contains(&base.as_str())
+        || EXTRA_ALLOWED_UPLOAD_TYPES.contains(&base.as_str())
 }
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
@@ -4310,6 +4599,61 @@ pub async fn push_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use librefang_channels::types::ParticipantRef;
+
+    /// The pre-fix prefix-match (`"image/"`) let SVG, BMP, TIFF, HEIC and
+    /// friends through. Post-fix the allowlist is exact-match over the
+    /// same four formats SECURITY.md advertises.
+    #[test]
+    fn test_upload_mime_allowlist_rejects_previously_accepted_types() {
+        // Previously accepted via prefix match, now explicitly rejected.
+        for bad in [
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8",
+            "image/bmp",
+            "image/tiff",
+            "image/x-icon",
+            "image/heic",
+            "image/heif",
+            "image/avif",
+            "image/vnd.microsoft.icon",
+            "text/html", // text/ prefix used to let this through
+            "text/xml",
+            "audio/vnd.rn-realaudio",
+            "application/octet-stream",
+            "application/javascript",
+        ] {
+            assert!(
+                !is_allowed_content_type(bad),
+                "{bad} must be rejected by the upload allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn test_upload_mime_allowlist_accepts_expected_formats() {
+        for good in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "image/PNG",                 // case-insensitive
+            "image/png; charset=binary", // MIME params stripped
+            "audio/mpeg",
+            "audio/wav",
+            "audio/ogg",
+            "audio/flac",
+            "text/plain",
+            "text/markdown",
+            "text/csv",
+            "application/pdf",
+        ] {
+            assert!(
+                is_allowed_content_type(good),
+                "{good} must be accepted by the upload allowlist"
+            );
+        }
+    }
 
     #[test]
     fn test_clone_request_defaults() {
@@ -4418,6 +4762,9 @@ mod tests {
             is_group: false,
             was_mentioned: false,
             ephemeral: false,
+            thinking: None,
+            show_thinking: None,
+            group_participants: None,
         };
         assert!(request_sender_context(&req).is_none());
     }
@@ -4433,11 +4780,15 @@ mod tests {
             is_group: false,
             was_mentioned: false,
             ephemeral: false,
+            thinking: None,
+            show_thinking: None,
+            group_participants: None,
         };
         let sender = request_sender_context(&req).expect("sender context");
         assert_eq!(sender.user_id, "u-123");
         assert_eq!(sender.display_name, "u-123");
         assert_eq!(sender.channel, "api");
+        assert!(sender.group_participants.is_empty());
     }
 
     #[test]
@@ -4451,10 +4802,79 @@ mod tests {
             is_group: true,
             was_mentioned: true,
             ephemeral: false,
+            thinking: None,
+            show_thinking: None,
+            group_participants: None,
         };
         let sender = request_sender_context(&req).expect("sender context");
         assert!(sender.is_group);
         assert!(sender.was_mentioned);
+    }
+
+    #[test]
+    fn test_request_sender_context_threads_group_participants() {
+        let roster = vec![
+            ParticipantRef {
+                jid: "111@s.whatsapp.net".to_string(),
+                display_name: "Alice".to_string(),
+            },
+            ParticipantRef {
+                jid: "222@s.whatsapp.net".to_string(),
+                display_name: "Bob".to_string(),
+            },
+        ];
+        let req = MessageRequest {
+            message: "Bob, ciao".to_string(),
+            attachments: Vec::new(),
+            sender_id: Some("111@s.whatsapp.net".to_string()),
+            sender_name: Some("Alice".to_string()),
+            channel_type: Some("whatsapp".to_string()),
+            is_group: true,
+            was_mentioned: false,
+            ephemeral: false,
+            thinking: None,
+            show_thinking: None,
+            group_participants: Some(roster.clone()),
+        };
+        let sender = request_sender_context(&req).expect("sender context");
+        assert_eq!(sender.group_participants, roster);
+    }
+
+    #[test]
+    fn test_message_request_group_participants_default_when_missing() {
+        // Backward compat: callers (Telegram, direct API) that omit
+        // `group_participants` must still deserialize cleanly.
+        let json = serde_json::json!({
+            "message": "hi",
+            "sender_id": "u-1",
+            "channel_type": "telegram",
+            "is_group": false,
+        });
+        let req: MessageRequest =
+            serde_json::from_value(json).expect("deserialize without group_participants");
+        assert!(req.group_participants.is_none());
+        let sender = request_sender_context(&req).expect("sender context");
+        assert!(sender.group_participants.is_empty());
+    }
+
+    #[test]
+    fn test_message_request_group_participants_deserializes_from_json() {
+        let json = serde_json::json!({
+            "message": "hey Bob",
+            "sender_id": "111@s.whatsapp.net",
+            "sender_name": "Alice",
+            "channel_type": "whatsapp:group-jid@g.us",
+            "is_group": true,
+            "group_participants": [
+                {"jid": "111@s.whatsapp.net", "display_name": "Alice"},
+                {"jid": "222@s.whatsapp.net", "display_name": "Bob"}
+            ]
+        });
+        let req: MessageRequest =
+            serde_json::from_value(json).expect("deserialize with group_participants");
+        let sender = request_sender_context(&req).expect("sender context");
+        assert_eq!(sender.group_participants.len(), 2);
+        assert_eq!(sender.group_participants[1].display_name, "Bob");
     }
 
     #[test]
@@ -4465,6 +4885,8 @@ mod tests {
             api_key_env: "OPENAI_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         };
         let override_dm = librefang_types::config::DefaultModelConfig {
             provider: "deepseek".to_string(),
@@ -4472,6 +4894,8 @@ mod tests {
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         };
 
         let effective = effective_default_model(&base, Some(&override_dm));
@@ -4489,6 +4913,8 @@ mod tests {
             api_key_env: "OPENAI_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         };
 
         let effective = effective_default_model(&base, None);
@@ -4496,6 +4922,43 @@ mod tests {
         assert_eq!(effective.provider, "openai");
         assert_eq!(effective.model, "gpt-4.1");
         assert_eq!(effective.api_key_env, "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn test_patch_config_request_temperature_deserialization() {
+        let json = r#"{"temperature": 1.5}"#;
+        let req: PatchAgentConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.temperature, Some(1.5));
+        assert!(req.max_tokens.is_none());
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn test_patch_config_request_temperature_range() {
+        // Valid ranges
+        for temp in [0.0, 0.5, 1.0, 1.5, 2.0] {
+            let json = format!(r#"{{"temperature": {temp}}}"#);
+            let req: PatchAgentConfigRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(req.temperature, Some(temp));
+        }
+
+        // Out of range values still deserialize (validation happens in handler)
+        let json = r#"{"temperature": 3.0}"#;
+        let req: PatchAgentConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.temperature, Some(3.0));
+
+        // Negative values still deserialize (validation happens in handler)
+        let json = r#"{"temperature": -0.5}"#;
+        let req: PatchAgentConfigRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.temperature, Some(-0.5));
+    }
+
+    #[test]
+    fn test_patch_config_request_without_temperature() {
+        let json = r#"{"max_tokens": 4096}"#;
+        let req: PatchAgentConfigRequest = serde_json::from_str(json).unwrap();
+        assert!(req.temperature.is_none());
+        assert_eq!(req.max_tokens, Some(4096));
     }
 }
 
@@ -4736,11 +5199,15 @@ mod monitoring_tests {
             clawhub_cache: dashmap::DashMap::new(),
             skillhub_cache: dashmap::DashMap::new(),
             provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
+            provider_test_cache: dashmap::DashMap::new(),
             webhook_store: crate::webhook_store::WebhookStore::load(home_dir.join("webhooks.json")),
             active_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "telemetry")]
             prometheus_handle: None,
             media_drivers: librefang_runtime::media::MediaDriverCache::new(),
+            webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
+            api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+            config_write_lock: tokio::sync::Mutex::new(()),
         });
         (state, tmp)
     }
@@ -4824,5 +5291,118 @@ mod monitoring_tests {
         let logs = body["logs"].as_array().unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0]["outcome"], "custom_error");
+    }
+
+    #[test]
+    fn test_patch_agent_mcp_servers_parses_top_level_and_nested_shapes() {
+        let top_level = serde_json::json!({"mcp_servers": ["alpha", "beta"]});
+        assert_eq!(
+            patch_agent_mcp_servers(&top_level).unwrap(),
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+
+        let nested = serde_json::json!({"capabilities": {"mcp_servers": ["gamma"]}});
+        assert_eq!(
+            patch_agent_mcp_servers(&nested).unwrap(),
+            Some(vec!["gamma".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_patch_agent_mcp_servers_rejects_invalid_shape() {
+        let invalid = serde_json::json!({"mcp_servers": [{}]});
+        assert!(patch_agent_mcp_servers(&invalid).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_patch_agent_updates_top_level_mcp_servers_and_persists() {
+        let (state, _tmp) = monitoring_test_app_state();
+        let manifest = AgentManifest {
+            name: "patch-top-level-mcp".to_string(),
+            mcp_servers: vec!["server-a".to_string()],
+            ..AgentManifest::default()
+        };
+        let agent_id = state.kernel.spawn_agent(manifest).unwrap();
+
+        let (status, body) = json_response(
+            patch_agent(
+                State(state.clone()),
+                Path(agent_id.to_string()),
+                None,
+                Json(serde_json::json!({"mcp_servers": []})),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            state
+                .kernel
+                .agent_registry()
+                .get(agent_id)
+                .unwrap()
+                .manifest
+                .mcp_servers,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            state
+                .kernel
+                .memory_substrate()
+                .load_agent(agent_id)
+                .unwrap()
+                .unwrap()
+                .manifest
+                .mcp_servers,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_patch_agent_updates_nested_capabilities_mcp_servers_and_persists() {
+        let (state, _tmp) = monitoring_test_app_state();
+        let manifest = AgentManifest {
+            name: "patch-nested-mcp".to_string(),
+            mcp_servers: vec!["server-b".to_string()],
+            ..AgentManifest::default()
+        };
+        let agent_id = state.kernel.spawn_agent(manifest).unwrap();
+
+        let (status, body) = json_response(
+            patch_agent(
+                State(state.clone()),
+                Path(agent_id.to_string()),
+                None,
+                Json(serde_json::json!({"capabilities": {"mcp_servers": []}})),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            state
+                .kernel
+                .agent_registry()
+                .get(agent_id)
+                .unwrap()
+                .manifest
+                .mcp_servers,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            state
+                .kernel
+                .memory_substrate()
+                .load_agent(agent_id)
+                .unwrap()
+                .unwrap()
+                .manifest
+                .mcp_servers,
+            Vec::<String>::new()
+        );
     }
 }

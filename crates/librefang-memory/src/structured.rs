@@ -254,8 +254,21 @@ impl StructuredStore {
                 identity_str,
                 source_toml_path,
             )) => {
-                let manifest = rmp_serde::from_slice(&manifest_blob)
-                    .map_err(|e| LibreFangError::Serialization(e.to_string()))?;
+                let mut manifest: librefang_types::agent::AgentManifest =
+                    rmp_serde::from_slice(&manifest_blob)
+                        .map_err(|e| LibreFangError::Serialization(e.to_string()))?;
+                // Migrate legacy hand agents: if manifest.is_hand is not set but
+                // the agent looks like a hand (tags or name convention), fix it now.
+                if !manifest.is_hand {
+                    let looks_like_hand = manifest
+                        .tags
+                        .iter()
+                        .any(|t: &String| t.starts_with("hand:"))
+                        || name.contains(':');
+                    if looks_like_hand {
+                        manifest.is_hand = true;
+                    }
+                }
                 let state = serde_json::from_str(&state_str)
                     .map_err(|e| LibreFangError::Serialization(e.to_string()))?;
                 let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
@@ -268,6 +281,7 @@ impl StructuredStore {
                 let identity = identity_str
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default();
+                let is_hand = manifest.is_hand;
                 Ok(Some(AgentEntry {
                     id: agent_id,
                     name,
@@ -284,6 +298,7 @@ impl StructuredStore {
                     identity,
                     onboarding_completed: false,
                     onboarding_completed_at: None,
+                    is_hand,
                 }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -291,17 +306,56 @@ impl StructuredStore {
         }
     }
 
-    /// Remove an agent from the database.
+    /// Remove an agent from the database, cascading to all agent-scoped tables.
+    ///
+    /// SQLite foreign keys are not enforced (`PRAGMA foreign_keys=OFF` default)
+    /// and none of these tables declared `ON DELETE CASCADE`, so prior to
+    /// this function rows keyed by `agent_id` would accumulate indefinitely
+    /// after agent deletion. All DELETEs run inside a single transaction so
+    /// a mid-cascade failure leaves no half-removed state.
+    ///
+    /// Tables covered: agents, kv_store, task_queue, memories,
+    /// canonical_sessions, audit_entries, usage_events, entities, relations,
+    /// approval_audit, prompt_versions, prompt_experiments (plus their
+    /// dependent experiment_variants and experiment_metrics rows), and
+    /// events via source_agent. sessions / sessions_fts are handled by
+    /// the caller (MemorySubstrate::remove_agent via SessionStore).
     pub fn remove_agent(&self, agent_id: AgentId) -> LibreFangResult<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| LibreFangError::Internal(e.to_string()))?;
-        conn.execute(
+        let id = agent_id.0.to_string();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+
+        // Subquery-scoped deletes must happen BEFORE prompt_experiments
+        // is cleared, otherwise the IN (SELECT ...) matches nothing.
+        for stmt in [
+            "DELETE FROM experiment_metrics \
+             WHERE experiment_id IN (SELECT id FROM prompt_experiments WHERE agent_id = ?1)",
+            "DELETE FROM experiment_variants \
+             WHERE experiment_id IN (SELECT id FROM prompt_experiments WHERE agent_id = ?1)",
+            "DELETE FROM prompt_experiments WHERE agent_id = ?1",
+            "DELETE FROM prompt_versions WHERE agent_id = ?1",
+            "DELETE FROM approval_audit WHERE agent_id = ?1",
+            "DELETE FROM audit_entries WHERE agent_id = ?1",
+            "DELETE FROM usage_events WHERE agent_id = ?1",
+            "DELETE FROM memories WHERE agent_id = ?1",
+            "DELETE FROM canonical_sessions WHERE agent_id = ?1",
+            "DELETE FROM kv_store WHERE agent_id = ?1",
+            "DELETE FROM task_queue WHERE agent_id = ?1",
+            "DELETE FROM entities WHERE agent_id = ?1",
+            "DELETE FROM relations WHERE agent_id = ?1",
+            "DELETE FROM events WHERE source_agent = ?1",
             "DELETE FROM agents WHERE id = ?1",
-            rusqlite::params![agent_id.0.to_string()],
-        )
-        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+        ] {
+            tx.execute(stmt, rusqlite::params![id])
+                .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
         Ok(())
     }
 
@@ -407,7 +461,7 @@ impl StructuredStore {
                 }
             };
 
-            let manifest: librefang_types::agent::AgentManifest = match rmp_serde::from_slice(
+            let mut manifest: librefang_types::agent::AgentManifest = match rmp_serde::from_slice(
                 &manifest_blob,
             ) {
                 Ok(m) => m,
@@ -420,12 +474,26 @@ impl StructuredStore {
                 }
             };
 
+            // Migrate legacy hand agents: if manifest.is_hand is not set but the
+            // agent looks like a hand (tags or name convention), fix it now so
+            // the repaired blob persists the correct value.
+            if !manifest.is_hand {
+                let looks_like_hand = manifest
+                    .tags
+                    .iter()
+                    .any(|t: &String| t.starts_with("hand:"))
+                    || name.contains(':');
+                if looks_like_hand {
+                    manifest.is_hand = true;
+                }
+            }
+
             // Auto-repair: re-serialize with current schema and queue for update.
             // This upgrades the stored blob so future boots don't hit lenient paths.
             let new_blob = rmp_serde::to_vec_named(&manifest)
                 .map_err(|e| LibreFangError::Serialization(e.to_string()))?;
             if new_blob != manifest_blob {
-                tracing::info!(
+                tracing::debug!(
                     agent = %name, id = %id_str,
                     "Auto-repaired agent manifest (schema upgraded)"
                 );
@@ -451,6 +519,7 @@ impl StructuredStore {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
 
+            let is_hand = manifest.is_hand;
             agents.push(AgentEntry {
                 id: agent_id,
                 name,
@@ -467,6 +536,7 @@ impl StructuredStore {
                 identity,
                 onboarding_completed: false,
                 onboarding_completed_at: None,
+                is_hand,
             });
         }
 
@@ -581,6 +651,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         };
 
         store.save_agent(&entry).unwrap();

@@ -59,6 +59,7 @@ fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(routes::inbox::router())
         .merge(routes::media::router())
         .merge(routes::prompts::routes())
+        .merge(routes::terminal::router())
         // Dashboard credential login (handler defined locally in server.rs)
         .route(
             "/auth/dashboard-login",
@@ -160,14 +161,53 @@ pub(crate) fn dashboard_session_token(kernel: &LibreFangKernel) -> Option<String
 
 pub(crate) fn valid_api_tokens(kernel: &LibreFangKernel) -> Vec<String> {
     let mut tokens = Vec::new();
-    let explicit_api_key = kernel.config_ref().api_key.trim();
-    if !explicit_api_key.is_empty() {
-        tokens.push(explicit_api_key.to_string());
+    let cfg = kernel.config_ref();
+    let explicit_api_key = cfg.api_key.trim();
+    if explicit_api_key.is_empty() {
+        // No api_key configured — API is open, no auth required.
+        // Dashboard login is handled separately by session cookie checks.
+        return tokens;
     }
+    tokens.push(explicit_api_key.to_string());
     if let Some(token) = dashboard_session_token(kernel) {
         tokens.push(token);
     }
     tokens
+}
+
+pub(crate) fn has_dashboard_credentials(kernel: &LibreFangKernel) -> bool {
+    let cfg = kernel.config_ref();
+    let username = resolve_dashboard_credential(
+        &cfg.dashboard_user,
+        "LIBREFANG_DASHBOARD_USER",
+        kernel.home_dir(),
+    );
+    let password = resolve_dashboard_credential(
+        &cfg.dashboard_pass,
+        "LIBREFANG_DASHBOARD_PASS",
+        kernel.home_dir(),
+    );
+    !username.trim().is_empty()
+        && (!cfg.dashboard_pass_hash.trim().is_empty() || !password.trim().is_empty())
+}
+
+pub(crate) fn configured_user_api_keys(kernel: &LibreFangKernel) -> Vec<middleware::ApiUserAuth> {
+    kernel
+        .config_ref()
+        .users
+        .iter()
+        .filter_map(|user| {
+            let api_key_hash = user.api_key_hash.as_deref()?.trim();
+            if api_key_hash.is_empty() {
+                return None;
+            }
+            Some(middleware::ApiUserAuth {
+                name: user.name.clone(),
+                role: librefang_kernel::auth::UserRole::from_str_role(&user.role),
+                api_key_hash: api_key_hash.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Dashboard credential login — validates username/password using Argon2id
@@ -177,7 +217,7 @@ async fn dashboard_login(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let cfg = &state.kernel.config_ref();
+    let cfg = state.kernel.config_snapshot();
     let cfg_user = resolve_dashboard_credential(
         &cfg.dashboard_user,
         "LIBREFANG_DASHBOARD_USER",
@@ -222,12 +262,64 @@ async fn dashboard_login(
                 );
             }
 
+            // TOTP second-factor check for login
+            let policy = state.kernel.approvals().policy();
+            if policy.second_factor.requires_login_totp() {
+                let totp_enrolled = state
+                    .kernel
+                    .vault_get("totp_secret")
+                    .is_some_and(|s| !s.is_empty());
+                let totp_confirmed =
+                    state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
+                if totp_enrolled && totp_confirmed {
+                    let totp_code = body.get("totp_code").and_then(|v| v.as_str()).unwrap_or("");
+                    if totp_code.is_empty() {
+                        // Password OK but TOTP required — ask frontend to prompt
+                        return axum::response::Json(serde_json::json!({
+                            "ok": false,
+                            "requires_totp": true,
+                        }))
+                        .into_response();
+                    }
+                    // Verify TOTP code
+                    let secret = state.kernel.vault_get("totp_secret").unwrap_or_default();
+                    let issuer = policy.totp_issuer.clone();
+                    match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                        &secret, totp_code, &issuer,
+                    ) {
+                        Ok(true) => { /* TOTP valid, proceed to session creation */ }
+                        Ok(false) => {
+                            return (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                axum::response::Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "Invalid TOTP code",
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Err(e) => {
+                            tracing::warn!("TOTP verification error during login: {e}");
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::response::Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "TOTP verification failed",
+                                })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+
             // Store the session token so the auth middleware can validate it.
-            state
-                .active_sessions
-                .write()
-                .await
-                .insert(token.token.clone(), token.clone());
+            {
+                let mut sessions = state.active_sessions.write().await;
+                sessions.insert(token.token.clone(), token.clone());
+                // Persist so sessions survive daemon restarts.
+                save_sessions(state.kernel.home_dir(), &sessions);
+            }
 
             axum::response::Json(serde_json::json!({
                 "ok": true,
@@ -252,7 +344,7 @@ async fn dashboard_login(
 async fn dashboard_auth_check(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
 ) -> axum::response::Json<serde_json::Value> {
-    let cfg = &state.kernel.config_ref();
+    let cfg = state.kernel.config_ref();
     let du = resolve_dashboard_credential(
         &cfg.dashboard_user,
         "LIBREFANG_DASHBOARD_USER",
@@ -266,9 +358,30 @@ async fn dashboard_auth_check(
     let has_pass_hash = !cfg.dashboard_pass_hash.trim().is_empty();
     let has_credentials = !du.trim().is_empty() && (has_pass_hash || !dp.trim().is_empty());
     let has_api_key = !cfg.api_key.trim().is_empty();
+    let has_user_api_keys = cfg.users.iter().any(|user| {
+        user.api_key_hash
+            .as_deref()
+            .is_some_and(|hash| !hash.trim().is_empty())
+    });
+    let mode = if has_credentials && (has_api_key || has_user_api_keys) {
+        "hybrid"
+    } else if has_credentials {
+        "credentials"
+    } else if has_api_key || has_user_api_keys {
+        "api_key"
+    } else {
+        "none"
+    };
 
+    // Intentionally do NOT echo the configured dashboard username here: the
+    // endpoint is unauthenticated (the SPA calls it before the user has
+    // logged in) and returning the username would hand an anonymous remote
+    // caller one half of the credential pair, enabling targeted credential
+    // stuffing. The `mode` field is enough for the SPA to pick the right
+    // login form; the user already knows their own username.
     axum::response::Json(serde_json::json!({
-        "mode": if has_credentials { "credentials" } else if has_api_key { "api_key" } else { "none" },
+        "mode": mode,
+        "username": "",
     }))
 }
 
@@ -276,19 +389,22 @@ async fn dashboard_auth_check(
 #[derive(serde::Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
-    new_password: String,
+    /// New password — optional, omit to keep the current password.
+    new_password: Option<String>,
+    /// New username — optional, omit to keep the current username.
+    new_username: Option<String>,
 }
 
-/// Change the dashboard password.
+/// Change the dashboard password and/or username.
 ///
-/// Verifies the current password against the stored hash (or legacy plaintext),
-/// then hashes the new password with Argon2id and persists `dashboard_pass_hash`
-/// to config.toml. All existing sessions are invalidated on success.
+/// Verifies the current password, then updates whichever credentials are
+/// provided in the request body. At least one of `new_password` or
+/// `new_username` must be non-empty. All existing sessions are invalidated on success.
 async fn change_password(
     axum::extract::State(state): axum::extract::State<Arc<routes::AppState>>,
     axum::Json(body): axum::Json<ChangePasswordRequest>,
 ) -> axum::response::Response {
-    let cfg = state.kernel.config_ref();
+    let cfg = state.kernel.config_snapshot();
 
     let cfg_user = resolve_dashboard_credential(
         &cfg.dashboard_user,
@@ -317,7 +433,7 @@ async fn change_password(
             .into_response();
     }
 
-    // Verify current password (reuse existing verification logic)
+    // Verify current password
     let verify = crate::password_hash::verify_dashboard_password(
         &cfg_user,
         &body.current_password,
@@ -336,47 +452,58 @@ async fn change_password(
             .into_response();
     }
 
-    // Validate new password is not empty
-    if body.new_password.trim().is_empty() {
+    // At least one of new_password / new_username must be provided
+    let new_pass_trimmed = body
+        .new_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let new_user_trimmed = body
+        .new_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if new_pass_trimmed.is_none() && new_user_trimmed.is_none() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             axum::response::Json(serde_json::json!({
                 "ok": false,
-                "error": "New password cannot be empty"
+                "error": "Provide at least a new password or new username"
             })),
         )
             .into_response();
     }
 
-    // Validate minimum password length
-    if body.new_password.len() < 8 {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::response::Json(serde_json::json!({
-                "ok": false,
-                "error": "Password must be at least 8 characters"
-            })),
-        )
-            .into_response();
-    }
-
-    // Hash the new password with Argon2id
-    let new_hash = match crate::password_hash::hash_password(&body.new_password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("Failed to hash new password: {e}");
+    // Validate new password length if provided
+    if let Some(np) = new_pass_trimmed {
+        if np.len() < 8 {
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::http::StatusCode::BAD_REQUEST,
                 axum::response::Json(serde_json::json!({
                     "ok": false,
-                    "error": "Failed to hash new password"
+                    "error": "Password must be at least 8 characters"
                 })),
             )
                 .into_response();
         }
-    };
+    }
 
-    // Persist to config.toml
+    // Validate new username if provided
+    if let Some(nu) = new_user_trimmed {
+        if nu.len() < 2 {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::response::Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Username must be at least 2 characters"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Load config.toml for writing
     let config_path = state.kernel.home_dir().join("config.toml");
     let mut table: toml::value::Table = if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
@@ -386,12 +513,38 @@ async fn change_password(
     } else {
         toml::value::Table::new()
     };
-    table.insert(
-        "dashboard_pass_hash".to_string(),
-        toml::Value::String(new_hash),
-    );
-    // Remove legacy plaintext password if present
-    table.remove("dashboard_pass");
+
+    // Update username if requested
+    if let Some(nu) = new_user_trimmed {
+        table.insert(
+            "dashboard_user".to_string(),
+            toml::Value::String(nu.to_string()),
+        );
+    }
+
+    // Update password if requested
+    if let Some(np) = new_pass_trimmed {
+        let new_hash = match crate::password_hash::hash_password(np) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("Failed to hash new password: {e}");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(serde_json::json!({
+                        "ok": false,
+                        "error": "Failed to hash new password"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        table.insert(
+            "dashboard_pass_hash".to_string(),
+            toml::Value::String(new_hash),
+        );
+        // Remove legacy plaintext password if present
+        table.remove("dashboard_pass");
+    }
 
     let toml_string = match toml::to_string_pretty(&table) {
         Ok(s) => s,
@@ -417,21 +570,79 @@ async fn change_password(
             .into_response();
     }
 
-    // Trigger config reload so the kernel picks up the new hash
-    if let Err(e) = state.kernel.reload_config() {
-        tracing::warn!("Config reload after password change failed: {e}");
+    // Trigger config reload so the kernel picks up the new credentials
+    if let Err(e) = state.kernel.reload_config().await {
+        tracing::warn!("Config reload after credential change failed: {e}");
     }
+
+    // Update api_key_lock so the derived static token reflects new credentials immediately
+    let new_api_key = valid_api_tokens(state.kernel.as_ref()).join("\n");
+    *state.api_key_lock.write().await = new_api_key;
 
     // Invalidate all existing sessions to force re-login
     state.active_sessions.write().await.clear();
+    clear_sessions_file(state.kernel.home_dir());
 
-    tracing::info!("Dashboard password changed successfully");
+    tracing::info!("Dashboard credentials changed successfully");
 
     axum::response::Json(serde_json::json!({
         "ok": true,
-        "message": "Password changed successfully"
+        "message": "Credentials changed successfully"
     }))
     .into_response()
+}
+
+/// Path to the file where active sessions are persisted across restarts.
+fn sessions_path(home_dir: &std::path::Path) -> std::path::PathBuf {
+    home_dir.join("sessions.json")
+}
+
+/// Load persisted sessions from disk, dropping any that have already expired.
+fn load_sessions(
+    home_dir: &std::path::Path,
+) -> std::collections::HashMap<String, crate::password_hash::SessionToken> {
+    let path = sessions_path(home_dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let sessions: std::collections::HashMap<String, crate::password_hash::SessionToken> =
+        serde_json::from_str(&content).unwrap_or_default();
+    sessions
+        .into_iter()
+        .filter(|(_, st)| {
+            !crate::password_hash::is_token_expired(
+                st,
+                crate::password_hash::DEFAULT_SESSION_TTL_SECS,
+            )
+        })
+        .collect()
+}
+
+/// Persist active sessions to disk so they survive daemon restarts.
+fn save_sessions(
+    home_dir: &std::path::Path,
+    sessions: &std::collections::HashMap<String, crate::password_hash::SessionToken>,
+) {
+    let path = sessions_path(home_dir);
+    match serde_json::to_string(sessions) {
+        Ok(content) => {
+            if let Err(e) = std::fs::write(&path, content) {
+                tracing::warn!("Failed to persist sessions: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize sessions: {e}"),
+    }
+}
+
+/// Remove the sessions persistence file (called on password change to force re-login).
+fn clear_sessions_file(home_dir: &std::path::Path) {
+    let path = sessions_path(home_dir);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("Failed to clear sessions file: {e}");
+        }
+    }
 }
 
 /// Build the full API router with all routes, middleware, and state.
@@ -446,7 +657,10 @@ pub async fn build_router(
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
     // Start channel bridges (Telegram, etc.)
-    let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
+    // Webhook-based channels (Feishu, Teams, etc.) register their routes
+    // for mounting on this server instead of starting separate HTTP servers.
+    let (bridge, initial_webhook_router) =
+        channel_bridge::start_channel_bridge(kernel.clone()).await;
 
     // Initialize Prometheus metrics recorder if telemetry feature is enabled
     // and the config has prometheus_enabled = true.
@@ -459,7 +673,14 @@ pub async fn build_router(
     };
 
     let channels_config = kernel.config_ref().channels.clone();
-    let active_sessions = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let persisted_sessions = load_sessions(kernel.home_dir());
+    let active_sessions = Arc::new(tokio::sync::RwLock::new(persisted_sessions));
+    let webhook_router = Arc::new(tokio::sync::RwLock::new(Arc::new(initial_webhook_router)));
+
+    // Create api_key_lock before AppState so both AppState and AuthState share the same Arc.
+    let api_key = valid_api_tokens(kernel.as_ref()).join("\n");
+    let api_key_lock = Arc::new(tokio::sync::RwLock::new(api_key));
+
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
         started_at: Instant::now(),
@@ -470,13 +691,17 @@ pub async fn build_router(
         clawhub_cache: dashmap::DashMap::new(),
         skillhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
+        provider_test_cache: dashmap::DashMap::new(),
         webhook_store: crate::webhook_store::WebhookStore::load(
-            kernel.config_ref().home_dir.join("webhooks.json"),
+            kernel.home_dir().join("webhooks.json"),
         ),
         active_sessions: active_sessions.clone(),
+        api_key_lock: api_key_lock.clone(),
         media_drivers: librefang_runtime::media::MediaDriverCache::new_with_urls(
             kernel.config_ref().provider_urls.clone(),
         ),
+        webhook_router,
+        config_write_lock: tokio::sync::Mutex::new(()),
         #[cfg(feature = "telemetry")]
         prometheus_handle: prom_handle,
     });
@@ -501,7 +726,8 @@ pub async fn build_router(
             }
         }
         // Add explicitly configured CORS origins from config.toml
-        for origin in &state.kernel.config_ref().cors_origin {
+        let cors_cfg = state.kernel.config_ref();
+        for origin in &cors_cfg.cors_origin {
             if let Ok(v) = origin.parse::<axum::http::HeaderValue>() {
                 origins.push(v);
             } else {
@@ -514,14 +740,51 @@ pub async fn build_router(
             .allow_headers(tower_http::cors::Any)
     };
 
-    // Middleware accepts any token in this composite key.
-    let api_key = valid_api_tokens(state.kernel.as_ref()).join("\n");
-    let api_key_lock = Arc::new(tokio::sync::RwLock::new(api_key));
+    // AuthState shares api_key_lock with AppState so change_password can update it live.
+    let user_api_keys_vec = configured_user_api_keys(state.kernel.as_ref());
+    let dashboard_auth_enabled = has_dashboard_credentials(state.kernel.as_ref());
+    let api_key_set = !state.kernel.config_ref().api_key.trim().is_empty();
+    let any_auth = api_key_set || !user_api_keys_vec.is_empty() || dashboard_auth_enabled;
+
+    // Resolve the effective value of `require_auth_for_reads`.
+    // - Explicit `Some(true)`  → operators are forcing the allowlist
+    //   closed even if auth is misconfigured (catches an accidental
+    //   `api_key = ""` redeploy).
+    // - Explicit `Some(false)` → operators are deliberately keeping the
+    //   reads allowlist open even when an `api_key` is set; typical
+    //   for deployments fronted by an external auth proxy.
+    // - `None` (default)       → derive from whether *any* authentication
+    //   is configured. This makes the safe default "set an api_key and
+    //   the reads allowlist closes automatically", instead of forcing
+    //   operators to remember a separate flag before reads stop leaking
+    //   agent IDs to the LAN.
+    let configured_require_auth_for_reads = state.kernel.config_ref().require_auth_for_reads;
+    let require_auth_for_reads =
+        derive_require_auth_for_reads(configured_require_auth_for_reads, any_auth);
+    if require_auth_for_reads && !any_auth {
+        tracing::warn!(
+            "require_auth_for_reads = true but no authentication is configured \
+             (api_key, user_api_keys, and dashboard credentials are all empty). \
+             The flag will have no effect — set an api_key or configure dashboard \
+             credentials to lock down read endpoints."
+        );
+    }
+    if require_auth_for_reads && configured_require_auth_for_reads.is_none() {
+        tracing::info!(
+            "require_auth_for_reads auto-enabled because authentication is configured \
+             (api_key / user_api_keys / dashboard credentials). Dashboard reads now \
+             require a bearer token. Set `require_auth_for_reads = false` in config.toml \
+             to restore the legacy public reads allowlist."
+        );
+    }
     let auth_state = middleware::AuthState {
         api_key_lock: api_key_lock.clone(),
         active_sessions: active_sessions.clone(),
+        dashboard_auth_enabled,
+        user_api_keys: Arc::new(user_api_keys_vec),
+        require_auth_for_reads,
     };
-    let rl_cfg = &state.kernel.config_ref().rate_limit;
+    let rl_cfg = state.kernel.config_ref().rate_limit.clone();
     let gcra_limiter = rate_limiter::GcraState {
         limiter: rate_limiter::create_rate_limiter(rl_cfg.api_requests_per_minute),
         retry_after_secs: rl_cfg.retry_after_secs,
@@ -616,6 +879,30 @@ pub async fn build_router(
     // `librefang_telemetry::metrics::record_http_request()`.  A separate metrics
     // middleware layer is not needed (and would double-count requests).
 
+    // Mount channel webhook routes under /channels/{adapter_name}/*.
+    // These bypass auth/rate-limit layers since external platforms (Feishu,
+    // Teams, etc.) handle their own signature verification.
+    // The router is dynamic (behind RwLock) so hot-reload can swap routes.
+    let channel_webhook_state = state.webhook_router.clone();
+    let channel_routes = Router::new().fallback(move |req: axum::extract::Request| {
+        let wr = channel_webhook_state.clone();
+        async move {
+            use tower::ServiceExt;
+            let guard = wr.read().await;
+            let router: Arc<axum::Router> = Arc::clone(&guard);
+            drop(guard);
+            // Unwrap the Arc — if we hold the only reference we avoid a clone,
+            // otherwise Router::clone is needed (only during hot-reload overlap).
+            Arc::try_unwrap(router)
+                .unwrap_or_else(|arc| (*arc).clone())
+                .into_service()
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|e: std::convert::Infallible| match e {})
+        }
+    });
+    let app = app.nest("/channels", channel_routes);
+
     let app = app.with_state(state.clone());
 
     (app, state)
@@ -638,14 +925,16 @@ pub async fn run_daemon(
     // Initialize OpenTelemetry OTLP tracing when telemetry feature is compiled
     // in and the config has `telemetry.enabled = true`.
     #[cfg(feature = "telemetry")]
-    if kernel.config_ref().telemetry.enabled {
-        let cfg = &kernel.config_ref().telemetry;
-        if let Err(e) = crate::telemetry::init_otel_tracing(
-            &cfg.otlp_endpoint,
-            &cfg.service_name,
-            cfg.sample_rate,
-        ) {
-            tracing::warn!("Failed to initialize OpenTelemetry tracing: {e}");
+    {
+        let cfg = kernel.config_ref();
+        if cfg.telemetry.enabled {
+            if let Err(e) = crate::telemetry::init_otel_tracing(
+                &cfg.telemetry.otlp_endpoint,
+                &cfg.telemetry.service_name,
+                cfg.telemetry.sample_rate,
+            ) {
+                tracing::warn!("Failed to initialize OpenTelemetry tracing: {e}");
+            }
         }
     }
 
@@ -654,12 +943,28 @@ pub async fn run_daemon(
 
     let (app, state) = build_router(kernel.clone(), addr).await;
 
+    // Sync dashboard assets in background (downloads from release if outdated)
+    {
+        let home = kernel.home_dir().to_path_buf();
+        bg_tasks.push(tokio::spawn(async move {
+            crate::webchat::sync_dashboard(&home).await;
+        }));
+    }
+
+    // Background provider key validation — runs shortly after boot so the
+    // dashboard shows ValidatedKey / InvalidKey instead of just Configured.
+    kernel.clone().spawn_key_validation();
+
+    // Approval expiry sweep — checks for expired pending approval requests
+    // every 10 seconds and handles their resolution.
+    kernel.clone().spawn_approval_sweep_task();
+
     // Config file hot-reload watcher (polls every 30 seconds).
     // Spawned after `build_router` so it can access `AppState` for bridge reload.
     {
         let k = kernel.clone();
         let st = state.clone();
-        let config_path = kernel.config_ref().home_dir.join("config.toml");
+        let config_path = kernel.home_dir().join("config.toml");
         bg_tasks.push(tokio::spawn(async move {
             let mut last_modified = std::fs::metadata(&config_path)
                 .and_then(|m| m.modified())
@@ -672,7 +977,7 @@ pub async fn run_daemon(
                 if current != last_modified && current.is_some() {
                     last_modified = current;
                     tracing::info!("Config file changed, reloading...");
-                    match k.reload_config() {
+                    match k.reload_config().await {
                         Ok(plan) => {
                             if plan.has_changes() {
                                 tracing::info!("Config hot-reload applied: {:?}", plan.hot_actions);
@@ -777,9 +1082,10 @@ pub async fn run_daemon(
         let kernel = state.kernel.clone();
         bg_tasks.push(tokio::spawn(async move {
             loop {
+                let cfg = kernel.config_snapshot();
                 match librefang_runtime::catalog_sync::sync_catalog_to(
-                    &kernel.config_ref().home_dir,
-                    &kernel.config_ref().registry.registry_mirror,
+                    kernel.home_dir(),
+                    &cfg.registry.registry_mirror,
                 )
                 .await
                 {
@@ -811,6 +1117,52 @@ pub async fn run_daemon(
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            }
+        }));
+    }
+
+    // Background: periodic GC for API-layer caches (every 5 minutes)
+    {
+        let st = state.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+            interval.tick().await; // Skip first immediate tick
+            loop {
+                interval.tick().await;
+
+                // Evict expired clawhub/skillhub cache entries (120s TTL)
+                let cache_ttl = std::time::Duration::from_secs(120);
+                let before_claw = st.clawhub_cache.len();
+                st.clawhub_cache
+                    .retain(|_, (fetched_at, _)| fetched_at.elapsed() < cache_ttl);
+                let before_skill = st.skillhub_cache.len();
+                st.skillhub_cache
+                    .retain(|_, (fetched_at, _)| fetched_at.elapsed() < cache_ttl);
+
+                // Evict expired session tokens
+                let expired_sessions = {
+                    let mut sessions = st.active_sessions.write().await;
+                    let before = sessions.len();
+                    sessions.retain(|_, token| {
+                        !crate::password_hash::is_token_expired(
+                            token,
+                            crate::password_hash::DEFAULT_SESSION_TTL_SECS,
+                        )
+                    });
+                    before - sessions.len()
+                };
+
+                let claw_removed = before_claw - st.clawhub_cache.len();
+                let skill_removed = before_skill - st.skillhub_cache.len();
+                let total = claw_removed + skill_removed + expired_sessions;
+                if total > 0 {
+                    tracing::info!(
+                        clawhub = claw_removed,
+                        skillhub = skill_removed,
+                        sessions = expired_sessions,
+                        "API cache GC sweep completed"
+                    );
+                }
             }
         }));
     }
@@ -1038,6 +1390,20 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Resolve the effective value of `require_auth_for_reads` from the explicit
+/// config option and whether any authentication method is configured.
+///
+/// - `Some(explicit)` preserves the operator's stated intent verbatim.
+/// - `None` derives the value from `any_auth` so that setting any form of
+///   auth (api_key / user keys / dashboard credentials) automatically closes
+///   the dashboard reads allowlist.
+fn derive_require_auth_for_reads(configured: Option<bool>, any_auth: bool) -> bool {
+    match configured {
+        Some(explicit) => explicit,
+        None => any_auth,
+    }
+}
+
 /// Check if an LibreFang daemon is actually responding at the given address.
 /// This avoids false positives where a different process reused the same PID
 /// after a system reboot.
@@ -1055,5 +1421,30 @@ fn is_daemon_responding(addr: &str) -> bool {
         std::net::TcpStream::connect(addr_only)
             .map(|_| true)
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod derive_require_auth_for_reads_tests {
+    use super::derive_require_auth_for_reads;
+
+    #[test]
+    fn none_with_auth_enables() {
+        assert!(derive_require_auth_for_reads(None, true));
+    }
+
+    #[test]
+    fn none_without_auth_disables() {
+        assert!(!derive_require_auth_for_reads(None, false));
+    }
+
+    #[test]
+    fn some_false_is_preserved_even_when_auth_configured() {
+        assert!(!derive_require_auth_for_reads(Some(false), true));
+    }
+
+    #[test]
+    fn some_true_is_preserved_even_when_no_auth_configured() {
+        assert!(derive_require_auth_for_reads(Some(true), false));
     }
 }

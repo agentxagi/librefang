@@ -76,9 +76,25 @@ jobs:
         with:
           targets: ${{ matrix.platform.rust_target }}
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/librefang-api/dashboard/package-lock.json
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: desktop-${{ matrix.platform.rust_target }}-${{ github.ref_name }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build embedded dashboard assets
+        working-directory: crates/librefang-api/dashboard
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Import macOS signing certificate
         if: runner.os == 'macOS'
@@ -137,8 +153,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          # List assets and delete any matching this target
-          gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null | while read -r name; do
+          # Fetch asset list with retry (GitHub API can be transiently unavailable)
+          ASSETS=""
+          for attempt in $(seq 1 5); do
+            if ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+              break
+            fi
+            echo "Failed to fetch release assets (attempt $attempt/5), retrying in 10s..."
+            sleep 10
+          done
+          # Delete any matching this target
+          echo "$ASSETS" | while read -r name; do
+            [ -z "$name" ] && continue
             case "$name" in
               *${{ matrix.platform.rust_target }}*|*latest.json)
                 echo "Deleting existing asset: $name"
@@ -362,6 +388,45 @@ jobs:
           for channel in "${CHANNELS[@]}"; do
             generate_cask "$channel"
           done
+
+          # ── Versioned cask (pinned to this exact release) ──────────────
+          # Allows: brew install --cask librefang@2026.4.2-beta7
+          # These accumulate in the tap and are never overwritten.
+          VERSIONED_NAME="librefang@${VERSION}"
+          mkdir -p tap/Casks
+          cat > "tap/Casks/${VERSIONED_NAME}.rb" <<CASK
+          cask "${VERSIONED_NAME}" do
+            arch arm: "aarch64", intel: "x64"
+
+            version "${TAURI_VERSION}"
+
+            on_arm do
+              sha256 "${ARM_SHA}"
+            end
+            on_intel do
+              sha256 "${X86_SHA}"
+            end
+
+            url "https://github.com/librefang/librefang/releases/download/${TAG}/LibreFang_#{version}_#{arch}.dmg",
+                verified: "github.com/librefang/librefang/"
+            name "LibreFang ${VERSION}"
+            desc "Community-Maintained Agent Operating System written in Rust (pinned to ${VERSION})"
+            homepage "https://librefang.ai"
+
+            depends_on macos: ">= :ventura"
+
+            app "LibreFang.app"
+
+            zap trash: [
+              "~/Library/Application Support/ai.librefang.desktop",
+              "~/Library/Caches/ai.librefang.desktop",
+              "~/Library/Preferences/ai.librefang.desktop.plist",
+            ]
+          end
+          CASK
+
+          echo "=== Versioned cask: ${VERSIONED_NAME} ==="
+          cat "tap/Casks/${VERSIONED_NAME}.rb"
 
       - name: Commit and push
         working-directory: tap

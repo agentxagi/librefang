@@ -165,6 +165,23 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Replace an agent's manifest wholesale. The caller is responsible for
+    /// preserving runtime-only fields (workspace, tags) and invalidating any
+    /// caches that depend on the manifest. Used by `reload_agent_from_disk`.
+    pub fn replace_manifest(
+        &self,
+        id: AgentId,
+        manifest: librefang_types::agent::AgentManifest,
+    ) -> LibreFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| LibreFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest = manifest;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's visual identity (emoji, avatar, color).
     pub fn update_identity(
         &self,
@@ -225,6 +242,43 @@ impl AgentRegistry {
         entry.manifest.model.provider = new_provider;
         entry.manifest.model.api_key_env = api_key_env;
         entry.manifest.model.base_url = base_url;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Update an agent's max_tokens (response length limit).
+    pub fn update_max_tokens(&self, id: AgentId, max_tokens: u32) -> LibreFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| LibreFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.max_tokens = max_tokens;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Update an agent's sampling temperature.
+    pub fn update_temperature(&self, id: AgentId, temperature: f32) -> LibreFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| LibreFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.temperature = temperature;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
+    /// Update an agent's web search augmentation mode.
+    pub fn update_web_search_augmentation(
+        &self,
+        id: AgentId,
+        mode: librefang_types::agent::WebSearchAugmentationMode,
+    ) -> LibreFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| LibreFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.web_search_augmentation = mode;
         entry.last_active = chrono::Utc::now();
         Ok(())
     }
@@ -359,7 +413,7 @@ impl AgentRegistry {
             entry.manifest.resources.max_cost_per_month_usd = v;
         }
         if let Some(v) = tokens_per_hour {
-            entry.manifest.resources.max_llm_tokens_per_hour = v;
+            entry.manifest.resources.max_llm_tokens_per_hour = Some(v);
         }
         entry.last_active = chrono::Utc::now();
         Ok(())
@@ -413,6 +467,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         }
     }
 
@@ -503,5 +558,27 @@ mod tests {
 
         let names: Vec<String> = registry.list().iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn test_update_temperature() {
+        let registry = AgentRegistry::new();
+        let entry = test_entry("temp-agent");
+        let id = entry.id;
+        registry.register(entry).unwrap();
+
+        // Default temperature is 0.7
+        let before = registry.get(id).unwrap();
+        let old_active = before.last_active;
+        assert!((before.manifest.model.temperature - 0.7).abs() < f32::EPSILON);
+
+        // Wait a tiny bit so last_active changes
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        registry.update_temperature(id, 1.5).unwrap();
+
+        let after = registry.get(id).unwrap();
+        assert!((after.manifest.model.temperature - 1.5).abs() < f32::EPSILON);
+        assert!(after.last_active > old_active);
     }
 }

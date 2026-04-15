@@ -152,6 +152,12 @@ const PROVIDERS: &[ProviderInfo] = &[
         default_model: "local-model",
         needs_key: false,
     },
+    ProviderInfo {
+        name: "alibaba-coding-plan",
+        env_var: "ALIBABA_CODING_PLAN_API_KEY",
+        default_model: "alibaba-coding-plan/qwen3.6-plus",
+        needs_key: true,
+    },
 ];
 
 /// Check if first-run setup is needed.
@@ -219,13 +225,14 @@ impl WizardState {
     }
 
     fn build_provider_order(&mut self) {
+        let has_key = |var: &str| std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
         self.provider_order.clear();
         // Detected providers first
         for (i, p) in PROVIDERS.iter().enumerate() {
             let detected = if librefang_runtime::drivers::is_cli_provider(p.name) {
                 librefang_runtime::drivers::cli_provider_available(p.name)
             } else {
-                !p.env_var.is_empty() && std::env::var(p.env_var).is_ok()
+                !p.env_var.is_empty() && has_key(p.env_var)
             };
             if detected {
                 self.provider_order.push(i);
@@ -236,7 +243,7 @@ impl WizardState {
             let detected = if librefang_runtime::drivers::is_cli_provider(p.name) {
                 librefang_runtime::drivers::cli_provider_available(p.name)
             } else {
-                !p.env_var.is_empty() && std::env::var(p.env_var).is_ok()
+                !p.env_var.is_empty() && has_key(p.env_var)
             };
             if !detected {
                 self.provider_order.push(i);

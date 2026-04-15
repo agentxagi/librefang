@@ -50,6 +50,26 @@ pub enum OutputFormat {
     PlainText,
 }
 
+/// Auto-routing strategy for a channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoRouteStrategy {
+    /// Disable auto-routing entirely (default). Channel messages always go to
+    /// the configured agent without keyword/semantic classification.
+    #[default]
+    Off,
+    /// Only route if the cache already has an entry; never trigger LLM
+    /// classification on the first message.
+    ExplicitOnly,
+    /// Use the cached route for up to `auto_route_ttl_minutes`; re-classify
+    /// via LLM once the TTL expires.
+    StickyTtl,
+    /// Use a cheap metadata heuristic to decide whether the cached route is
+    /// still valid; fall back to full LLM classification after
+    /// `auto_route_divergence_count` consecutive mismatches.
+    StickyHeuristic,
+}
+
 /// Per-channel behavior overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -70,6 +90,14 @@ pub struct ChannelOverrides {
     /// `group_policy` is `mention_only`.
     #[serde(default)]
     pub group_trigger_patterns: Vec<String>,
+    /// Enable LLM-based reply-intent precheck for group messages.
+    /// When true and group_policy is "all", a lightweight classifier decides
+    /// whether to reply before running the full agent loop.
+    #[serde(default)]
+    pub reply_precheck: bool,
+    /// Model override for the reply precheck classifier (default: agent's model).
+    #[serde(default)]
+    pub reply_precheck_model: Option<String>,
     /// Global rate limit for this channel (messages per minute, 0 = unlimited).
     #[serde(default)]
     pub rate_limit_per_minute: u32,
@@ -97,6 +125,49 @@ pub struct ChannelOverrides {
     /// Maximum number of messages to buffer per sender before forcing dispatch. Default: 64.
     #[serde(default = "default_message_debounce_max_buffer")]
     pub message_debounce_max_buffer: usize,
+    /// Remove the reaction emoji on task completion instead of showing a
+    /// "done" reaction.  When `true`, the bot clears all its reactions once
+    /// the response is delivered, keeping the chat cleaner.  Default: `false`
+    /// (show the done reaction for backward compatibility).
+    #[serde(default)]
+    pub clear_done_reaction: bool,
+    /// When `true`, all built-in slash commands (`/agent`, `/new`, `/help`, …)
+    /// are disabled on this channel and any leading-slash text is forwarded
+    /// to the agent as normal message content. Use this for public-facing
+    /// bots where end users must not be able to switch agents or reset
+    /// sessions. Takes precedence over `allowed_commands` / `blocked_commands`.
+    #[serde(default)]
+    pub disable_commands: bool,
+    /// Whitelist of built-in command names (without the leading `/`) that
+    /// are allowed on this channel. When non-empty, any command outside this
+    /// list is treated as normal text and forwarded to the agent. Leave
+    /// empty to fall back to `blocked_commands`.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    /// Blacklist of built-in command names (without the leading `/`) that
+    /// are blocked on this channel. Applied only when `allowed_commands` is
+    /// empty. Blocked commands are treated as normal text and forwarded to
+    /// the agent.
+    #[serde(default)]
+    pub blocked_commands: Vec<String>,
+    /// Auto-routing strategy for this channel. Defaults to `off` (no routing).
+    #[serde(default)]
+    pub auto_route: AutoRouteStrategy,
+    /// How long (in minutes) a cached route stays valid for `sticky_ttl` strategy.
+    #[serde(default = "default_auto_route_ttl")]
+    pub auto_route_ttl_minutes: u32,
+    /// Minimum heuristic confidence score (0–10) before a route is cached for
+    /// `sticky_heuristic` strategy.
+    #[serde(default = "default_auto_route_confidence")]
+    pub auto_route_confidence_threshold: u32,
+    /// Extra score added to the cached route in `sticky_heuristic` to prefer
+    /// stability over churn.
+    #[serde(default = "default_auto_route_bonus")]
+    pub auto_route_sticky_bonus: u32,
+    /// How many consecutive heuristic mismatches trigger a full LLM
+    /// re-classification in `sticky_heuristic` mode.
+    #[serde(default = "default_auto_route_divergence")]
+    pub auto_route_divergence_count: u32,
 }
 
 impl Default for ChannelOverrides {
@@ -107,6 +178,8 @@ impl Default for ChannelOverrides {
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_trigger_patterns: Vec::new(),
+            reply_precheck: false,
+            reply_precheck_model: None,
             rate_limit_per_minute: 0,
             rate_limit_per_user: 0,
             threading: false,
@@ -116,6 +189,15 @@ impl Default for ChannelOverrides {
             message_debounce_ms: 0,
             message_debounce_max_ms: 30000,
             message_debounce_max_buffer: 64,
+            clear_done_reaction: false,
+            disable_commands: false,
+            allowed_commands: Vec::new(),
+            blocked_commands: Vec::new(),
+            auto_route: AutoRouteStrategy::Off,
+            auto_route_ttl_minutes: default_auto_route_ttl(),
+            auto_route_confidence_threshold: default_auto_route_confidence(),
+            auto_route_sticky_bonus: default_auto_route_bonus(),
+            auto_route_divergence_count: default_auto_route_divergence(),
         }
     }
 }
@@ -126,6 +208,22 @@ fn default_message_debounce_max_ms() -> u64 {
 
 fn default_message_debounce_max_buffer() -> usize {
     64
+}
+
+fn default_auto_route_ttl() -> u32 {
+    30
+}
+
+fn default_auto_route_confidence() -> u32 {
+    6
+}
+
+fn default_auto_route_bonus() -> u32 {
+    4
+}
+
+fn default_auto_route_divergence() -> u32 {
+    2
 }
 
 /// Controls what usage info appears in response footers.
@@ -226,9 +324,11 @@ pub enum SearchProvider {
     Tavily,
     /// Perplexity AI search.
     Perplexity,
+    /// Jina AI search.
+    Jina,
     /// DuckDuckGo HTML (no API key needed).
     DuckDuckGo,
-    /// Auto-select based on available API keys (Tavily → Brave → Perplexity → DuckDuckGo).
+    /// Auto-select based on available API keys (Tavily → Brave → Jina → Perplexity → DuckDuckGo).
     #[default]
     Auto,
 }
@@ -241,14 +341,24 @@ pub struct WebConfig {
     pub search_provider: SearchProvider,
     /// Cache TTL in minutes (0 = disabled).
     pub cache_ttl_minutes: u64,
+    /// HTTP timeout for all web search requests (seconds).
+    /// Recommended: 15 for most providers, 30+ for Jina.
+    #[serde(default = "default_search_timeout_secs")]
+    pub timeout_secs: u64,
     /// Brave Search configuration.
     pub brave: BraveSearchConfig,
     /// Tavily Search configuration.
     pub tavily: TavilySearchConfig,
     /// Perplexity Search configuration.
     pub perplexity: PerplexitySearchConfig,
+    /// Jina Search configuration.
+    pub jina: JinaSearchConfig,
     /// Web fetch configuration.
     pub fetch: WebFetchConfig,
+}
+
+fn default_search_timeout_secs() -> u64 {
+    15
 }
 
 impl Default for WebConfig {
@@ -256,9 +366,11 @@ impl Default for WebConfig {
         Self {
             search_provider: SearchProvider::default(),
             cache_ttl_minutes: 15,
+            timeout_secs: default_search_timeout_secs(),
             brave: BraveSearchConfig::default(),
             tavily: TavilySearchConfig::default(),
             perplexity: PerplexitySearchConfig::default(),
+            jina: JinaSearchConfig::default(),
             fetch: WebFetchConfig::default(),
         }
     }
@@ -336,6 +448,37 @@ impl Default for PerplexitySearchConfig {
     }
 }
 
+/// Jina Search API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JinaSearchConfig {
+    /// Env var name holding the API key.
+    pub api_key_env: String,
+    /// Maximum results to return.
+    pub max_results: usize,
+    /// Country/region code for geolocation (e.g., "US").
+    pub country: String,
+    /// Language code (e.g., "en").
+    pub language: String,
+    /// Use EU endpoint (https://eu.s.jina.ai/) instead of global.
+    pub use_eu_endpoint: bool,
+    /// Disable Jina server-side cache.
+    pub no_cache: bool,
+}
+
+impl Default for JinaSearchConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: "JINA_API_KEY".to_string(),
+            max_results: 5,
+            country: String::new(),
+            language: String::new(),
+            use_eu_endpoint: false,
+            no_cache: false,
+        }
+    }
+}
+
 /// Web fetch configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -348,6 +491,10 @@ pub struct WebFetchConfig {
     pub timeout_secs: u64,
     /// Enable HTML→Markdown readability extraction.
     pub readability: bool,
+    /// Hosts/CIDRs that are exempt from SSRF blocking (e.g. internal services in K8s).
+    /// Cloud metadata endpoints (169.254.x.x, etc.) remain blocked unconditionally.
+    #[serde(default)]
+    pub ssrf_allowed_hosts: Vec<String>,
 }
 
 impl Default for WebFetchConfig {
@@ -357,6 +504,7 @@ impl Default for WebFetchConfig {
             max_response_bytes: 10 * 1024 * 1024, // 10 MB
             timeout_secs: 30,
             readability: true,
+            ssrf_allowed_hosts: vec![],
         }
     }
 }
@@ -453,6 +601,18 @@ pub struct RateLimitConfig {
     /// Maximum WebSocket messages per minute per connection. Default: 10.
     #[serde(default = "default_ws_messages_per_minute")]
     pub ws_messages_per_minute: u32,
+    /// Maximum terminal WebSocket input messages per minute per connection.
+    /// Default: 3600.
+    ///
+    /// Terminal sessions send one WebSocket message per keystroke, so the
+    /// generic `ws_messages_per_minute = 10` (sized for chat WS where a
+    /// "message" is a whole utterance) is two orders of magnitude too low
+    /// for an interactive PTY — typing `vim` + `:wq` in vim already
+    /// exhausts the budget and the session appears to freeze. 3600/min
+    /// (60/sec ≈ 720 WPM) covers any human typing speed plus TUI
+    /// navigation bursts while still capping pathological floods.
+    #[serde(default = "default_ws_terminal_messages_per_minute")]
+    pub ws_terminal_messages_per_minute: u32,
     /// WebSocket idle timeout in seconds (close after inactivity). Default: 1800.
     #[serde(default = "default_ws_idle_timeout_secs")]
     pub ws_idle_timeout_secs: u64,
@@ -476,6 +636,9 @@ fn default_max_ws_per_ip() -> usize {
 fn default_ws_messages_per_minute() -> u32 {
     10
 }
+fn default_ws_terminal_messages_per_minute() -> u32 {
+    3600
+}
 fn default_ws_idle_timeout_secs() -> u64 {
     1800
 }
@@ -493,6 +656,7 @@ impl Default for RateLimitConfig {
             retry_after_secs: default_retry_after_secs(),
             max_ws_per_ip: default_max_ws_per_ip(),
             ws_messages_per_minute: default_ws_messages_per_minute(),
+            ws_terminal_messages_per_minute: default_ws_terminal_messages_per_minute(),
             ws_idle_timeout_secs: default_ws_idle_timeout_secs(),
             ws_debounce_ms: default_ws_debounce_ms(),
             ws_debounce_chars: default_ws_debounce_chars(),
@@ -557,12 +721,14 @@ pub struct FallbackProviderConfig {
 pub struct TtsConfig {
     /// Enable TTS. Default: false.
     pub enabled: bool,
-    /// Default provider: "openai" or "elevenlabs".
+    /// Default provider: "openai", "elevenlabs", or "google_tts".
     pub provider: Option<String>,
     /// OpenAI TTS settings.
     pub openai: TtsOpenAiConfig,
     /// ElevenLabs TTS settings.
     pub elevenlabs: TtsElevenLabsConfig,
+    /// Google Cloud TTS settings.
+    pub google: TtsGoogleConfig,
     /// Max text length for TTS (chars). Default: 4096.
     pub max_text_length: usize,
     /// Timeout per TTS request in seconds. Default: 30.
@@ -576,6 +742,7 @@ impl Default for TtsConfig {
             provider: None,
             openai: TtsOpenAiConfig::default(),
             elevenlabs: TtsElevenLabsConfig::default(),
+            google: TtsGoogleConfig::default(),
             max_text_length: 4096,
             timeout_secs: 30,
         }
@@ -628,6 +795,34 @@ impl Default for TtsElevenLabsConfig {
             model_id: "eleven_monolingual_v1".to_string(),
             stability: 0.5,
             similarity_boost: 0.75,
+        }
+    }
+}
+
+/// Google Cloud TTS settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TtsGoogleConfig {
+    /// Voice name (e.g. "en-US-Standard-F", "pl-PL-Wavenet-A"). Default: "en-US-Standard-F".
+    pub voice: String,
+    /// Language code (e.g. "en-US", "pl-PL"). Default: "en-US".
+    pub language_code: String,
+    /// Speaking rate: 0.25 to 4.0. Default: 1.0.
+    pub speaking_rate: f32,
+    /// Pitch adjustment: -20.0 to 20.0. Default: 0.0.
+    pub pitch: f32,
+    /// Output format: "mp3", "opus", "wav". Default: "mp3".
+    pub format: String,
+}
+
+impl Default for TtsGoogleConfig {
+    fn default() -> Self {
+        Self {
+            voice: "en-US-Standard-F".to_string(),
+            language_code: "en-US".to_string(),
+            speaking_rate: 1.0,
+            pitch: 0.0,
+            format: "mp3".to_string(),
         }
     }
 }
@@ -742,6 +937,27 @@ impl Default for PairingConfig {
             push_provider: "none".to_string(),
             ntfy_url: None,
             ntfy_topic: None,
+        }
+    }
+}
+
+/// Skills configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Whether user-installed skills from the skills directory are loaded. Default: true.
+    pub load_user: bool,
+    /// Extra skill directories to scan in addition to `~/.librefang/skills/`.
+    /// Each entry must be an absolute path.
+    #[serde(default)]
+    pub extra_dirs: Vec<std::path::PathBuf>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            load_user: true,
+            extra_dirs: Vec::new(),
         }
     }
 }
@@ -1023,6 +1239,9 @@ pub struct ExecPolicy {
     pub safe_bins: Vec<String>,
     /// Global command allowlist (when mode = allowlist).
     pub allowed_commands: Vec<String>,
+    /// Environment variables explicitly allowed to pass through to `shell_exec`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_env_vars: Vec<String>,
     /// Max execution timeout in seconds. Default: 30.
     pub timeout_secs: u64,
     /// Max output size in bytes. Default: 100KB.
@@ -1049,6 +1268,7 @@ impl Default for ExecPolicy {
             .map(String::from)
             .collect(),
             allowed_commands: Vec::new(),
+            allowed_env_vars: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
@@ -1564,8 +1784,18 @@ pub struct KernelConfig {
     /// Allowed CORS origins. When non-empty, these origins are added to the
     /// CORS allow list (in addition to localhost). Accepts exact origin strings
     /// like `"https://dash.example.com"`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cors_origin: Vec<String>,
+    /// Hostnames allowed to drive the OAuth `redirect_uri` when starting an
+    /// MCP auth flow. The MCP auth-start handler derives the callback URL
+    /// from the incoming request's `Origin` / `X-Forwarded-Host` / `Host`
+    /// headers; without an allowlist a spoofed Host header could redirect
+    /// the authorization code to an attacker-controlled origin. Loopback
+    /// addresses (`localhost`, `127.0.0.1`, `::1`) are always accepted so
+    /// local development keeps working with an empty list. Entries are
+    /// hostnames without port, e.g. `"dash.example.com"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_hosts: Vec<String>,
     /// Whether to enable the OFP network layer.
     pub network_enabled: bool,
     /// Default LLM provider configuration.
@@ -1580,6 +1810,47 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// Controls whether the dashboard read-endpoint allowlist (agents,
+    /// config, budget, sessions, approvals, hands, skills, workflows, …)
+    /// requires a bearer token.
+    ///
+    /// * `None` (default, unset in config.toml) — **derive from
+    ///   configured auth**: the reads allowlist is collapsed *automatically*
+    ///   whenever any authentication is configured (non-empty `api_key`,
+    ///   per-user keys, or dashboard credentials). This is the safe
+    ///   default: operators who already set an `api_key` shouldn't also
+    ///   have to remember a separate flag before their read endpoints
+    ///   stop leaking agent IDs to the LAN.
+    /// * `Some(true)` — state the intent explicitly. The daemon logs a
+    ///   boot-time warning if no authentication is actually configured
+    ///   (so an accidental `api_key = ""` redeploy is visible in the
+    ///   logs), but the middleware itself only enforces the closed
+    ///   allowlist when some form of auth is also configured: with no
+    ///   `api_key`, user keys, or dashboard credentials there is nothing
+    ///   to authenticate against and reads fall through to the
+    ///   unauthenticated local-development bypass. Configure an
+    ///   `api_key` (or per-user keys / dashboard credentials) alongside
+    ///   this flag to actually close the allowlist.
+    /// * `Some(false)` — force the allowlist open even when `api_key`
+    ///   is set. Provided as an explicit escape hatch for deployments
+    ///   that front the daemon with an external auth proxy and want the
+    ///   in-tree dashboard to keep rendering before the reverse proxy
+    ///   has attached its own credentials.
+    ///
+    /// Unauthenticated static assets, OAuth flow endpoints, and
+    /// `/api/health*` stay reachable in every mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_auth_for_reads: Option<bool>,
+    /// Hex-encoded Ed25519 public keys (32 bytes → 64 hex chars) allowed to
+    /// sign agent manifests. `verify_signed_manifest` requires the envelope's
+    /// `signer_public_key` to be on this list before accepting a signature —
+    /// without a trust anchor, a self-signed envelope from any attacker
+    /// passes internal-consistency checks and would be indistinguishable
+    /// from a legitimate one. When empty, `SignedManifest` JSON payloads are
+    /// rejected outright (fail-closed). Raw unsigned TOML manifests are
+    /// unaffected; this list only gates the signed-envelope path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_manifest_signers: Vec<String>,
     /// Dashboard login username. When both dashboard_user and dashboard_pass
     /// are set, the dashboard requires username/password login.
     /// Can also be set via `LIBREFANG_DASHBOARD_USER` env var.
@@ -1604,10 +1875,10 @@ pub struct KernelConfig {
     #[serde(default = "default_language")]
     pub language: String,
     /// User configurations for RBAC multi-user support.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<UserConfig>,
     /// MCP server configurations for external tool integration.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerConfigEntry>,
     /// A2A (Agent-to-Agent) protocol configuration.
     #[serde(default)]
@@ -1627,7 +1898,7 @@ pub struct KernelConfig {
     pub web: WebConfig,
     /// Fallback providers tried in order if the primary fails.
     /// Configure in config.toml as `[[fallback_providers]]`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_providers: Vec<FallbackProviderConfig>,
     /// Browser automation configuration.
     #[serde(default)]
@@ -1635,6 +1906,9 @@ pub struct KernelConfig {
     /// Extensions & integrations configuration.
     #[serde(default)]
     pub extensions: ExtensionsConfig,
+    /// Skills configuration (bundled + user-installed skills).
+    #[serde(default)]
+    pub skills: SkillsConfig,
     /// Credential vault configuration.
     #[serde(default)]
     pub vault: VaultConfig,
@@ -1663,19 +1937,22 @@ pub struct KernelConfig {
     /// Execution approval policy.
     #[serde(default, alias = "approval_policy")]
     pub approval: crate::approval::ApprovalPolicy,
+    /// Notification engine configuration for approval alerts and task state notifications.
+    #[serde(default)]
+    pub notification: crate::approval::NotificationConfig,
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
     pub max_cron_jobs: usize,
     /// Config include files — loaded and deep-merged before the root config.
     /// Paths are relative to the root config file's directory.
     /// Security: absolute paths and `..` components are rejected.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
     /// Shell/exec security policy.
     #[serde(default)]
     pub exec_policy: ExecPolicy,
     /// Agent bindings for multi-account routing.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<AgentBinding>,
     /// Broadcast routing configuration.
     #[serde(default)]
@@ -1708,6 +1985,11 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
+    /// Per-provider proxy URL overrides (provider ID → proxy URL).
+    /// Allows routing specific providers through a proxy while others connect directly.
+    /// e.g. `openai = "http://proxy.corp:8080"`, `ollama = ""` (direct)
+    #[serde(default)]
+    pub provider_proxy_urls: HashMap<String, String>,
     /// Provider region selection (provider ID → region name).
     /// Selects a regional endpoint from the provider's `[provider.regions]` map.
     /// e.g. `qwen = "us"` to use the US endpoint instead of China mainland.
@@ -1729,7 +2011,7 @@ pub struct KernelConfig {
     #[serde(default)]
     pub oauth: OAuthConfig,
     /// Sidecar channel adapters (external process-based).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecar_channels: Vec<SidecarChannelConfig>,
     /// HTTP proxy configuration for all outbound connections.
     #[serde(default)]
@@ -1837,6 +2119,9 @@ pub struct KernelConfig {
     /// Individual endpoints may enforce tighter limits.
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
+    /// Terminal / CLI access control configuration.
+    #[serde(default)]
+    pub terminal: TerminalConfig,
 }
 
 /// Input sanitization mode for channel messages.
@@ -2016,6 +2301,35 @@ pub struct ContextEngineTomlConfig {
     /// Plugin name. Resolves to `~/.librefang/plugins/<name>/plugin.toml`.
     /// Takes precedence over manual `hooks` if set.
     pub plugin: Option<String>,
+    /// Stack multiple plugins on a single context engine.
+    ///
+    /// When 2 or more plugin names are listed the runtime builds a
+    /// [`StackedContextEngine`] that chains them in declaration order.
+    /// Ignored when fewer than 2 entries are present; use `plugin` for the
+    /// single-plugin case instead.
+    ///
+    /// Example:
+    /// ```toml
+    /// [context_engine]
+    /// plugin_stack = ["qdrant-recall", "my-indexer"]
+    /// ```
+    #[serde(default)]
+    pub plugin_stack: Option<Vec<String>>,
+    /// Priority weight for each layer in `plugin_stack` (default 1.0).
+    ///
+    /// Higher weights cause that layer's recalled memories to appear first in
+    /// the merged ingest result.  Values are matched by position — the first
+    /// weight applies to the first entry in `plugin_stack`, and so on.
+    /// Missing trailing weights default to `1.0`.
+    ///
+    /// Example:
+    /// ```toml
+    /// [context_engine]
+    /// plugin_stack = ["qdrant-recall", "my-indexer"]
+    /// plugin_stack_weights = [2.0, 1.0]   # qdrant-recall has higher priority
+    /// ```
+    #[serde(default)]
+    pub plugin_stack_weights: Vec<f32>,
     /// Optional Python script hooks that override specific lifecycle methods.
     pub hooks: ContextEngineHooks,
     /// Plugin registries (GitHub repos) to browse for installable plugins.
@@ -2029,6 +2343,8 @@ impl Default for ContextEngineTomlConfig {
         Self {
             engine: "default".to_string(),
             plugin: None,
+            plugin_stack: None,
+            plugin_stack_weights: Vec::new(),
             hooks: ContextEngineHooks::default(),
             plugin_registries: default_plugin_registries(),
         }
@@ -2062,22 +2378,334 @@ fn default_plugin_registries() -> Vec<PluginRegistrySource> {
     }]
 }
 
-/// Python script overrides for individual context engine lifecycle hooks.
+/// Script overrides for individual context engine lifecycle hooks.
+///
+/// Hook scripts speak a language-agnostic JSON-over-stdin/stdout protocol —
+/// they read one JSON object from stdin and emit one JSON line on stdout.
+/// The `runtime` field picks which interpreter / launcher to use; it defaults
+/// to `"python"` so existing Python plugins keep working without edits.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextEngineHooks {
-    /// Python script for the `ingest` hook (called on new user message).
+    /// Script for the `ingest` hook (called on new user message).
     /// Receives: `{"type": "ingest", "agent_id": "...", "message": "..."}`
     /// Returns: `{"type": "ingest_result", "memories": [{"content": "..."}]}`
     pub ingest: Option<String>,
-    /// Python script for the `after_turn` hook (called after each turn).
+    /// Script for the `after_turn` hook (called after each turn).
     /// Receives: `{"type": "after_turn", "agent_id": "...", "messages": [...]}`
     /// Returns: `{"type": "ok"}` (acknowledgement)
     pub after_turn: Option<String>,
+    /// Script for the `bootstrap` hook (called once on engine init).
+    /// Receives: `{"type": "bootstrap", "context_window_tokens": N, "stable_prefix_mode": bool, "max_recall_results": N}`
+    /// Returns: `{"type": "ok"}`
+    pub bootstrap: Option<String>,
+    /// Script for the `assemble` hook (called before each LLM call).
+    /// Receives: `{"type": "assemble", "agent_id": "...", "messages": [...], "system_prompt": "...", "context_window_tokens": N}`
+    /// Returns: `{"type": "assemble_result", "messages": [...]}` — script controls what the model sees.
+    /// Falls back to default engine if script fails or returns no messages.
+    pub assemble: Option<String>,
+    /// Script for the `compact` hook (called under context pressure).
+    /// Receives: `{"type": "compact", "agent_id": "...", "messages": [...], "model": "...", "context_window_tokens": N}`
+    /// Returns: `{"type": "compact_result", "messages": [...]}` — compacted message list.
+    /// Falls back to default LLM-based compaction if script fails.
+    pub compact: Option<String>,
+    /// Script for the `prepare_subagent` hook (called before sub-agent spawn).
+    /// Receives: `{"type": "prepare_subagent", "parent_id": "...", "child_id": "..."}`
+    /// Returns: `{"type": "ok"}`
+    pub prepare_subagent: Option<String>,
+    /// Script for the `merge_subagent` hook (called after sub-agent completes).
+    /// Receives: `{"type": "merge_subagent", "parent_id": "...", "child_id": "..."}`
+    /// Returns: `{"type": "ok"}`
+    pub merge_subagent: Option<String>,
+    /// Which runtime launches the hook scripts.
+    ///
+    /// Supported: `"python"` (default, runs `.py` via `python3`), `"native"`
+    /// (exec a pre-compiled binary directly), `"v"` (`v run *.v`), `"node"`,
+    /// `"deno"`, `"go"` (`go run *.go`). Unknown values fall back to
+    /// `"python"` with a warning.
+    pub runtime: Option<String>,
+    /// Per-invocation timeout for hook scripts, in seconds.
+    ///
+    /// Defaults to `30`. The `bootstrap` hook gets **double** this value because
+    /// it runs only once and may need time to connect to external services (e.g.
+    /// a vector database). Set higher if your hooks do heavy I/O at startup.
+    #[serde(default)]
+    pub hook_timeout_secs: Option<u64>,
+    /// What to do when a hook script fails (crash, timeout, bad JSON).
+    ///
+    /// - `"warn"` (default) — log a warning, continue with fallback behaviour.
+    /// - `"abort"` — propagate the error to the caller; the agent turn fails.
+    /// - `"skip"` — silently ignore the failure, no log, use fallback.
+    #[serde(default)]
+    pub on_hook_failure: HookFailurePolicy,
+    /// How many times to retry a failing hook before applying `on_hook_failure`.
+    ///
+    /// Defaults to `0` (no retries). Each retry respects the same timeout.
+    /// Useful for hooks that call flaky external services.
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Milliseconds to wait between hook retries.
+    ///
+    /// Defaults to `500`. Ignored when `max_retries = 0`.
+    #[serde(default = "default_hook_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+    /// Optional substring filter for the `ingest` hook.
+    ///
+    /// When set, the ingest hook is only invoked if the incoming user message
+    /// contains this string (case-sensitive). If the message does not match,
+    /// the default recall path runs without starting a subprocess.
+    ///
+    /// Example: `ingest_filter = "remember"` — only index messages that
+    /// explicitly ask the agent to remember something.
+    #[serde(default)]
+    pub ingest_filter: Option<String>,
+    /// Hook protocol version this plugin was written for.
+    ///
+    /// LibreFang's current hook protocol is version **1**. If a plugin declares
+    /// a higher version the runtime logs a compatibility warning and may refuse
+    /// to load. Omit or set to `1` for full compatibility.
+    #[serde(default)]
+    pub hook_protocol_version: Option<u32>,
+    /// Memory limit (MiB) for each hook subprocess.
+    ///
+    /// Enforced via `RLIMIT_AS` on Linux. On other platforms a warning is
+    /// logged and the limit is not applied. Omit to use the OS default.
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// Whether hook subprocesses are allowed to make network connections.
+    ///
+    /// When `false` the runtime attempts soft network isolation: on Linux it
+    /// wraps the hook with `unshare --net` (if available); on other platforms
+    /// it injects `no_proxy=*` / `NO_PROXY=*` into the subprocess environment.
+    /// Defaults to `true`.
+    #[serde(default = "default_true_bool")]
+    pub allow_network: bool,
+    /// Restrict the `ingest`/`after_turn`/`assemble` hooks to specific agent IDs.
+    ///
+    /// Each entry is matched as a substring of the agent's UUID string. Leave
+    /// empty (default) to run hooks for every agent.
+    ///
+    /// ```toml
+    /// only_for_agent_ids = ["3f2a", "9c01"]  # prefix match is fine
+    /// ```
+    #[serde(default)]
+    pub only_for_agent_ids: Vec<String>,
+    /// Per-hook JSON Schema definitions for input/output validation.
+    ///
+    /// Map keys are hook names (`"ingest"`, `"assemble"`, …). Each value is
+    /// an object with optional `"input"` and `"output"` JSON Schema objects.
+    /// When declared, the runtime validates hook payloads and responses against
+    /// the schema and logs a warning on mismatch (never blocks execution).
+    ///
+    /// ```toml
+    /// [hooks.hook_schemas.ingest.output]
+    /// type = "object"
+    /// required = ["memories"]
+    /// ```
+    #[serde(default)]
+    pub hook_schemas: std::collections::HashMap<String, HookSchema>,
+    /// Optional TTL (seconds) for caching `ingest` hook results.
+    ///
+    /// When set, the runtime caches the hook output keyed on the exact input
+    /// JSON. Subsequent calls with identical input within the TTL window skip
+    /// the subprocess entirely and return the cached result. Useful for
+    /// embedding-based recall hooks that are deterministic and expensive.
+    ///
+    /// Set to `0` or omit to disable caching (default).
+    ///
+    /// ```toml
+    /// hook_cache_ttl_secs = 60   # cache ingest results for 1 minute
+    /// ```
+    #[serde(default)]
+    pub hook_cache_ttl_secs: Option<u64>,
+    /// Keep hook subprocesses alive between calls (persistent process pool).
+    ///
+    /// When `true`, the runtime keeps one subprocess per hook script alive
+    /// between invocations, communicating via JSON-lines on stdin/stdout.
+    /// Eliminates interpreter startup overhead (significant for Python/Node).
+    /// Defaults to `false`.
+    ///
+    /// ```toml
+    /// persistent_subprocess = true
+    /// ```
+    #[serde(default)]
+    pub persistent_subprocess: bool,
+    /// Cache TTL (seconds) for `assemble` hook results.
+    ///
+    /// When set, identical assemble inputs (same messages + system_prompt) return
+    /// the cached output without invoking the subprocess. Useful for expensive
+    /// context-shaping hooks that produce deterministic output.
+    #[serde(default)]
+    pub assemble_cache_ttl_secs: Option<u64>,
+    /// Cache TTL (seconds) for `compact` hook results.
+    #[serde(default)]
+    pub compact_cache_ttl_secs: Option<u64>,
+    /// Execution priority in a stacked engine (higher = runs first).
+    ///
+    /// Plugins with higher priority run first for `ingest` and `assemble`
+    /// hooks. Plugins with equal priority keep declaration order.
+    /// Defaults to `0`.
+    ///
+    /// ```toml
+    /// priority = 10   # run before plugins with default priority 0
+    /// ```
+    #[serde(default)]
+    pub priority: i32,
+    /// Regex filter for the `ingest` hook (applied before `ingest_filter`).
+    ///
+    /// The hook is only invoked when the user message matches this regex.
+    /// ```toml
+    /// ingest_regex = "(?i)remember|note|save"
+    /// ```
+    #[serde(default)]
+    pub ingest_regex: Option<String>,
+    /// Declared environment variable schema for this plugin.
+    ///
+    /// Maps env var name → description. Keys prefixed with `!` are required;
+    /// the runtime warns at load time if a required var is not set.
+    ///
+    /// ```toml
+    /// [hooks.env_schema]
+    /// "!QDRANT_URL" = "Required: Qdrant HTTP endpoint"
+    /// "COLLECTION"  = "Optional: collection name (default: memories)"
+    /// ```
+    #[serde(default)]
+    pub env_schema: std::collections::HashMap<String, String>,
+    /// Enable shared state KV store for this plugin's hooks.
+    ///
+    /// When enabled, the runtime injects `LIBREFANG_STATE_FILE=/path/to/state.json`
+    /// into every hook subprocess. Hooks can read/write this JSON file to persist
+    /// state across calls. The file is scoped per-plugin.
+    ///
+    /// ```toml
+    /// enable_shared_state = true
+    /// ```
+    #[serde(default)]
+    pub enable_shared_state: bool,
+    /// Circuit-breaker configuration for hook failures.
+    ///
+    /// After `max_failures` consecutive failures the hook is suspended for
+    /// `reset_secs` seconds before being retried in half-open state.
+    ///
+    /// ```toml
+    /// [hooks.circuit_breaker]
+    /// max_failures = 5
+    /// reset_secs   = 60
+    /// ```
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Maximum concurrent `after_turn` background tasks (default 16).
+    #[serde(default = "default_after_turn_queue_depth")]
+    pub after_turn_queue_depth: u32,
+    /// Pre-warm persistent subprocesses at engine init (requires `persistent_subprocess = true`).
+    #[serde(default)]
+    pub prewarm_subprocesses: bool,
+    /// Restrict hook filesystem access: sets `HOME=/dev/null`, per-call `TMPDIR`,
+    /// and `LIBREFANG_READONLY_FS=1`. Defaults to `true` (no restriction).
+    #[serde(default = "default_true_bool")]
+    pub allow_filesystem: bool,
+    /// OTel OTLP gRPC endpoint for hook span export (overrides global setting).
+    #[serde(default)]
+    pub otel_endpoint: Option<String>,
+    /// Script path for the `on_event` hook.
+    /// Called when another plugin emits an event via the event bus.
+    #[serde(default)]
+    pub on_event: Option<String>,
+    /// Vault secret names that this plugin's hooks are allowed to access.
+    ///
+    /// Each entry is a key name in the LibreFang credential vault. The runtime
+    /// resolves the secret value at engine init time and injects it into every
+    /// hook subprocess as `LIBREFANG_SECRET_<NAME>` (uppercased). If a named
+    /// secret does not exist in the vault a warning is logged and the variable
+    /// is not injected.
+    ///
+    /// ```toml
+    /// [hooks]
+    /// allowed_secrets = ["GITHUB_TOKEN", "OPENAI_KEY"]
+    /// ```
+    #[serde(default)]
+    pub allowed_secrets: Vec<String>,
+}
+
+/// Circuit-breaker settings for a hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive failures before the circuit opens.
+    #[serde(default = "default_cb_max_failures")]
+    pub max_failures: u32,
+    /// Cooldown in seconds before half-open retry.
+    #[serde(default = "default_cb_reset_secs")]
+    pub reset_secs: u64,
+}
+
+fn default_cb_max_failures() -> u32 {
+    5
+}
+fn default_cb_reset_secs() -> u64 {
+    60
+}
+fn default_after_turn_queue_depth() -> u32 {
+    16
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+/// Per-hook input/output JSON Schema definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookSchema {
+    /// JSON Schema for the value sent to the hook script on stdin.
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    /// JSON Schema for the value the hook script must return on stdout.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+}
+
+fn default_hook_retry_delay_ms() -> u64 {
+    500
+}
+
+/// What to do when a hook script invocation fails.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailurePolicy {
+    /// Log a warning and continue with the engine's built-in fallback (default).
+    #[default]
+    Warn,
+    /// Propagate the error to the caller — the current agent operation fails.
+    Abort,
+    /// Silently ignore the failure and proceed with fallback, no log emitted.
+    Skip,
 }
 
 /// Plugin manifest — parsed from `~/.librefang/plugins/<name>/plugin.toml`.
 ///
+/// Type of a plugin config field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginConfigFieldType {
+    #[default]
+    String,
+    Number,
+    Boolean,
+}
+
+/// A single user-configurable field declared in `[config]` of plugin.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginConfigField {
+    /// Field value type.
+    #[serde(rename = "type", default)]
+    pub field_type: PluginConfigFieldType,
+    /// Default value (always a JSON-compatible value).
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+    /// Human-readable description of what this field controls.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// # Example `plugin.toml`
 ///
 /// ```toml
@@ -2090,7 +2718,7 @@ pub struct ContextEngineHooks {
 /// ingest = "hooks/ingest.py"      # relative to plugin dir
 /// after_turn = "hooks/after_turn.py"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginManifest {
     /// Plugin name (must match directory name).
     pub name: String,
@@ -2105,9 +2733,94 @@ pub struct PluginManifest {
     /// Hook script paths, relative to the plugin directory.
     #[serde(default)]
     pub hooks: ContextEngineHooks,
-    /// Python dependencies file (relative to plugin dir, default: `requirements.txt`).
+    /// Dependencies file (relative to plugin dir). For Python: `requirements.txt`.
+    /// Other runtimes ignore this field (use `go.mod`, `package.json`, etc. directly).
     #[serde(default)]
     pub requirements: Option<String>,
+    /// Environment variables injected into every hook subprocess spawned by this plugin.
+    ///
+    /// Values starting with `${VAR_NAME}` are expanded from the daemon's own environment
+    /// at invocation time. Unknown references expand to an empty string.
+    ///
+    /// ```toml
+    /// [env]
+    /// QDRANT_URL     = "http://localhost:6333"
+    /// COLLECTION     = "agent-memories"
+    /// QDRANT_API_KEY = "${QDRANT_API_KEY}"   # expanded from daemon env
+    /// ```
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Minimum LibreFang version required by this plugin.
+    ///
+    /// The runtime refuses to load the plugin when the running daemon's version
+    /// is lower than this string (compared lexicographically on the semver
+    /// portion before any `-` pre-release suffix). Omit to allow all versions.
+    ///
+    /// ```toml
+    /// librefang_min_version = "2026.4.0"
+    /// ```
+    #[serde(default)]
+    pub librefang_min_version: Option<String>,
+    /// SHA-256 integrity hashes for hook script files.
+    ///
+    /// Maps a file path (relative to the plugin directory) to its expected
+    /// lowercase hex SHA-256 digest. Verified at load time; mismatches abort
+    /// loading with an error so tampered scripts are never executed.
+    ///
+    /// Generate with: `sha256sum hooks/ingest.py`
+    ///
+    /// ```toml
+    /// [integrity]
+    /// "hooks/ingest.py"    = "e3b0c44298fc1c149afb..."
+    /// "hooks/after_turn.py" = "a87ff679a2f3e71d9181..."
+    /// ```
+    #[serde(default)]
+    pub integrity: std::collections::HashMap<String, String>,
+    /// Other plugins this plugin depends on.
+    ///
+    /// Listed names must be installed (present in `~/.librefang/plugins/`)
+    /// before this plugin is allowed to load. The runtime returns an error
+    /// listing any missing dependencies.
+    ///
+    /// ```toml
+    /// plugin_depends = ["base-recall", "embedding-indexer"]
+    /// ```
+    #[serde(default)]
+    pub plugin_depends: Vec<String>,
+    /// User-configurable plugin settings declared in `[config]`.
+    ///
+    /// ```toml
+    /// [config]
+    /// model = { type = "string", default = "small", description = "Whisper model size" }
+    /// max_file_size_mb = { type = "number", default = 10 }
+    /// ```
+    ///
+    /// The resolved config (defaults merged with user overrides) is written as JSON to
+    /// the path in `LIBREFANG_PLUGIN_CONFIG` before each hook subprocess runs.
+    #[serde(default)]
+    pub config: std::collections::HashMap<String, PluginConfigField>,
+    /// System binaries required by this plugin.
+    ///
+    /// The runtime checks each binary against `PATH` at install and lint time
+    /// and warns when one is missing. Hooks still execute — this is advisory only.
+    ///
+    /// ```toml
+    /// [[requires]]
+    /// binary = "ffmpeg"
+    /// install_hint = "brew install ffmpeg"
+    /// ```
+    #[serde(default)]
+    pub requires: Vec<PluginSystemRequirement>,
+}
+
+/// A single system-binary requirement declared in `plugin.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginSystemRequirement {
+    /// Name of the binary that must exist on `PATH`.
+    pub binary: String,
+    /// Human-readable install hint shown when the binary is missing.
+    #[serde(default)]
+    pub install_hint: Option<String>,
 }
 
 /// client_secret_env = "GITHUB_OAUTH_CLIENT_SECRET"
@@ -2255,6 +2968,26 @@ pub struct OAuthConfig {
     pub slack_client_id: Option<String>,
 }
 
+/// Per-provider spending limits.
+///
+/// Lets you cap spend on paid providers (e.g. Moonshot, OpenAI) without
+/// throttling free local providers (e.g. litellm, ollama). All limits
+/// default to 0 which means "unlimited" — only non-zero limits are enforced.
+/// Keyed by the provider id in `BudgetConfig.providers`, which must match
+/// the `model.provider` field of the agent's `ModelConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProviderBudget {
+    /// Maximum cost in USD per hour for this provider (0.0 = unlimited).
+    pub max_cost_per_hour_usd: f64,
+    /// Maximum cost in USD per day for this provider (0.0 = unlimited).
+    pub max_cost_per_day_usd: f64,
+    /// Maximum cost in USD per month for this provider (0.0 = unlimited).
+    pub max_cost_per_month_usd: f64,
+    /// Maximum total tokens per hour for this provider (0 = unlimited).
+    pub max_tokens_per_hour: u64,
+}
+
 /// Global spending budget configuration.
 ///
 /// Set limits to 0.0 for unlimited. All limits apply across all agents.
@@ -2273,6 +3006,10 @@ pub struct BudgetConfig {
     /// will be overridden to this value. Set to 0 to keep each agent's own limit.
     /// Use this to globally raise or lower the token budget for all agents.
     pub default_max_llm_tokens_per_hour: u64,
+    /// Per-provider spending caps, keyed by provider id (e.g. `"moonshot"`,
+    /// `"openai"`, `"litellm"`). Missing providers are unlimited.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub providers: std::collections::HashMap<String, ProviderBudget>,
 }
 
 impl Default for BudgetConfig {
@@ -2283,6 +3020,7 @@ impl Default for BudgetConfig {
             max_monthly_usd: 0.0,
             alert_threshold: 0.8,
             default_max_llm_tokens_per_hour: 0,
+            providers: std::collections::HashMap::new(),
         }
     }
 }
@@ -2322,17 +3060,36 @@ fn default_max_request_body_bytes() -> usize {
 /// ```toml
 /// [audit]
 /// retention_days = 90
+/// # Optional override for the external tip-anchor path. Relative
+/// # paths resolve against `data_dir`. Leave unset for the default
+/// # `data_dir/audit.anchor`.
+/// anchor_path = "/var/log/librefang/audit.anchor"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuditConfig {
     /// How many days to retain audit log entries. Default: 90. Set to 0 for unlimited.
     pub retention_days: u32,
+    /// Optional override for the external Merkle-tip anchor file that
+    /// `AuditLog::with_db_anchored` uses to detect full rewrites of
+    /// `audit_entries`. When unset the daemon writes to
+    /// `data_dir/audit.anchor`, which catches most casual tampering but
+    /// sits in the same filesystem namespace as the SQLite file it is
+    /// meant to verify. Operators who want a stronger boundary can
+    /// point this at a path the daemon can write to but unprivileged
+    /// code cannot — a chmod-0400 file owned by a dedicated user, a
+    /// `systemd ReadOnlyPaths=` mount, an NFS share, or a pipe to
+    /// `logger`. Relative paths are resolved against `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_path: Option<PathBuf>,
 }
 
 impl Default for AuditConfig {
     fn default() -> Self {
-        Self { retention_days: 90 }
+        Self {
+            retention_days: 90,
+            anchor_path: None,
+        }
     }
 }
 
@@ -2520,6 +3277,12 @@ pub struct McpServerConfigEntry {
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
     #[serde(default)]
     pub headers: Vec<String>,
+    /// Optional OAuth configuration for this MCP server.
+    // `skip_serializing_if` is load-bearing: `upsert_mcp_server_config` goes
+    // serde_json → TOML, and the null round-trip writes `oauth = ""` which
+    // fails to deserialize back into `Option<McpOAuthConfig>` on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 fn default_mcp_timeout() -> u64 {
@@ -2612,6 +3375,41 @@ pub enum McpTransportEntry {
     },
 }
 
+/// Optional OAuth configuration for an MCP server.
+///
+/// Used as fallback when the server doesn't support `.well-known` discovery,
+/// or to override specific values from discovery. All fields are optional —
+/// discovery results fill gaps, config values take precedence.
+///
+/// # Example (config.toml)
+///
+/// ```toml
+/// [[mcp_servers]]
+/// name = "custom-server"
+/// transport = { type = "http", url = "https://my-server.com/mcp" }
+///
+/// [mcp_servers.oauth]
+/// auth_url = "https://my-server.com/oauth/authorize"
+/// token_url = "https://my-server.com/oauth/token"
+/// client_id = "my-client-id"
+/// scopes = ["read", "write"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    #[serde(default)]
+    pub auth_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Slack-style user scopes, appended to the authorization URL as
+    /// `&user_scope=...`. Most OAuth servers don't use this.
+    #[serde(default)]
+    pub user_scopes: Vec<String>,
+}
+
 /// A2A (Agent-to-Agent) protocol configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -2699,6 +3497,8 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            require_auth_for_reads: None,
+            trusted_manifest_signers: Vec::new(),
             dashboard_user: String::new(),
             dashboard_pass: String::new(),
             dashboard_pass_hash: String::new(),
@@ -2713,6 +3513,7 @@ impl Default for KernelConfig {
             fallback_providers: Vec::new(),
             browser: BrowserConfig::default(),
             extensions: ExtensionsConfig::default(),
+            skills: SkillsConfig::default(),
             vault: VaultConfig::default(),
             workspaces_dir: None,
             log_dir: None,
@@ -2722,6 +3523,7 @@ impl Default for KernelConfig {
             webhook_triggers: None,
             triggers: TriggersConfig::default(),
             approval: crate::approval::ApprovalPolicy::default(),
+            notification: crate::approval::NotificationConfig::default(),
             max_cron_jobs: default_max_cron_jobs(),
             include: Vec::new(),
             exec_policy: ExecPolicy::default(),
@@ -2736,6 +3538,7 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
+            provider_proxy_urls: HashMap::new(),
             provider_regions: HashMap::new(),
             provider_api_keys: HashMap::new(),
             vertex_ai: VertexAiConfig::default(),
@@ -2757,6 +3560,7 @@ impl Default for KernelConfig {
             plugins: PluginsConfig::default(),
             registry: RegistryConfig::default(),
             cors_origin: Vec::new(),
+            trusted_hosts: Vec::new(),
             privacy: PrivacyConfig::default(),
             strict_config: false,
             qwen_code_path: None,
@@ -2771,6 +3575,7 @@ impl Default for KernelConfig {
             max_concurrent_bg_llm: default_max_concurrent_bg_llm(),
             max_agent_call_depth: default_max_agent_call_depth(),
             max_request_body_bytes: default_max_request_body_bytes(),
+            terminal: TerminalConfig::default(),
         }
     }
 }
@@ -2791,6 +3596,18 @@ impl KernelConfig {
     /// Resolved directory for hand workspaces.
     pub fn effective_hands_workspaces_dir(&self) -> PathBuf {
         self.effective_workspaces_dir().join("hands")
+    }
+
+    /// Parse the TCP port number from `api_listen`.
+    ///
+    /// Returns `None` when the address string is malformed. Callers that rely
+    /// on the port for security-relevant decisions (e.g. Origin validation)
+    /// MUST fail closed in the `None` case rather than assume a default.
+    pub fn listen_port(&self) -> Option<u16> {
+        self.api_listen
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
     }
 
     /// Resolve the API key env var name for a provider.
@@ -2944,6 +3761,16 @@ pub struct DefaultModelConfig {
     /// many seconds of silence on stdout, not wall-clock time.
     #[serde(default = "default_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Provider-specific extension parameters that are flattened directly
+    /// into the API request body.
+    #[serde(default, flatten)]
+    pub extra_params: HashMap<String, serde_json::Value>,
+    /// Claude Code CLI profile directories for token rotation.
+    /// Each entry is a path to a `.claude/` config dir (e.g. `~/.claude-profiles/account-2`).
+    /// When multiple profiles are configured, a TokenRotationDriver wraps them
+    /// for automatic failover on rate limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cli_profile_dirs: Vec<String>,
 }
 
 fn default_message_timeout_secs() -> u64 {
@@ -2958,6 +3785,8 @@ impl Default for DefaultModelConfig {
             api_key_env: String::new(),
             base_url: None,
             message_timeout_secs: default_message_timeout_secs(),
+            extra_params: HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         }
     }
 }
@@ -2973,8 +3802,12 @@ pub struct MemoryConfig {
     /// Maximum memories before consolidation is triggered.
     pub consolidation_threshold: u64,
     /// Memory decay rate (0.0 = no decay, 1.0 = aggressive decay).
-    pub decay_rate: f32,
-    /// Embedding provider (e.g., "openai", "ollama"). None = auto-detect.
+    pub decay_rate: f64,
+    /// Embedding provider. Valid values: `"openai"`, `"groq"`, `"mistral"`,
+    /// `"together"`, `"fireworks"`, `"cohere"`, `"ollama"`, `"bedrock"`,
+    /// `"vllm"`, `"lmstudio"`, or `"auto"`.
+    /// `None` or `"auto"` = probe API-key env vars across all cloud providers,
+    /// then fall back to local Ollama.
     #[serde(default)]
     pub embedding_provider: Option<String>,
     /// Environment variable name for the embedding API key.
@@ -4989,6 +5822,64 @@ impl Default for LinkedInConfig {
     }
 }
 
+/// Terminal / CLI access control configuration.
+///
+/// Controls which clients may connect to the interactive terminal (WebSocket)
+/// and how locality is determined.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// Master switch — set to false to disable the terminal entirely.
+    #[serde(default = "default_terminal_enabled")]
+    pub enabled: bool,
+
+    /// Additional allowed WebSocket origins beyond auto-detected localhost.
+    /// Use when the dashboard is served from a custom domain (e.g. "https://my.domain.com").
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Allow terminal access from remote/proxied connections when no auth is configured.
+    /// Default: false (local-only when unauthenticated).
+    #[serde(default)]
+    pub allow_remote: bool,
+
+    /// When true, bare-loopback connections (127.0.0.1 / ::1 with no proxy
+    /// headers) are rejected at auth time — only connections that arrived via
+    /// a reverse proxy (carrying X-Forwarded-For / X-Real-IP) are considered
+    /// "local". Enable only when running behind a reverse proxy that strips
+    /// direct loopback access. Default: false.
+    ///
+    /// (Historically named `trust_proxy_headers`; the old name is still
+    /// accepted for backward compatibility via `serde(alias)`.)
+    #[serde(default, alias = "trust_proxy_headers")]
+    pub require_proxy_headers: bool,
+
+    /// Hard-override for the "remote + no authentication" combination.
+    /// When `allow_remote` is true and no auth is configured, the terminal
+    /// will still refuse every connection unless this flag is explicitly
+    /// set to `true`. Intended as a foot-gun guard: enabling `allow_remote`
+    /// alone is not enough to expose an unauthenticated shell to the network.
+    /// Default: false.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+}
+
+fn default_terminal_enabled() -> bool {
+    true
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: Vec::new(),
+            allow_remote: false,
+            require_proxy_headers: false,
+            allow_unauthenticated_remote: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5186,6 +6077,55 @@ type = "number"
         assert_eq!(
             toml_str, toml_str2,
             "KernelConfig default roundtrip mismatch — a field may be missing from Default impl"
+        );
+    }
+
+    /// Per-provider budget TOML roundtrip (issue #2316).
+    #[test]
+    fn test_budget_config_per_provider_roundtrip() {
+        let toml_str = r#"
+max_hourly_usd = 0.0
+max_daily_usd = 10.0
+max_monthly_usd = 0.0
+alert_threshold = 0.8
+default_max_llm_tokens_per_hour = 0
+
+[providers.moonshot]
+max_cost_per_day_usd = 2.0
+max_tokens_per_hour = 500000
+
+[providers.litellm]
+# all zeros -> unlimited
+"#;
+        let cfg: BudgetConfig = toml::from_str(toml_str).expect("parse budget TOML");
+        assert_eq!(cfg.providers.len(), 2);
+
+        let moonshot = cfg.providers.get("moonshot").expect("moonshot entry");
+        assert!((moonshot.max_cost_per_day_usd - 2.0).abs() < f64::EPSILON);
+        assert_eq!(moonshot.max_tokens_per_hour, 500_000);
+        // Unset fields default to 0 (unlimited).
+        assert_eq!(moonshot.max_cost_per_hour_usd, 0.0);
+        assert_eq!(moonshot.max_cost_per_month_usd, 0.0);
+
+        let litellm = cfg.providers.get("litellm").expect("litellm entry");
+        assert_eq!(*litellm, ProviderBudget::default());
+
+        // Round-trip: serialize then re-parse, structs should match.
+        let reserialized = toml::to_string(&cfg).expect("serialize budget");
+        let cfg2: BudgetConfig = toml::from_str(&reserialized).expect("reparse budget");
+        assert_eq!(cfg2.providers, cfg.providers);
+    }
+
+    #[test]
+    fn test_budget_config_default_has_empty_providers() {
+        let b = BudgetConfig::default();
+        assert!(b.providers.is_empty());
+        // An empty providers map must not appear in serialized output so that
+        // users who never configured per-provider caps see a clean config.
+        let s = toml::to_string(&b).expect("serialize");
+        assert!(
+            !s.contains("providers"),
+            "empty providers map should be skipped: {s}"
         );
     }
 }

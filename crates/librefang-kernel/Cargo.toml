@@ -8,10 +8,13 @@ description = "Core kernel for the LibreFang Agent OS"
 [dependencies]
 librefang-types = { path = "../librefang-types" }
 librefang-memory = { path = "../librefang-memory" }
+librefang-kernel-router = { path = "../librefang-kernel-router" }
+librefang-kernel-metering = { path = "../librefang-kernel-metering" }
 librefang-runtime = { path = "../librefang-runtime" }
 librefang-skills = { path = "../librefang-skills" }
 librefang-hands = { path = "../librefang-hands" }
 librefang-extensions = { path = "../librefang-extensions" }
+librefang-llm-driver = { path = "../librefang-llm-driver" }
 librefang-wire = { path = "../librefang-wire" }
 librefang-channels = { path = "../librefang-channels", default-features = false }
 tokio = { workspace = true }
@@ -20,6 +23,8 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 serde_yaml = { workspace = true }
 dashmap = { workspace = true }
+rusqlite = { workspace = true }
+arc-swap = { workspace = true }
 crossbeam = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -36,6 +41,8 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 regex-lite = { workspace = true }
 cron = "0.16"
+totp-rs = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -81,6 +81,8 @@ async fn start_test_server_with_provider(
             api_key_env: api_key_env.to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         },
         ..KernelConfig::default()
     };
@@ -109,6 +111,10 @@ async fn start_test_server_with_provider(
         #[cfg(feature = "telemetry")]
         prometheus_handle: None,
         media_drivers: librefang_runtime::media::MediaDriverCache::new(),
+        webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
+        api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+        provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
@@ -209,6 +215,8 @@ async fn start_full_router(api_key: &str) -> FullRouterHarness {
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         },
         ..KernelConfig::default()
     };
@@ -275,7 +283,7 @@ memory_write = ["self.*"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_health_endpoint() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .get(format!("{}/api/health", server.base_url))
@@ -300,7 +308,7 @@ async fn test_health_endpoint() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_status_endpoint() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .get(format!("{}/api/status", server.base_url))
@@ -480,12 +488,7 @@ async fn test_build_router_unauthorized_responses_include_api_version_header() {
 async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     let harness = start_full_router("").await;
 
-    let source_dir = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("openclaw-source");
+    let source_dir = harness.state.kernel.home_dir().join("openclaw-source");
     std::fs::create_dir_all(&source_dir).unwrap();
     std::fs::write(
         source_dir.join("openclaw.json"),
@@ -528,26 +531,18 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
     assert_eq!(json["status"], "completed");
     assert_eq!(json["dry_run"], false);
 
-    let config_path = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("config.toml");
+    let config_path = harness.state.kernel.home_dir().join("config.toml");
+    // Migrate writes to <home>/agents/ but the daemon relocates the dirs to
+    // the canonical workspaces/agents/ layout immediately after migration.
     let agent_path = harness
         .state
         .kernel
-        .config_ref()
-        .home_dir
+        .home_dir()
+        .join("workspaces")
         .join("agents")
         .join("main")
         .join("agent.toml");
-    let report_path = harness
-        .state
-        .kernel
-        .config_ref()
-        .home_dir
-        .join("migration_report.md");
+    let report_path = harness.state.kernel.home_dir().join("migration_report.md");
 
     assert!(
         config_path.exists(),
@@ -564,7 +559,7 @@ async fn test_run_migrate_uses_daemon_home_when_target_dir_is_empty() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_config_reload_reports_proxy_changes_require_restart() {
+async fn test_config_reload_hot_reloads_proxy_changes() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
 
@@ -573,27 +568,11 @@ async fn test_config_reload_reports_proxy_changes_require_restart() {
     let table = config.as_table_mut().unwrap();
     table.insert(
         "home_dir".to_string(),
-        toml::Value::String(
-            server
-                .state
-                .kernel
-                .config_ref()
-                .home_dir
-                .display()
-                .to_string(),
-        ),
+        toml::Value::String(server.state.kernel.home_dir().display().to_string()),
     );
     table.insert(
         "data_dir".to_string(),
-        toml::Value::String(
-            server
-                .state
-                .kernel
-                .config_ref()
-                .data_dir
-                .display()
-                .to_string(),
-        ),
+        toml::Value::String(server.state.kernel.data_dir().display().to_string()),
     );
     table.insert(
         "proxy".to_string(),
@@ -617,23 +596,24 @@ async fn test_config_reload_reports_proxy_changes_require_restart() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "partial");
-    assert_eq!(body["restart_required"], true);
+    // Proxy is now hot-reloadable — should NOT require restart
+    assert_eq!(
+        body["restart_required"], false,
+        "proxy changes should be hot-reloaded, not require restart: {body}"
+    );
     assert!(
-        body["restart_reasons"]
+        body["hot_actions_applied"]
             .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|value| value.as_str())
-            .any(|reason| reason.contains("proxy config changed")),
-        "unexpected reload response: {body}"
+            .map(|a| a.iter().any(|v| v.as_str() == Some("ReloadProxy")))
+            .unwrap_or(false),
+        "ReloadProxy should be in hot_actions_applied: {body}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spawn_list_kill_agent() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // --- Spawn ---
     let resp = client
@@ -689,7 +669,7 @@ async fn test_spawn_list_kill_agent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_agent_session_empty() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Spawn agent
     let resp = client
@@ -719,7 +699,7 @@ async fn test_agent_session_empty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_agent_monitoring_endpoints() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .post(format!("{}/api/agents", server.base_url))
@@ -782,7 +762,7 @@ async fn test_send_message_with_llm() {
     }
 
     let server = start_test_server_with_llm().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Spawn
     let resp = client
@@ -830,7 +810,7 @@ async fn test_send_message_with_llm() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_workflow_crud() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Spawn agent for workflow
     let resp = client
@@ -883,7 +863,7 @@ async fn test_workflow_crud() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_trigger_crud() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Spawn agent for trigger
     let resp = client
@@ -963,7 +943,7 @@ async fn test_trigger_crud() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_agent_id_returns_400() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Send message to invalid ID
     let resp = client
@@ -996,7 +976,7 @@ async fn test_invalid_agent_id_returns_400() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kill_nonexistent_agent_returns_404() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let fake_id = uuid::Uuid::new_v4();
     let resp = client
@@ -1010,7 +990,7 @@ async fn test_kill_nonexistent_agent_returns_404() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_spawn_invalid_manifest_returns_400() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .post(format!("{}/api/agents", server.base_url))
@@ -1026,7 +1006,7 @@ async fn test_spawn_invalid_manifest_returns_400() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_request_id_header_is_uuid() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .get(format!("{}/api/health", server.base_url))
@@ -1049,7 +1029,7 @@ async fn test_request_id_header_is_uuid() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_agents_lifecycle() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Spawn 3 agents
     let mut ids = Vec::new();
@@ -1353,6 +1333,8 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         },
         ..KernelConfig::default()
     };
@@ -1363,6 +1345,10 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
+
+    let api_key_lock = std::sync::Arc::new(tokio::sync::RwLock::new(
+        kernel.config_ref().api_key.clone(),
+    ));
 
     let state = Arc::new(AppState {
         kernel,
@@ -1381,13 +1367,18 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         #[cfg(feature = "telemetry")]
         prometheus_handle: None,
         media_drivers: librefang_runtime::media::MediaDriverCache::new(),
+        webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
+        api_key_lock: api_key_lock.clone(),
+        provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let api_key_state = middleware::AuthState {
-        api_key_lock: std::sync::Arc::new(tokio::sync::RwLock::new(
-            state.kernel.config_ref().api_key.clone(),
-        )),
+        api_key_lock,
         active_sessions: state.active_sessions.clone(),
+        dashboard_auth_enabled: false,
+        user_api_keys: Arc::new(Vec::new()),
+        require_auth_for_reads: false,
     };
 
     let app = Router::new()
@@ -1468,7 +1459,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_auth_health_is_public() {
     let server = start_test_server_with_auth("secret-key-123").await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // /api/health should be accessible without auth
     let resp = client
@@ -1482,7 +1473,7 @@ async fn test_auth_health_is_public() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_auth_rejects_no_token() {
     let server = start_test_server_with_auth("secret-key-123").await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Protected endpoint without auth header → 401
     // Note: /api/status is public (dashboard needs it), so use a protected endpoint
@@ -1499,7 +1490,7 @@ async fn test_auth_rejects_no_token() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_auth_rejects_wrong_token() {
     let server = start_test_server_with_auth("secret-key-123").await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Wrong bearer token → 401
     // Note: /api/status is public (dashboard needs it), so use a protected endpoint
@@ -1517,7 +1508,7 @@ async fn test_auth_rejects_wrong_token() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_auth_accepts_correct_token() {
     let server = start_test_server_with_auth("secret-key-123").await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Correct bearer token → 200
     let resp = client
@@ -1535,7 +1526,7 @@ async fn test_auth_accepts_correct_token() {
 async fn test_auth_disabled_when_no_key() {
     // Empty API key = auth disabled
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // Protected endpoint accessible without auth when no key is configured
     let resp = client
@@ -1553,7 +1544,7 @@ async fn test_auth_disabled_when_no_key() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_list_tools() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .get(format!("{}/api/tools", server.base_url))
@@ -1570,7 +1561,7 @@ async fn test_list_tools() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_tool_found() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     // First list tools to get a known tool name
     let resp = client
@@ -1598,7 +1589,7 @@ async fn test_get_tool_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_tool_not_found() {
     let server = start_test_server().await;
-    let client = librefang_runtime::http_client::new_client();
+    let client = reqwest::Client::new();
 
     let resp = client
         .get(format!(
@@ -1612,4 +1603,113 @@ async fn test_get_tool_not_found() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+// ---------------------------------------------------------------------------
+// Test: /api/hands/active enriched response (Task 1 of chat-picker plan)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_active_hands_includes_definition_metadata() {
+    use std::collections::{BTreeMap, HashMap};
+
+    let harness = start_full_router("").await;
+
+    // Install a fresh hand definition with a known name + icon.
+    let toml_content = r#"
+id = "test-grouping-hand"
+name = "Test Grouping Hand"
+description = "Hand fixture for chat picker grouping integration test"
+category = "productivity"
+icon = "🧪"
+
+[agent]
+name = "test-agent"
+description = "Coordinator role for the test grouping hand"
+system_prompt = "You are a test agent."
+
+[dashboard]
+metrics = []
+"#;
+    harness
+        .state
+        .kernel
+        .hands()
+        .install_from_content(toml_content, "")
+        .expect("install_from_content should succeed");
+
+    // Activate the hand to get an instance, then attach two roles by hand.
+    // (The kernel normally spawns agents; here we simulate that with set_agents
+    // so the test does not depend on the spawner subsystem.)
+    let instance = harness
+        .state
+        .kernel
+        .hands()
+        .activate("test-grouping-hand", HashMap::new())
+        .expect("activate should succeed");
+
+    let main_id = librefang_types::agent::AgentId::new();
+    let linter_id = librefang_types::agent::AgentId::new();
+    let mut agent_ids = BTreeMap::new();
+    agent_ids.insert("main".to_string(), main_id);
+    agent_ids.insert("linter".to_string(), linter_id);
+    harness
+        .state
+        .kernel
+        .hands()
+        .set_agents(instance.instance_id, agent_ids, Some("main".to_string()))
+        .expect("set_agents should succeed");
+
+    // Hit the endpoint via the in-process router.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/hands/active")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router.oneshot should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("response is JSON");
+    let instances = json["instances"].as_array().expect("instances array");
+    let hand = instances
+        .iter()
+        .find(|i| i["hand_id"] == "test-grouping-hand")
+        .expect("our hand must appear in the active list");
+
+    // Existing fields — regression guard.
+    assert_eq!(hand["hand_id"], "test-grouping-hand");
+    assert!(hand["agent_id"].is_string(), "legacy agent_id must remain");
+    assert!(
+        hand["agent_name"].is_string(),
+        "legacy agent_name must remain"
+    );
+
+    // NEW fields from this plan.
+    assert_eq!(
+        hand["hand_name"], "Test Grouping Hand",
+        "hand_name must be exposed from definition"
+    );
+    assert_eq!(
+        hand["hand_icon"], "🧪",
+        "hand_icon must be exposed from definition"
+    );
+    assert_eq!(
+        hand["coordinator_role"], "main",
+        "coordinator_role must be exposed"
+    );
+
+    let agent_ids_obj = hand["agent_ids"]
+        .as_object()
+        .expect("agent_ids must be a JSON object");
+    assert_eq!(agent_ids_obj.len(), 2, "agent_ids must contain both roles");
+    assert_eq!(agent_ids_obj["main"], main_id.to_string());
+    assert_eq!(agent_ids_obj["linter"], linter_id.to_string());
 }

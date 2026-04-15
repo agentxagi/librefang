@@ -11,8 +11,9 @@ import { Home, RefreshCw, Users, Layers, Server, Network, Zap, MessageCircle, Us
 import { truncateId } from "../lib/string";
 import { isProviderAvailable } from "../lib/status";
 import { getStatusVariant } from "../lib/status";
+import { formatRelativeTime } from "../lib/datetime";
 
-const REFRESH_MS = 30000;
+const REFRESH_MS = 5000;
 
 export function OverviewPage() {
   const { t } = useTranslation();
@@ -79,8 +80,8 @@ export function OverviewPage() {
   const statsCards = [
     {
       title: t("overview.active_agents"),
-      value: agentsTotal,
-      subValue: `${agentsActive} ${t("overview.active")}`,
+      value: agentsActive,
+      subValue: `${agentsTotal} ${t("overview.total")}`,
       icon: Users,
       color: "brand",
       link: "/agents",
@@ -150,9 +151,13 @@ export function OverviewPage() {
           </div>
           <button
             onClick={() => void snapshotQuery.refetch()}
-            className="flex h-9 w-9 items-center justify-center rounded-full border border-border-subtle bg-surface text-text-dim hover:text-brand transition-colors shadow-sm"
+            title={snapshotQuery.dataUpdatedAt ? `${t("overview.last_updated", { defaultValue: "Last updated" })}: ${formatRelativeTime(snapshotQuery.dataUpdatedAt)}` : undefined}
+            className="flex h-9 items-center gap-2 rounded-full border border-border-subtle bg-surface px-3 text-text-dim hover:text-brand transition-colors shadow-sm"
           >
             <RefreshCw className={`h-4 w-4 ${snapshotQuery.isFetching ? "animate-spin" : ""}`} />
+            {snapshotQuery.dataUpdatedAt > 0 && (
+              <span className="text-[10px] font-medium hidden md:inline">{formatRelativeTime(snapshotQuery.dataUpdatedAt)}</span>
+            )}
           </button>
         </div>
       </header>
@@ -180,7 +185,7 @@ export function OverviewPage() {
       )}
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4 stagger-children">
+      <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-4 stagger-children">
         {isLoading ? (
           // Loading skeletons
           <>
@@ -261,14 +266,14 @@ export function OverviewPage() {
               </button>
             </div>
             {isLoading ? (
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 {[1, 2].map(i => (
                   <div key={i} className="h-16 rounded-xl bg-gradient-to-r from-main via-surface-hover to-main bg-[length:200%_100%]" style={{ animation: "shimmer 1.5s ease-in-out infinite" }} />
                 ))}
               </div>
             ) : snapshot?.agents && snapshot.agents.length > 0 ? (
-              <div className="grid gap-3 sm:grid-cols-2">
-                {snapshot.agents.filter(a => !a.name.includes("-hand") && !a.name.includes(":")).slice(0, 4).map(agent => (
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                {snapshot.agents.filter(a => !a.is_hand && !a.name.includes(":")).slice(0, 4).map(agent => (
                   <div
                     key={agent.id}
                     className="flex items-center gap-3 rounded-xl border border-border-subtle bg-surface p-3 shadow-sm hover:border-brand/30 transition-colors cursor-pointer"
@@ -280,7 +285,7 @@ export function OverviewPage() {
                       <User className="h-5 w-5" />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-bold">{agent.name}</p>
+                      <p className="truncate text-sm font-bold">{t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })}</p>
                       <p className="truncate text-[10px] text-text-dim uppercase tracking-tight font-medium">
                         {truncateId(agent.id)} · {translateStatus(agent.state)}
                       </p>
@@ -404,7 +409,13 @@ export function OverviewPage() {
       {/* Pro Tip */}
       <div className="hidden sm:flex items-center gap-3 rounded-xl border border-brand/10 bg-gradient-to-r from-brand/5 to-transparent px-4 py-3">
         <Sparkles className="h-4 w-4 text-brand shrink-0" />
-        <span className="text-xs text-text-dim"><span className="font-bold text-brand">{t("overview.pro_tip")}</span> — {t("overview.pro_tip_shortcut")}</span>
+        <span className="text-xs text-text-dim flex-1">
+          <span className="font-bold text-brand">{t("overview.pro_tip")}</span> — {t("overview.pro_tip_shortcut")}
+        </span>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded border border-border-subtle bg-main px-1 text-[9px] font-mono font-semibold text-text-dim">⌘K</kbd>
+          <kbd className="inline-flex h-5 min-w-[20px] items-center justify-center rounded border border-border-subtle bg-main px-1 text-[9px] font-mono font-semibold text-text-dim">?</kbd>
+        </div>
       </div>
     </div>
   );

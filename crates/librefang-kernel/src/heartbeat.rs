@@ -8,7 +8,7 @@
 use crate::registry::AgentRegistry;
 use chrono::Utc;
 use librefang_types::agent::{AgentId, AgentState};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Default heartbeat check interval (seconds).
 const DEFAULT_CHECK_INTERVAL_SECS: u64 = 30;
@@ -101,20 +101,15 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
 
         let unresponsive = inactive_secs > timeout_secs;
 
-        if unresponsive {
-            warn!(
-                agent = %entry_ref.name,
-                inactive_secs,
-                timeout_secs,
-                "Agent is unresponsive"
-            );
-        } else {
-            debug!(
-                agent = %entry_ref.name,
-                inactive_secs,
-                "Agent heartbeat OK"
-            );
-        }
+        // Logging is handled by the caller (heartbeat monitor loop) which
+        // tracks state transitions to avoid spamming repeated warnings.
+        debug!(
+            agent = %entry_ref.name,
+            inactive_secs,
+            timeout_secs,
+            unresponsive,
+            "Heartbeat check"
+        );
 
         statuses.push(HeartbeatStatus {
             agent_id: entry_ref.id,
@@ -267,6 +262,7 @@ mod tests {
             identity: AgentIdentity::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         };
         registry.register(non_autonomous_entry).unwrap();
 
@@ -291,6 +287,7 @@ mod tests {
             identity: AgentIdentity::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            is_hand: false,
         };
         registry.register(autonomous_entry).unwrap();
 

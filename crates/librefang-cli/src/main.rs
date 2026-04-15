@@ -3,7 +3,7 @@
 //! When a daemon is running (`librefang start`), the CLI talks to it over HTTP.
 //! Otherwise, commands boot an in-process kernel (single-shot mode).
 
-mod dotenv;
+mod desktop_install;
 mod http_client;
 pub mod i18n;
 mod launcher;
@@ -17,6 +17,7 @@ mod ui;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use librefang_api::server::read_daemon_info;
+use librefang_extensions::dotenv;
 use librefang_kernel::{config::load_config, LibreFangKernel};
 use librefang_types::agent::{AgentId, AgentManifest};
 use std::ffi::OsString;
@@ -31,8 +32,6 @@ use std::time::{Duration, Instant};
 /// Global flag set by the Ctrl+C handler.
 static CTRLC_PRESSED: AtomicBool = AtomicBool::new(false);
 const INIT_DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../templates/init_default_config.toml");
-const PROVIDER_DEFAULT_MODELS_TEMPLATE: &str =
-    include_str!("../templates/provider_default_models.toml");
 
 /// Install a Ctrl+C handler that force-exits the process.
 /// On Windows/MINGW, the default handler doesn't reliably interrupt blocking
@@ -477,6 +476,12 @@ enum Commands {
         long_about = "Display system information and version details.\n\nExamples:\n  librefang system info          # Detailed system info\n  librefang system version       # Version information"
     )]
     System(SystemCommands),
+    /// Manage boot service (systemd/launchd/Windows autostart) [*].
+    #[command(
+        subcommand,
+        long_about = "Install, remove, or check the status of a system boot service so LibreFang\nstarts automatically on login/boot.\n\nExamples:\n  librefang service install      # Register auto-start service\n  librefang service uninstall    # Remove auto-start service\n  librefang service status       # Check if the service is registered"
+    )]
+    Service(ServiceCommands),
     /// Reset local config and state.
     #[command(
         long_about = "Reset local configuration and state to defaults.\n\nRemoves the ~/.librefang/ directory and all its contents. You will be\nprompted for confirmation unless --confirm is passed.\n\nExamples:\n  librefang reset            # Interactive confirmation\n  librefang reset --confirm  # Skip confirmation (for scripts)"
@@ -616,19 +621,29 @@ enum SkillCommands {
     Install {
         /// Skill name, local path, or git URL.
         source: String,
+        /// Install into a specific hand's workspace instead of globally.
+        #[arg(long)]
+        hand: Option<String>,
     },
     /// List installed skills.
     #[command(
-        long_about = "List all skills currently installed in this LibreFang instance.\n\nExamples:\n  librefang skill list"
+        long_about = "List all skills currently installed in this LibreFang instance.\n\nExamples:\n  librefang skill list\n  librefang skill list --hand clip"
     )]
-    List,
+    List {
+        /// List skills installed in a specific hand's workspace.
+        #[arg(long)]
+        hand: Option<String>,
+    },
     /// Remove an installed skill.
     #[command(
-        long_about = "Remove an installed skill by name.\n\nExamples:\n  librefang skill remove web-search"
+        long_about = "Remove an installed skill by name.\n\nExamples:\n  librefang skill remove web-search\n  librefang skill remove web-search --hand clip"
     )]
     Remove {
         /// Skill name.
         name: String,
+        /// Remove from a specific hand's workspace instead of globally.
+        #[arg(long)]
+        hand: Option<String>,
     },
     /// Search FangHub for skills.
     #[command(
@@ -952,7 +967,7 @@ enum AgentCommands {
     },
     /// Set an agent property (e.g., model).
     #[command(
-        long_about = "Set a property on a running agent.\n\nCurrently supports changing the model.\n\nExamples:\n  librefang agent set <ID> model gpt-4o\n  librefang agent set <ID> model claude-sonnet"
+        long_about = "Set a property on a running agent.\n\nCurrently supports changing the model. Provider can be set if provided as a prefix.\n\nExamples:\n  librefang agent set <ID> model gpt-4o\n  librefang agent set <ID> model claude-code/claude-sonnet"
     )]
     Set {
         /// Agent ID (UUID).
@@ -1360,6 +1375,25 @@ enum SystemCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Register auto-start service so LibreFang starts on boot/login.
+    #[command(
+        long_about = "Register a system service so LibreFang starts automatically.\n\nOn Linux:   creates a systemd user service (~/.config/systemd/user/librefang.service)\nOn macOS:   creates a LaunchAgent (~/Library/LaunchAgents/ai.librefang.daemon.plist)\nOn Windows: adds a registry entry (HKCU\\...\\Run)\n\nExamples:\n  librefang service install"
+    )]
+    Install,
+    /// Remove the auto-start service.
+    #[command(
+        long_about = "Remove the previously installed auto-start service.\n\nExamples:\n  librefang service uninstall"
+    )]
+    Uninstall,
+    /// Show whether the auto-start service is registered.
+    #[command(
+        long_about = "Check whether the auto-start service is currently registered.\n\nExamples:\n  librefang service status"
+    )]
+    Status,
+}
+
 fn init_tracing_stderr(log_level: &str) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -1614,9 +1648,9 @@ fn main() {
         },
         Some(Commands::Migrate(args)) => cmd_migrate(args),
         Some(Commands::Skill(sub)) => match sub {
-            SkillCommands::Install { source } => cmd_skill_install(&source),
-            SkillCommands::List => cmd_skill_list(),
-            SkillCommands::Remove { name } => cmd_skill_remove(&name),
+            SkillCommands::Install { source, hand } => cmd_skill_install(&source, hand.as_deref()),
+            SkillCommands::List { hand } => cmd_skill_list(hand.as_deref()),
+            SkillCommands::Remove { name, hand } => cmd_skill_remove(&name, hand.as_deref()),
             SkillCommands::Search { query } => cmd_skill_search(&query),
             SkillCommands::Test { path, tool, input } => cmd_skill_test(path, tool, input),
             SkillCommands::Publish {
@@ -1758,6 +1792,11 @@ fn main() {
             SystemCommands::Info { json } => cmd_system_info(json),
             SystemCommands::Version { json } => cmd_system_version(json),
         },
+        Some(Commands::Service(sub)) => match sub {
+            ServiceCommands::Install => cmd_service_install(),
+            ServiceCommands::Uninstall => cmd_service_uninstall(),
+            ServiceCommands::Status => cmd_service_status(),
+        },
         Some(Commands::Reset { confirm }) => cmd_reset(confirm),
         Some(Commands::Uninstall {
             confirm,
@@ -1896,11 +1935,15 @@ fn cmd_init(quick: bool) {
 
     let librefang_dir = cli_librefang_home();
 
-    // Hint about --upgrade when config already exists (skip in quick/CI mode)
+    // When an existing config is detected in interactive mode, redirect to the
+    // upgrade path so user settings (channels, keys, etc.) are preserved.
+    // The interactive wizard unconditionally overwrites config.toml, which
+    // would silently delete channels and custom configuration (#1862).
     if !quick && librefang_dir.join("config.toml").exists() {
-        ui::hint(
-            "Existing installation detected. To upgrade in-place, run: librefang init --upgrade",
-        );
+        ui::hint("Existing installation detected — running upgrade to preserve your settings.");
+        ui::hint("To start fresh, remove ~/.librefang/config.toml and run `librefang init` again.");
+        cmd_init_upgrade();
+        return;
     }
 
     // --- Ensure directories exist ---
@@ -2023,7 +2066,7 @@ fn cmd_init_upgrade() {
         }
     };
 
-    let existing: toml::Value = match existing_raw.parse() {
+    let existing: toml::Value = match toml::from_str(&existing_raw) {
         Ok(v) => v,
         Err(e) => {
             ui::error(&format!("Failed to parse config.toml: {e}"));
@@ -2034,7 +2077,7 @@ fn cmd_init_upgrade() {
 
     let (provider, api_key_env, model) = detect_best_provider();
     let default_config_str = render_init_default_config(&provider, &model, &api_key_env);
-    let defaults: toml::Value = match default_config_str.parse() {
+    let defaults: toml::Value = match toml::from_str(&default_config_str) {
         Ok(v) => v,
         Err(e) => {
             ui::error(&format!("Failed to parse default config template: {e}"));
@@ -2049,22 +2092,54 @@ fn cmd_init_upgrade() {
     if added.is_empty() {
         ui::success("Config is already up to date — no new fields added");
     } else {
-        // Build TOML snippets for each missing key and append to existing file
-        let mut appendix =
-            String::from("\n# ── Added by upgrade ────────────────────────────────────\n");
-        for key in &added {
-            if let Some(val) = defaults.get(key) {
-                // Serialize just this key as a standalone TOML fragment
-                let mut fragment = toml::map::Map::new();
-                fragment.insert(key.clone(), val.clone());
-                if let Ok(snippet) = toml::to_string_pretty(&toml::Value::Table(fragment)) {
-                    appendix.push('\n');
-                    appendix.push_str(&snippet);
+        // Partition into scalars (must stay in TOML root scope) and tables.
+        // Scalars appended after a [table] header would be absorbed into that
+        // table's scope, potentially colliding with same-named sub-keys (#2021).
+        let (scalar_keys, table_keys): (Vec<_>, Vec<_>) = added
+            .iter()
+            .partition(|k| defaults.get(*k).is_none_or(|v| !v.is_table()));
+
+        let mut content = existing_raw.clone();
+
+        // Insert scalar keys before the first [table] header so they remain
+        // top-level in the TOML document.
+        if !scalar_keys.is_empty() {
+            let mut scalar_snippet = String::new();
+            for key in &scalar_keys {
+                if let Some(val) = defaults.get(*key) {
+                    let mut fragment = toml::map::Map::new();
+                    fragment.insert((*key).clone(), val.clone());
+                    if let Ok(s) = toml::to_string_pretty(&toml::Value::Table(fragment)) {
+                        scalar_snippet.push_str(&s);
+                    }
+                }
+            }
+            // Find the first line that starts with '[' (a table header).
+            // We search for "\n[" then insert just before the '['.
+            if let Some(pos) = content.find("\n[").map(|p| p + 1) {
+                content.insert_str(pos, &format!("{scalar_snippet}\n"));
+            } else {
+                // No table headers in file — appending is safe.
+                content.push('\n');
+                content.push_str(&scalar_snippet);
+            }
+        }
+
+        // Append table sections at the end of the file.
+        if !table_keys.is_empty() {
+            content.push_str("\n# ── Added by upgrade ────────────────────────────────────\n");
+            for key in &table_keys {
+                if let Some(val) = defaults.get(*key) {
+                    let mut fragment = toml::map::Map::new();
+                    fragment.insert((*key).clone(), val.clone());
+                    if let Ok(snippet) = toml::to_string_pretty(&toml::Value::Table(fragment)) {
+                        content.push('\n');
+                        content.push_str(&snippet);
+                    }
                 }
             }
         }
-        let mut content = existing_raw.clone();
-        content.push_str(&appendix);
+
         if let Err(e) = std::fs::write(&config_path, &content) {
             ui::error(&format!("Failed to write config: {e}"));
             ui::hint(&format!("Your original config was saved to {backup_name}"));
@@ -2087,7 +2162,33 @@ fn cmd_init_upgrade() {
         }
     }
 
-    // 7. Summary
+    // 7. Warn users whose require_approval list predates the file_write default (#1861).
+    // The default was expanded to include file_write and file_delete, but users who
+    // had an explicit `require_approval = [...]` entry in their config won't pick up
+    // the new default automatically.
+    let approval_needs_update = existing
+        .get("approval")
+        .and_then(|a| a.get("require_approval"))
+        .and_then(|r| r.as_array())
+        .is_some_and(|list| {
+            let has_shell = list.iter().any(|v| v.as_str() == Some("shell_exec"));
+            let missing_new = ["file_write", "file_delete", "apply_patch"]
+                .iter()
+                .any(|tool| !list.iter().any(|v| v.as_str() == Some(*tool)));
+            has_shell && missing_new
+        });
+    if approval_needs_update {
+        ui::blank();
+        ui::hint(
+            "Your require_approval list only contains \"shell_exec\". \
+             File operations (file_write, file_delete) now require approval by default.",
+        );
+        ui::hint(
+            "To enable: add \"file_write\" and \"file_delete\" to require_approval in config.toml",
+        );
+    }
+
+    // 8. Summary
     ui::blank();
     ui::success("Upgrade complete!");
     ui::kv("Backup", &backup_name);
@@ -2328,61 +2429,14 @@ fn cmd_init_interactive(librefang_dir: &std::path::Path) {
 
 /// Launch the librefang-desktop Tauri app, connecting to the running daemon.
 fn launch_desktop_app(_librefang_dir: &std::path::Path) {
-    // Look for the desktop binary next to our own executable.
-    let desktop_bin = {
-        let exe = std::env::current_exe().ok();
-        let dir = exe.as_ref().and_then(|e| e.parent());
+    if let Some(path) = desktop_install::find_desktop_binary() {
+        desktop_install::launch(&path);
+        return;
+    }
 
-        #[cfg(windows)]
-        let name = "librefang-desktop.exe";
-        #[cfg(not(windows))]
-        let name = "librefang-desktop";
-
-        dir.map(|d| d.join(name))
-    };
-
-    match desktop_bin {
-        Some(ref path) if path.exists() => {
-            ui::success(&i18n::t("desktop-launching"));
-            match std::process::Command::new(path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    ui::success(&i18n::t("desktop-started"));
-                }
-                Err(e) => {
-                    ui::error(&i18n::t_args(
-                        "desktop-launch-fail",
-                        &[("error", &e.to_string())],
-                    ));
-                    ui::hint(&i18n::t("hint-try-dashboard"));
-                }
-            }
-        }
-        _ => {
-            ui::error(&i18n::t("desktop-not-found"));
-            ui::hint(&i18n::t("hint-install-desktop"));
-            ui::hint(&i18n::t("hint-fallback-web-dashboard"));
-            ui::blank();
-            if let Some(base) = find_daemon() {
-                let url = format!("{base}/");
-                if !open_in_browser(&url) {
-                    // Browser launch failed entirely (e.g., sandbox EPERM,
-                    // no display server, container environment).
-                    ui::hint(&i18n::t("hint-could-not-open-browser"));
-                }
-                // Always print the URL so the user can open it manually,
-                // even when open_in_browser reported success — the spawned
-                // opener may still fail asynchronously.
-                ui::hint(&i18n::t_args("hint-dashboard-url", &[("url", &url)]));
-            } else {
-                ui::hint(&i18n::t("daemon-not-running-start"));
-                ui::hint(&i18n::t("hint-then-open-dashboard"));
-            }
-        }
+    // Not installed — offer to download
+    if let Some(installed) = desktop_install::prompt_and_install() {
+        desktop_install::launch(&installed);
     }
 }
 
@@ -2478,21 +2532,10 @@ fn render_init_default_config(provider: &str, model: &str, api_key_env: &str) ->
         .replace("{{api_key_env}}", api_key_env)
 }
 
-fn configured_default_model(provider: &str) -> Option<String> {
-    let parsed = toml::from_str::<toml::Value>(PROVIDER_DEFAULT_MODELS_TEMPLATE).ok()?;
-    parsed
-        .get("default_models")?
-        .get(provider)?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 fn default_model_for_provider(provider: &str) -> String {
-    configured_default_model(provider)
-        .or_else(|| {
-            let catalog = librefang_runtime::model_catalog::ModelCatalog::default();
-            catalog.default_model_for_provider(provider)
-        })
+    let catalog = librefang_runtime::model_catalog::ModelCatalog::default();
+    catalog
+        .default_model_for_provider(provider)
         .unwrap_or_else(|| "local-model".to_string())
 }
 
@@ -2604,8 +2647,9 @@ fn spawn_detached_daemon(
 
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     command
@@ -2725,10 +2769,11 @@ fn cmd_start(config: Option<PathBuf>, tail: bool, spawned: bool, foreground: boo
             }
         };
 
-        let listen_addr = kernel.config_ref().api_listen.clone();
-        let daemon_info_path = kernel.config_ref().home_dir.join("daemon.json");
-        let provider = kernel.config_ref().default_model.provider.clone();
-        let model = kernel.config_ref().default_model.model.clone();
+        let cfg = kernel.config_ref();
+        let listen_addr = cfg.api_listen.clone();
+        let daemon_info_path = kernel.home_dir().join("daemon.json");
+        let provider = cfg.default_model.provider.clone();
+        let model = cfg.default_model.model.clone();
         let agent_count = kernel.agent_registry().count();
         let model_count = kernel
             .model_catalog_ref()
@@ -3473,6 +3518,7 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
     } else {
         let kernel = boot_kernel(config);
         let agent_count = kernel.agent_registry().count();
+        let cfg = kernel.config_ref();
 
         if json {
             println!(
@@ -3480,9 +3526,9 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "in-process",
                     "agent_count": agent_count,
-                    "data_dir": kernel.config_ref().data_dir.display().to_string(),
-                    "default_provider": kernel.config_ref().default_model.provider,
-                    "default_model": kernel.config_ref().default_model.model,
+                    "data_dir": cfg.data_dir.display().to_string(),
+                    "default_provider": cfg.default_model.provider,
+                    "default_model": cfg.default_model.model,
                     "daemon": false,
                 }))
                 .unwrap_or_default()
@@ -3493,17 +3539,11 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         ui::section(&i18n::t("section-status-inprocess"));
         ui::blank();
         ui::kv(&i18n::t("label-agents"), &agent_count.to_string());
-        ui::kv(
-            &i18n::t("label-provider"),
-            &kernel.config_ref().default_model.provider,
-        );
-        ui::kv(
-            &i18n::t("label-model"),
-            &kernel.config_ref().default_model.model,
-        );
+        ui::kv(&i18n::t("label-provider"), &cfg.default_model.provider);
+        ui::kv(&i18n::t("label-model"), &cfg.default_model.model);
         ui::kv(
             &i18n::t("label-data-dir"),
-            &kernel.config_ref().data_dir.display().to_string(),
+            &cfg.data_dir.display().to_string(),
         );
         ui::kv_warn(
             &i18n::t("label-daemon"),
@@ -3550,9 +3590,9 @@ fn cmd_doctor(json: bool, repair: bool) {
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
                 if std::fs::create_dir_all(&librefang_dir).is_ok() {
                     restrict_dir_permissions(&librefang_dir);
-                    for sub in ["data", "agents"] {
-                        let _ = std::fs::create_dir_all(librefang_dir.join(sub));
-                    }
+                    let _ = std::fs::create_dir_all(librefang_dir.join("data"));
+                    let _ =
+                        std::fs::create_dir_all(librefang_dir.join("workspaces").join("agents"));
                     if !json {
                         ui::check_ok("Created LibreFang directory");
                     }
@@ -4241,40 +4281,23 @@ fn cmd_doctor(json: bool, repair: bool) {
         }
         let skills_dir = cli_librefang_home().join("skills");
         let mut skill_reg = librefang_skills::registry::SkillRegistry::new(skills_dir.clone());
-        skill_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        let bundled_count = skill_reg.count();
-        if !json {
-            ui::check_ok(&format!("Bundled skills loaded: {bundled_count}"));
-        }
-        checks.push(
-            serde_json::json!({"check": "bundled_skills", "status": "ok", "count": bundled_count}),
-        );
-
-        // Check workspace skills if home dir available
-        if skills_dir.exists() {
-            match skill_reg.load_workspace_skills(&skills_dir) {
-                Ok(_) => {
-                    let total = skill_reg.count();
-                    let ws_count = total.saturating_sub(bundled_count);
-                    if ws_count > 0 {
-                        if !json {
-                            ui::check_ok(&format!("Workspace skills loaded: {ws_count}"));
-                        }
-                        checks.push(serde_json::json!({"check": "workspace_skills", "status": "ok", "count": ws_count}));
-                    }
+        match skill_reg.load_all() {
+            Ok(count) => {
+                if !json {
+                    ui::check_ok(&format!("Skills loaded: {count}"));
                 }
-                Err(e) => {
-                    if !json {
-                        ui::check_warn(&format!("Failed to load workspace skills: {e}"));
-                    }
-                    checks.push(serde_json::json!({"check": "workspace_skills", "status": "warn", "error": e.to_string()}));
+                checks.push(serde_json::json!({"check": "skills", "status": "ok", "count": count}));
+            }
+            Err(e) => {
+                if !json {
+                    ui::check_warn(&format!("Failed to load skills: {e}"));
                 }
+                checks.push(serde_json::json!({"check": "skills", "status": "warn", "error": e.to_string()}));
             }
         }
 
-        // Check for prompt injection issues in skill definitions
-        // Only flag Critical-severity warnings (Warning-level hits are expected
-        // in bundled skills that mention shell commands in educational context).
+        // Check for prompt injection issues in skill definitions.
+        // Only flag Critical-severity warnings.
         let skills = skill_reg.list();
         let mut injection_warnings = 0;
         for skill in &skills {
@@ -4315,7 +4338,8 @@ fn cmd_doctor(json: bool, repair: bool) {
         let librefang_dir = cli_librefang_home();
         let mut ext_registry =
             librefang_extensions::registry::IntegrationRegistry::new(&librefang_dir);
-        ext_registry.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
+        ext_registry
+            .load_templates(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
         let _ = ext_registry.load_installed();
         let template_count = ext_registry.template_count();
         let installed_count = ext_registry.installed_count();
@@ -5004,9 +5028,24 @@ fn cmd_migrate(args: MigrateArgs) {
 // Skill commands
 // ---------------------------------------------------------------------------
 
-fn cmd_skill_install(source: &str) {
+/// Resolve the skills directory: global or per-hand workspace.
+fn resolve_skills_dir(hand: Option<&str>) -> PathBuf {
     let home = librefang_home();
-    let skills_dir = home.join("skills");
+    match hand {
+        None => home.join("skills"),
+        Some(hand_id) => {
+            let hand_dir = home.join("workspaces").join("hands").join(hand_id);
+            if !hand_dir.exists() {
+                eprintln!("Hand '{hand_id}' not found at {}", hand_dir.display());
+                std::process::exit(1);
+            }
+            hand_dir.join("skills")
+        }
+    }
+}
+
+fn cmd_skill_install(source: &str, hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
     std::fs::create_dir_all(&skills_dir).unwrap_or_else(|e| {
         eprintln!("Error creating skills directory: {e}");
         std::process::exit(1);
@@ -5031,7 +5070,14 @@ fn cmd_skill_install(source: &str) {
                             eprintln!("Failed to write manifest: {e}");
                             std::process::exit(1);
                         }
-                        println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        if let Some(h) = hand {
+                            println!(
+                                "Installed OpenClaw skill '{}' to hand '{h}'",
+                                manifest.skill.name
+                            );
+                        } else {
+                            println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Failed to convert OpenClaw skill: {e}");
@@ -5057,10 +5103,17 @@ fn cmd_skill_install(source: &str) {
 
         let dest = skills_dir.join(&manifest.skill.name);
         copy_dir_recursive(&source_path, &dest);
-        println!(
-            "Installed skill: {} v{}",
-            manifest.skill.name, manifest.skill.version
-        );
+        if let Some(h) = hand {
+            println!(
+                "Installed skill '{}' v{} to hand '{h}'",
+                manifest.skill.name, manifest.skill.version
+            );
+        } else {
+            println!(
+                "Installed skill: {} v{}",
+                manifest.skill.name, manifest.skill.version
+            );
+        }
     } else {
         // Remote install from FangHub
         println!("Installing {source} from FangHub...");
@@ -5069,7 +5122,13 @@ fn cmd_skill_install(source: &str) {
             librefang_skills::marketplace::MarketplaceConfig::default(),
         );
         match rt.block_on(client.install(source, &skills_dir)) {
-            Ok(version) => println!("Installed {source} {version}"),
+            Ok(version) => {
+                if let Some(h) = hand {
+                    println!("Installed {source} {version} to hand '{h}'");
+                } else {
+                    println!("Installed {source} {version}");
+                }
+            }
             Err(e) => {
                 eprintln!("Failed to install skill: {e}");
                 std::process::exit(1);
@@ -5078,15 +5137,24 @@ fn cmd_skill_install(source: &str) {
     }
 }
 
-fn cmd_skill_list() {
-    let home = librefang_home();
-    let skills_dir = home.join("skills");
+fn cmd_skill_list(hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
 
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     match registry.load_all() {
-        Ok(0) => println!("No skills installed."),
+        Ok(0) => {
+            if let Some(h) = hand {
+                println!("No skills installed for hand '{h}'.");
+            } else {
+                println!("No skills installed.");
+            }
+        }
         Ok(count) => {
-            println!("{count} skill(s) installed:\n");
+            if let Some(h) = hand {
+                println!("{count} skill(s) installed for hand '{h}':\n");
+            } else {
+                println!("{count} skill(s) installed:\n");
+            }
             println!(
                 "{:<20} {:<10} {:<8} DESCRIPTION",
                 "NAME", "VERSION", "TOOLS"
@@ -5109,14 +5177,19 @@ fn cmd_skill_list() {
     }
 }
 
-fn cmd_skill_remove(name: &str) {
-    let home = librefang_home();
-    let skills_dir = home.join("skills");
+fn cmd_skill_remove(name: &str, hand: Option<&str>) {
+    let skills_dir = resolve_skills_dir(hand);
 
     let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
     let _ = registry.load_all();
     match registry.remove(name) {
-        Ok(()) => println!("Removed skill: {name}"),
+        Ok(()) => {
+            if let Some(h) = hand {
+                println!("Removed skill '{name}' from hand '{h}'");
+            } else {
+                println!("Removed skill: {name}");
+            }
+        }
         Err(e) => {
             eprintln!("Failed to remove skill: {e}");
             std::process::exit(1);
@@ -6466,6 +6539,10 @@ pub(crate) fn test_api_key(provider: &str, key: &str) -> bool {
             .get("https://openrouter.ai/api/v1/models")
             .bearer_auth(key)
             .send(),
+        "elevenlabs" => client
+            .get("https://api.elevenlabs.io/v1/user")
+            .header("xi-api-key", key)
+            .send(),
         _ => return true, // unknown provider — skip test
     };
 
@@ -6966,7 +7043,7 @@ pub(crate) fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) {
 fn cmd_integration_add(name: &str, key: Option<&str>) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     // Check template exists
@@ -7052,7 +7129,7 @@ fn cmd_integration_add(name: &str, key: Option<&str>) {
 fn cmd_integration_remove(name: &str) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     match librefang_extensions::installer::remove_integration(&mut registry, name) {
@@ -7076,7 +7153,7 @@ fn cmd_integration_remove(name: &str) {
 fn cmd_integrations_list(query: Option<&str>) {
     let home = librefang_home();
     let mut registry = librefang_extensions::registry::IntegrationRegistry::new(&home);
-    registry.load_bundled(&home);
+    registry.load_templates(&home);
     let _ = registry.load_installed();
 
     let dotenv_path = home.join(".env");
@@ -8706,6 +8783,362 @@ fn cmd_system_version(json: bool) {
     println!("librefang {}", env!("CARGO_PKG_VERSION"));
 }
 
+// ---------------------------------------------------------------------------
+// Service management (boot auto-start)
+// ---------------------------------------------------------------------------
+
+/// Resolve the absolute path to the current librefang binary.
+fn resolve_binary_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("librefang"))
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_exe().unwrap_or_else(|_| "librefang".into()))
+}
+
+fn cmd_service_install() {
+    // Warn if running as root — the service would be installed for root, not
+    // the actual user. This catches `sudo librefang service install` mistakes.
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid() is always safe to call.
+        if unsafe { libc::geteuid() } == 0 {
+            ui::error(
+                "Running as root — the service will be installed for the root account, \
+                 not your user. Run without sudo instead.",
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let binary = resolve_binary_path();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let librefang_home = cli_librefang_home();
+
+    #[cfg(target_os = "linux")]
+    {
+        service_install_linux(&binary, &librefang_home);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        service_install_macos(&binary, &librefang_home);
+    }
+    #[cfg(windows)]
+    {
+        service_install_windows(&binary);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = &binary;
+        ui::error("Auto-start service is not supported on this platform.");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn service_install_linux(binary: &std::path::Path, librefang_home: &std::path::Path) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            ui::error("Cannot determine home directory.");
+            return;
+        }
+    };
+    let service_dir = home.join(".config/systemd/user");
+    if let Err(e) = std::fs::create_dir_all(&service_dir) {
+        ui::error(&format!("Failed to create {}: {e}", service_dir.display()));
+        return;
+    }
+
+    let unit = format!(
+        "[Unit]\n\
+         Description=LibreFang Agent OS Daemon\n\
+         Documentation=https://librefang.ai\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={binary} start --foreground\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         WorkingDirectory={home}\n\
+         EnvironmentFile=-{home}/env\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        binary = binary.display(),
+        home = librefang_home.display(),
+    );
+
+    let service_path = service_dir.join("librefang.service");
+    if let Err(e) = std::fs::write(&service_path, &unit) {
+        ui::error(&format!("Failed to write {}: {e}", service_path.display()));
+        return;
+    }
+    ui::success(&format!("Wrote {}", service_path.display()));
+
+    // Reload and enable
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output();
+    if let Ok(o) = &reload {
+        if !o.status.success() {
+            ui::error("systemctl --user daemon-reload failed");
+            return;
+        }
+    }
+    let enable = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "librefang.service"])
+        .output();
+    match enable {
+        Ok(o) if o.status.success() => {
+            ui::success("Service enabled (will start on next login)");
+            ui::hint("Start now with: systemctl --user start librefang.service");
+            // Enable lingering so the user service runs without an active login session
+            ui::hint("For headless servers, also run: loginctl enable-linger");
+        }
+        _ => ui::error("systemctl --user enable librefang.service failed"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn service_install_macos(binary: &std::path::Path, librefang_home: &std::path::Path) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            ui::error("Cannot determine home directory.");
+            return;
+        }
+    };
+    let agents_dir = home.join("Library/LaunchAgents");
+    if let Err(e) = std::fs::create_dir_all(&agents_dir) {
+        ui::error(&format!("Failed to create {}: {e}", agents_dir.display()));
+        return;
+    }
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.librefang.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary}</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>{home}</string>
+    <key>StandardOutPath</key>
+    <string>{home}/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>{home}/daemon.log</string>
+</dict>
+</plist>
+"#,
+        binary = binary.display(),
+        home = librefang_home.display(),
+    );
+
+    let plist_path = agents_dir.join("ai.librefang.daemon.plist");
+
+    // Unload existing service first (if any) to avoid launchctl errors
+    if plist_path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .output();
+    }
+
+    if let Err(e) = std::fs::write(&plist_path, &plist) {
+        ui::error(&format!("Failed to write {}: {e}", plist_path.display()));
+        return;
+    }
+    ui::success(&format!("Wrote {}", plist_path.display()));
+
+    let load = std::process::Command::new("launchctl")
+        .args(["load", &plist_path.to_string_lossy()])
+        .output();
+    match load {
+        Ok(o) if o.status.success() => {
+            ui::success("LaunchAgent loaded (will start on login and now)");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            ui::error(&format!("launchctl load failed: {stderr}"));
+        }
+        Err(e) => ui::error(&format!("Failed to run launchctl: {e}")),
+    }
+}
+
+#[cfg(windows)]
+fn service_install_windows(binary: &std::path::Path) {
+    let value = format!("\"{}\" start", binary.display());
+    let output = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "LibreFang",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &value,
+            "/f",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            ui::success("Added to Windows startup (HKCU\\...\\Run)");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            ui::error(&format!("Failed to write registry: {stderr}"));
+        }
+        Err(e) => ui::error(&format!("Failed to run reg.exe: {e}")),
+    }
+}
+
+fn cmd_service_uninstall() {
+    #[cfg(target_os = "linux")]
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let service_path = home.join(".config/systemd/user/librefang.service");
+        if service_path.exists() {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", "librefang.service"])
+                .output();
+            match std::fs::remove_file(&service_path) {
+                Ok(()) => {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "daemon-reload"])
+                        .output();
+                    ui::success("Removed systemd user service");
+                }
+                Err(e) => ui::error(&format!("Failed to remove service file: {e}")),
+            }
+        } else {
+            ui::hint("No systemd user service found — nothing to remove.");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let plist_path = home.join("Library/LaunchAgents/ai.librefang.daemon.plist");
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.to_string_lossy()])
+                .output();
+            match std::fs::remove_file(&plist_path) {
+                Ok(()) => ui::success("Removed LaunchAgent"),
+                Err(e) => ui::error(&format!("Failed to remove plist: {e}")),
+            }
+        } else {
+            ui::hint("No LaunchAgent found — nothing to remove.");
+        }
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("reg")
+            .args([
+                "delete",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "LibreFang",
+                "/f",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                ui::success("Removed from Windows startup");
+            }
+            _ => ui::hint("No startup entry found — nothing to remove."),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        ui::error("Auto-start service is not supported on this platform.");
+    }
+}
+
+fn cmd_service_status() {
+    #[cfg(target_os = "linux")]
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let service_path = home.join(".config/systemd/user/librefang.service");
+        if service_path.exists() {
+            ui::success("Systemd user service is registered");
+            // Show enabled/active status
+            if let Ok(output) = std::process::Command::new("systemctl")
+                .args(["--user", "is-enabled", "librefang.service"])
+                .output()
+            {
+                let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                ui::kv("  Enabled", &status);
+            }
+            if let Ok(output) = std::process::Command::new("systemctl")
+                .args(["--user", "is-active", "librefang.service"])
+                .output()
+            {
+                let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                ui::kv("  Active", &status);
+            }
+        } else {
+            ui::hint("No systemd user service registered.");
+            ui::hint("Run `librefang service install` to set it up.");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let plist_path = home.join("Library/LaunchAgents/ai.librefang.daemon.plist");
+        if plist_path.exists() {
+            ui::success("LaunchAgent is registered");
+            if let Ok(output) = std::process::Command::new("launchctl")
+                .args(["list"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let running = stdout.lines().any(|l| l.contains("ai.librefang.daemon"));
+                ui::kv("  Loaded", if running { "yes" } else { "not loaded" });
+            }
+        } else {
+            ui::hint("No LaunchAgent registered.");
+            ui::hint("Run `librefang service install` to set it up.");
+        }
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "LibreFang",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                ui::success("Windows startup entry is registered");
+            }
+            _ => {
+                ui::hint("No startup entry registered.");
+                ui::hint("Run `librefang service install` to set it up.");
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        ui::error("Auto-start service is not supported on this platform.");
+    }
+}
+
 fn cmd_reset(confirm: bool) {
     let librefang_dir = cli_librefang_home();
 
@@ -8914,6 +9347,14 @@ fn cmd_update(check: bool, version: Option<String>, channel_override: Option<Str
                 if let Some(installed) = installed_binary_version(&default_install) {
                     ui::kv("Installed", &installed);
                 }
+                // Merge any new config defaults added in the updated binary.
+                // Spawn the new binary rather than calling cmd_init_upgrade() here,
+                // because the current process still holds the old binary's template.
+                ui::blank();
+                ui::hint("Merging new config defaults...");
+                let _ = std::process::Command::new(&default_install)
+                    .args(["init", "--upgrade"])
+                    .status();
                 ui::hint("If the daemon is running, restart it with `librefang restart`.");
             }
             #[cfg(windows)]
@@ -9905,23 +10346,20 @@ mod tests {
     }
 
     #[test]
-    fn test_doctor_skill_registry_loads_bundled() {
+    fn test_doctor_skill_registry_loads() {
         let skills_dir = std::env::temp_dir().join("librefang-doctor-test-skills");
         let mut skill_reg = librefang_skills::registry::SkillRegistry::new(skills_dir);
-        let count =
-            skill_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        // Skills are loaded from disk at runtime; count depends on registry files being present
+        let count = skill_reg.load_all().unwrap_or(0);
         assert_eq!(skill_reg.count(), count);
     }
 
     #[test]
-    fn test_doctor_extension_registry_loads_bundled() {
+    fn test_doctor_extension_registry_loads_templates() {
         let tmp = std::env::temp_dir().join("librefang-doctor-test-ext");
         let _ = std::fs::create_dir_all(&tmp);
         let mut ext_reg = librefang_extensions::registry::IntegrationRegistry::new(&tmp);
         let count =
-            ext_reg.load_bundled(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
-        // Integrations are loaded from disk at runtime; count depends on registry files being present
+            ext_reg.load_templates(&librefang_runtime::registry_sync::resolve_home_dir_for_tests());
         assert_eq!(ext_reg.template_count(), count);
     }
 

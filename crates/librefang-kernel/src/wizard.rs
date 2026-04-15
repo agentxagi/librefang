@@ -151,6 +151,7 @@ impl SetupWizard {
             author: "wizard".to_string(),
             module: "builtin:chat".to_string(),
             schedule,
+            session_mode: librefang_types::agent::SessionMode::default(),
             model: ModelConfig {
                 provider: provider.to_string(),
                 model: model.to_string(),
@@ -159,6 +160,7 @@ impl SetupWizard {
                 system_prompt,
                 api_key_env: None,
                 base_url: None,
+                extra_params: std::collections::HashMap::new(),
             },
             resources: ResourceQuota::default(),
             priority: Priority::default(),
@@ -186,6 +188,8 @@ impl SetupWizard {
             response_format: None,
             inherit_parent_context: true,
             context_injection: vec![],
+            is_hand: false,
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::default(),
         };
 
         let skills_to_install: Vec<String> = intent

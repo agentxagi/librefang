@@ -4,9 +4,10 @@
 //! with alias resolution, auth status detection, and pricing lookups.
 
 use librefang_types::model_catalog::{
-    AliasesCatalogFile, AuthStatus, ModelCatalogEntry, ModelCatalogFile, ModelTier, ProviderInfo,
+    AliasesCatalogFile, AuthStatus, ModelCatalogEntry, ModelCatalogFile, ModelOverrides, ModelTier,
+    ProviderInfo,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
 /// The model catalog — registry of all known models and providers.
@@ -14,27 +15,83 @@ pub struct ModelCatalog {
     models: Vec<ModelCatalogEntry>,
     aliases: HashMap<String, String>,
     providers: Vec<ProviderInfo>,
+    /// Providers whose fallback/CLI detection is suppressed by the user
+    /// (i.e. the user explicitly removed the key via the dashboard).
+    suppressed_providers: HashSet<String>,
+    /// Per-model inference parameter overrides, keyed by "provider:model_id".
+    overrides: HashMap<String, ModelOverrides>,
 }
 
 impl ModelCatalog {
     /// Create a new catalog by loading providers from `home_dir/providers/`
     /// and aliases from `home_dir/aliases.toml`.
+    ///
+    /// Providers whose TOML filename also exists in
+    /// `home_dir/registry/providers/` are marked as built-in; the rest are
+    /// flagged `is_custom = true` so the dashboard can show a real delete
+    /// control for them.
     pub fn new(home_dir: &std::path::Path) -> Self {
         let providers_dir = home_dir.join("providers");
-        Self::new_from_dir(&providers_dir)
+        let registry_providers_dir = home_dir.join("registry").join("providers");
+        Self::new_from_dir_with_registry(&providers_dir, Some(&registry_providers_dir))
     }
 
     /// Create a catalog by loading all `*.toml` files from a specific directory.
     ///
     /// Also loads `aliases.toml` from the parent of `providers_dir` if present.
+    /// All loaded providers are marked `is_custom = false` (safe default —
+    /// callers that want custom detection should use
+    /// [`Self::new_from_dir_with_registry`] or [`Self::new`]).
     pub fn new_from_dir(providers_dir: &std::path::Path) -> Self {
-        let mut sources = Vec::new();
+        Self::new_from_dir_with_registry(providers_dir, None)
+    }
+
+    /// Same as [`Self::new_from_dir`] but with a registry-providers directory
+    /// used to classify each loaded provider as built-in vs user-added.
+    pub fn new_from_dir_with_registry(
+        providers_dir: &std::path::Path,
+        registry_providers_dir: Option<&std::path::Path>,
+    ) -> Self {
+        // Built-in filename set for custom classification.
+        //
+        // Tri-state semantics:
+        //   - `None` registry dir passed, or `read_dir` on it failed
+        //     (missing / corrupt / unreadable cache) → classification
+        //     unavailable, fall back to is_custom=false for every provider.
+        //     This keeps the delete button hidden, which is the safe
+        //     default — a user can always remove an API key via the edit
+        //     dialog's "Remove Key" control.
+        //   - `Some(set)` successful read, even if `set` is empty → trust
+        //     the classification. An empty registry dir genuinely means
+        //     every provider is user-added.
+        let builtin_filenames: Option<std::collections::HashSet<std::ffi::OsString>> =
+            registry_providers_dir.and_then(|dir| {
+                std::fs::read_dir(dir).ok().map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| {
+                            let path = e.path();
+                            if path.extension().is_some_and(|ext| ext == "toml") {
+                                path.file_name().map(|n| n.to_os_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+            });
+
+        let mut sources: Vec<(String, bool)> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(providers_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "toml") {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        sources.push(content);
+                        let is_custom = match (&builtin_filenames, path.file_name()) {
+                            (Some(set), Some(name)) => !set.contains(name),
+                            _ => false,
+                        };
+                        sources.push((content, is_custom));
                     }
                 }
             }
@@ -46,14 +103,19 @@ impl ModelCatalog {
     }
 
     /// Build a catalog from pre-loaded TOML source strings.
-    fn from_sources(sources: &[String], aliases_source: Option<&str>) -> Self {
+    ///
+    /// Each source is tagged with an `is_custom` flag that is copied onto
+    /// the corresponding [`ProviderInfo`].
+    fn from_sources(sources: &[(String, bool)], aliases_source: Option<&str>) -> Self {
         let mut models: Vec<ModelCatalogEntry> = Vec::new();
         let mut providers: Vec<ProviderInfo> = Vec::new();
-        for source in sources {
+        for (source, is_custom) in sources {
             if let Ok(file) = toml::from_str::<ModelCatalogFile>(source) {
                 let provider_id = file.provider.as_ref().map(|p| p.id.clone());
                 if let Some(p) = file.provider {
-                    providers.push(p.into());
+                    let mut info: ProviderInfo = p.into();
+                    info.is_custom = *is_custom;
+                    providers.push(info);
                 }
                 for mut model in file.models {
                     // Back-fill provider from the [provider] section when
@@ -95,6 +157,8 @@ impl ModelCatalog {
             models,
             aliases,
             providers,
+            suppressed_providers: HashSet::new(),
+            overrides: HashMap::new(),
         }
     }
 
@@ -116,36 +180,70 @@ impl ModelCatalog {
             }
 
             if !provider.key_required {
-                provider.auth_status = AuthStatus::NotRequired;
+                // Local providers (ollama, vllm, etc.) have their status set by
+                // the async probe at startup. Only set NotRequired as a fallback
+                // when the probe hasn't run yet (status still Missing).
+                // LocalOffline means the probe ran and found the service down —
+                // do NOT reset it here, or offline providers would re-appear in
+                // the model switcher after any unrelated detect_auth() call.
+                if crate::provider_health::is_local_provider(&provider.id) {
+                    if provider.auth_status == AuthStatus::Missing {
+                        provider.auth_status = AuthStatus::NotRequired;
+                    }
+                    // LocalOffline: leave unchanged — owned by the probe
+                } else if !provider.base_url.is_empty() {
+                    // Has a base_url, no key needed (e.g. custom local proxy).
+                    provider.auth_status = AuthStatus::NotRequired;
+                }
+                // Otherwise (no key required, no base_url, not local/CLI):
+                // leave as Missing — these providers are only usable through
+                // hosting platforms like OpenRouter and cannot be called directly.
                 continue;
             }
 
-            // Primary: check the provider's declared env var
-            let has_key = std::env::var(&provider.api_key_env).is_ok();
+            // Primary: check the provider's declared env var (non-empty after trim)
+            let has_key = std::env::var(&provider.api_key_env).is_ok_and(|v| !v.trim().is_empty());
+
+            // If the user explicitly removed this provider's key, skip
+            // fallback/CLI detection — only honour the primary env var.
+            let suppressed = self.suppressed_providers.contains(&provider.id);
 
             // Secondary: provider-specific fallback keys (still API-key-based auth)
-            let has_key_fallback = match provider.id.as_str() {
-                "gemini" => std::env::var("GOOGLE_API_KEY").is_ok(),
-                "openai" | "codex" => {
-                    std::env::var("OPENAI_API_KEY").is_ok() || read_codex_credential().is_some()
+            let has_key_fallback = if suppressed {
+                false
+            } else {
+                match provider.id.as_str() {
+                    "gemini" => std::env::var("GOOGLE_API_KEY").is_ok_and(|v| !v.trim().is_empty()),
+                    "openai" | "codex" => {
+                        std::env::var("OPENAI_API_KEY").is_ok_and(|v| !v.trim().is_empty())
+                            || read_codex_credential().is_some()
+                    }
+                    _ => false,
                 }
-                _ => false,
             };
 
             // Tertiary: CLI tools that can serve as fallback for API providers
-            let aider_ok = || crate::drivers::cli_provider_available("aider");
-            let has_cli_fallback = match provider.id.as_str() {
-                "anthropic" => crate::drivers::cli_provider_available("claude-code") || aider_ok(),
-                "gemini" => crate::drivers::cli_provider_available("gemini-cli") || aider_ok(),
-                "openai" | "codex" => {
-                    crate::drivers::cli_provider_available("codex-cli") || aider_ok()
+            let has_cli_fallback = if suppressed {
+                false
+            } else {
+                let aider_ok = || crate::drivers::cli_provider_available("aider");
+                match provider.id.as_str() {
+                    "anthropic" => {
+                        crate::drivers::cli_provider_available("claude-code") || aider_ok()
+                    }
+                    "gemini" => crate::drivers::cli_provider_available("gemini-cli") || aider_ok(),
+                    "openai" | "codex" => {
+                        crate::drivers::cli_provider_available("codex-cli") || aider_ok()
+                    }
+                    "qwen" => crate::drivers::cli_provider_available("qwen-code") || aider_ok(),
+                    _ => false,
                 }
-                "qwen" => crate::drivers::cli_provider_available("qwen-code") || aider_ok(),
-                _ => false,
             };
 
-            provider.auth_status = if has_key || has_key_fallback {
+            provider.auth_status = if has_key {
                 AuthStatus::Configured
+            } else if has_key_fallback {
+                AuthStatus::AutoDetected
             } else if has_cli_fallback {
                 AuthStatus::ConfiguredCli
             } else {
@@ -160,6 +258,45 @@ impl ModelCatalog {
                 "detect_auth result"
             );
         }
+    }
+
+    /// Collect providers that need background key validation.
+    ///
+    /// Returns `(provider_id, base_url, api_key_env)` for every provider
+    /// whose current auth status is `Configured` (key present, not yet validated).
+    pub fn providers_needing_validation(&self) -> Vec<(String, String, String)> {
+        self.providers
+            .iter()
+            .filter(|p| {
+                p.auth_status == AuthStatus::Configured || p.auth_status == AuthStatus::AutoDetected
+            })
+            .map(|p| (p.id.clone(), p.base_url.clone(), p.api_key_env.clone()))
+            .collect()
+    }
+
+    /// Update the `auth_status` of a single provider after background validation.
+    pub fn set_provider_auth_status(&mut self, provider_id: &str, status: AuthStatus) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
+            p.auth_status = status;
+        }
+    }
+
+    /// Store the list of models confirmed available via live probe.
+    pub fn set_provider_available_models(&mut self, provider_id: &str, models: Vec<String>) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id) {
+            p.available_models = models;
+        }
+    }
+
+    /// Check whether a model is confirmed available on its provider.
+    /// Returns `None` if the provider hasn't been probed yet (no data),
+    /// `Some(true)` if the model is in the probed list, `Some(false)` if not.
+    pub fn is_model_available(&self, provider_id: &str, model: &str) -> Option<bool> {
+        let p = self.providers.iter().find(|p| p.id == provider_id)?;
+        if p.available_models.is_empty() {
+            return None; // not probed yet
+        }
+        Some(p.available_models.iter().any(|m| m == model))
     }
 
     /// List all models in the catalog.
@@ -286,6 +423,86 @@ impl ModelCatalog {
         self.aliases.remove(&alias.to_lowercase()).is_some()
     }
 
+    /// Mark a provider as suppressed — fallback/CLI detection will be skipped
+    /// for this provider until `unsuppress_provider` is called.
+    pub fn suppress_provider(&mut self, id: &str) {
+        self.suppressed_providers.insert(id.to_string());
+    }
+
+    /// Remove a provider from the suppressed set, re-enabling fallback/CLI detection.
+    pub fn unsuppress_provider(&mut self, id: &str) {
+        self.suppressed_providers.remove(id);
+    }
+
+    /// Load the suppressed-providers list from a JSON file.
+    pub fn load_suppressed(&mut self, path: &std::path::Path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(list) = serde_json::from_str::<Vec<String>>(&data) {
+                self.suppressed_providers = list.into_iter().collect();
+            }
+        }
+    }
+
+    /// Persist the suppressed-providers list to a JSON file.
+    /// Removes the file when the set is empty.
+    pub fn save_suppressed(&self, path: &std::path::Path) {
+        if self.suppressed_providers.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        let mut list: Vec<&String> = self.suppressed_providers.iter().collect();
+        list.sort();
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    // ── Per-model overrides ──────────────────────────────────────────
+
+    /// Get inference parameter overrides for a model.
+    /// Key format: "provider:model_id".
+    pub fn get_overrides(&self, key: &str) -> Option<&ModelOverrides> {
+        self.overrides.get(key)
+    }
+
+    /// Set inference parameter overrides for a model.
+    /// Removes the entry if `overrides.is_empty()`.
+    pub fn set_overrides(&mut self, key: String, overrides: ModelOverrides) {
+        if overrides.is_empty() {
+            self.overrides.remove(&key);
+        } else {
+            self.overrides.insert(key, overrides);
+        }
+    }
+
+    /// Remove inference parameter overrides for a model.
+    pub fn remove_overrides(&mut self, key: &str) -> bool {
+        self.overrides.remove(key).is_some()
+    }
+
+    /// Load model overrides from a JSON file.
+    pub fn load_overrides(&mut self, path: &std::path::Path) {
+        if let Ok(data) = std::fs::read_to_string(path) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, ModelOverrides>>(&data) {
+                self.overrides = map;
+            }
+        }
+    }
+
+    /// Persist model overrides to a JSON file.
+    /// Removes the file when no overrides are set.
+    pub fn save_overrides(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.overrides.is_empty() {
+            let _ = std::fs::remove_file(path);
+            return Ok(());
+        }
+        let json = serde_json::to_string_pretty(&self.overrides)
+            .map_err(|e| format!("Failed to serialize model overrides: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("Failed to write model overrides file: {e}"))?;
+        Ok(())
+    }
+
     /// Set a custom base URL for a provider, overriding the default.
     ///
     /// Returns `true` if the provider was found and updated.
@@ -307,6 +524,10 @@ impl ModelCatalog {
                 signup_url: None,
                 regions: std::collections::HashMap::new(),
                 media_capabilities: Vec::new(),
+                available_models: Vec::new(),
+                // Added at runtime via set_provider_url → always custom.
+                is_custom: true,
+                proxy_url: None,
             });
             // Re-detect auth for the newly added provider
             self.detect_auth();
@@ -330,6 +551,24 @@ impl ModelCatalog {
                     }
                 }
             }
+        }
+    }
+
+    /// Set a per-provider proxy URL override.
+    pub fn set_provider_proxy_url(&mut self, provider: &str, proxy_url: &str) {
+        if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider) {
+            p.proxy_url = if proxy_url.is_empty() {
+                None
+            } else {
+                Some(proxy_url.to_string())
+            };
+        }
+    }
+
+    /// Apply a batch of per-provider proxy URL overrides from config.
+    pub fn apply_proxy_url_overrides(&mut self, overrides: &HashMap<String, String>) {
+        for (provider, proxy_url) in overrides {
+            self.set_provider_proxy_url(provider, proxy_url);
         }
     }
 
@@ -435,13 +674,14 @@ impl ModelCatalog {
                 display_name: display,
                 provider: provider.to_string(),
                 tier: ModelTier::Local,
-                context_window: 32_768,
-                max_output_tokens: 4_096,
+                context_window: 131_072,
+                max_output_tokens: 16_384,
                 input_cost_per_m: 0.0,
                 output_cost_per_m: 0.0,
                 supports_tools: true,
                 supports_vision: false,
                 supports_streaming: true,
+                supports_thinking: false,
                 aliases: Vec::new(),
             });
             added += 1;
@@ -803,6 +1043,74 @@ mod tests {
         assert!(catalog.list_models().len() >= 30);
     }
 
+    /// P2 regression: when registry classification is unavailable
+    /// (registry dir unreadable or missing), every provider must fall back
+    /// to is_custom=false so the dashboard does not re-enable the misleading
+    /// delete button on built-ins.
+    #[test]
+    fn test_is_custom_safe_fallback_on_missing_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers_dir = tmp.path().join("providers");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::write(
+            providers_dir.join("acme.toml"),
+            r#"[provider]
+id = "acme"
+display_name = "Acme"
+api_key_env = "ACME_API_KEY"
+base_url = "https://acme.test"
+"#,
+        )
+        .unwrap();
+
+        // Case 1: registry dir argument is None → classification skipped.
+        let catalog = ModelCatalog::new_from_dir_with_registry(&providers_dir, None);
+        assert!(
+            !catalog.list_providers().iter().any(|p| p.is_custom),
+            "is_custom must be false when no registry dir is supplied"
+        );
+
+        // Case 2: registry dir points to a nonexistent path → read_dir
+        // fails, classification must degrade to false (not true).
+        let missing_registry = tmp.path().join("nonexistent-registry");
+        let catalog =
+            ModelCatalog::new_from_dir_with_registry(&providers_dir, Some(&missing_registry));
+        assert!(
+            !catalog.list_providers().iter().any(|p| p.is_custom),
+            "is_custom must be false when registry read_dir fails"
+        );
+
+        // Case 3: registry dir exists and does NOT contain acme.toml →
+        // acme is correctly flagged custom.
+        let registry_dir = tmp.path().join("registry");
+        std::fs::create_dir_all(&registry_dir).unwrap();
+        let catalog = ModelCatalog::new_from_dir_with_registry(&providers_dir, Some(&registry_dir));
+        assert!(
+            catalog
+                .list_providers()
+                .iter()
+                .any(|p| p.id == "acme" && p.is_custom),
+            "acme must be flagged custom when registry dir exists but does not list it"
+        );
+
+        // Case 4: registry dir lists acme.toml → acme is a built-in.
+        std::fs::write(
+            registry_dir.join("acme.toml"),
+            r#"[provider]
+id = "acme"
+"#,
+        )
+        .unwrap();
+        let catalog = ModelCatalog::new_from_dir_with_registry(&providers_dir, Some(&registry_dir));
+        assert!(
+            catalog
+                .list_providers()
+                .iter()
+                .any(|p| p.id == "acme" && !p.is_custom),
+            "acme must NOT be flagged custom when registry dir lists it"
+        );
+    }
+
     #[test]
     fn test_catalog_has_providers() {
         let catalog = test_catalog();
@@ -1062,6 +1370,7 @@ mod tests {
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
+            supports_thinking: false,
             aliases: vec!["custom-qwen".to_string()],
         });
 
@@ -1089,6 +1398,7 @@ mod tests {
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
+            supports_thinking: false,
             aliases: Vec::new(),
         }));
 
@@ -1104,6 +1414,7 @@ mod tests {
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
+            supports_thinking: false,
             aliases: Vec::new(),
         }));
 
@@ -1146,6 +1457,7 @@ mod tests {
             supports_tools: true,
             supports_vision: false,
             supports_streaming: true,
+            supports_thinking: false,
             aliases: Vec::new(),
         }));
 
@@ -1168,6 +1480,7 @@ mod tests {
         assert!(catalog.get_provider("zai").is_some());
         assert!(catalog.get_provider("zai_coding").is_some());
         assert!(catalog.get_provider("kimi_coding").is_some());
+        assert!(catalog.get_provider("alibaba-coding-plan").is_some());
     }
 
     #[test]
@@ -1252,7 +1565,7 @@ mod tests {
     fn test_bedrock_models() {
         let catalog = test_catalog();
         let bedrock = catalog.models_by_provider("bedrock");
-        assert_eq!(bedrock.len(), 8);
+        assert_eq!(bedrock.len(), 11);
     }
 
     #[test]
@@ -1358,7 +1671,10 @@ supports_tools = false
 supports_vision = false
 supports_streaming = false
 "#;
-        let sources = vec![provider_a.to_string(), provider_b.to_string()];
+        let sources = vec![
+            (provider_a.to_string(), false),
+            (provider_b.to_string(), false),
+        ];
         ModelCatalog::from_sources(&sources, None)
     }
 
@@ -1739,7 +2055,7 @@ supports_tools = true
 supports_vision = false
 supports_streaming = true
 "#;
-        let catalog = ModelCatalog::from_sources(&[toml_content.to_string()], None);
+        let catalog = ModelCatalog::from_sources(&[(toml_content.to_string(), false)], None);
         let providers = catalog.list_providers();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "testprov");
@@ -1774,9 +2090,225 @@ supports_tools = false
 supports_vision = false
 supports_streaming = true
 "#;
-        let catalog = ModelCatalog::from_sources(&[toml_content.to_string()], None);
+        let catalog = ModelCatalog::from_sources(&[(toml_content.to_string(), false)], None);
         let providers = catalog.list_providers();
         assert_eq!(providers.len(), 1);
         assert!(providers[0].media_capabilities.is_empty());
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_provider() {
+        let catalog = test_catalog();
+        let provider = catalog
+            .get_provider("alibaba-coding-plan")
+            .expect("alibaba-coding-plan provider should be registered");
+        assert_eq!(provider.display_name, "Alibaba Coding Plan (Intl)");
+        assert_eq!(provider.api_key_env, "ALIBABA_CODING_PLAN_API_KEY");
+        assert_eq!(
+            provider.base_url,
+            "https://coding-intl.dashscope.aliyuncs.com/v1"
+        );
+        assert!(provider.key_required);
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_has_models() {
+        // Smoke check only — the exact model set is owned by the upstream
+        // librefang-registry repo and changes over time. Specific model
+        // coverage is asserted by name in the sibling tests below.
+        let catalog = test_catalog();
+        let models = catalog.models_by_provider("alibaba-coding-plan");
+        assert!(
+            !models.is_empty(),
+            "alibaba-coding-plan should expose at least one model"
+        );
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_zero_cost() {
+        let catalog = test_catalog();
+        let qwen35plus = catalog
+            .find_model("alibaba-coding-plan/qwen3.5-plus")
+            .expect("qwen3.5-plus model should be registered");
+        assert_eq!(qwen35plus.input_cost_per_m, 0.0);
+        assert_eq!(qwen35plus.output_cost_per_m, 0.0);
+        let qwen36plus = catalog
+            .find_model("alibaba-coding-plan/qwen3.6-plus")
+            .expect("qwen3.6-plus model should be registered");
+        assert_eq!(qwen36plus.input_cost_per_m, 0.0);
+        assert_eq!(qwen36plus.output_cost_per_m, 0.0);
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_vision_models() {
+        let catalog = test_catalog();
+        let qwen35plus = catalog
+            .find_model("alibaba-coding-plan/qwen3.5-plus")
+            .expect("qwen3.5-plus model should be registered");
+        assert!(qwen35plus.supports_vision);
+        assert_eq!(qwen35plus.tier, ModelTier::Smart);
+        assert_eq!(qwen35plus.context_window, 1_000_000);
+
+        let qwen36plus = catalog
+            .find_model("alibaba-coding-plan/qwen3.6-plus")
+            .expect("qwen3.6-plus model should be registered");
+        assert!(qwen36plus.supports_vision);
+        assert_eq!(qwen36plus.tier, ModelTier::Smart);
+        assert_eq!(qwen36plus.context_window, 1_000_000);
+
+        let kimi = catalog
+            .find_model("alibaba-coding-plan/kimi-k2.5")
+            .expect("kimi-k2.5 model should be registered");
+        assert!(kimi.supports_vision);
+        assert_eq!(kimi.tier, ModelTier::Smart);
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_coder_models() {
+        let catalog = test_catalog();
+        let coder_plus = catalog
+            .find_model("alibaba-coding-plan/qwen3-coder-plus")
+            .expect("qwen3-coder-plus model should be registered");
+        assert_eq!(coder_plus.tier, ModelTier::Smart);
+        assert_eq!(coder_plus.context_window, 1_000_000);
+
+        let coder_next = catalog
+            .find_model("alibaba-coding-plan/qwen3-coder-next")
+            .expect("qwen3-coder-next model should be registered");
+        assert_eq!(coder_next.tier, ModelTier::Frontier);
+        assert_eq!(coder_next.context_window, 262_144);
+    }
+
+    #[test]
+    fn test_alibaba_coding_plan_all_models_support_tools() {
+        let catalog = test_catalog();
+        let models = catalog.models_by_provider("alibaba-coding-plan");
+        for model in models {
+            assert!(
+                model.supports_tools,
+                "Model {} should support tools",
+                model.id
+            );
+            assert!(
+                model.supports_streaming,
+                "Model {} should support streaming",
+                model.id
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background key validation
+// ---------------------------------------------------------------------------
+
+/// Probe a single provider's API key via a lightweight `GET /models` request.
+///
+/// Returns:
+/// - `Some(true)`  — HTTP 2xx or 429 (rate-limited = key is valid)
+/// - `Some(false)` — HTTP 401 or 403 (key rejected by provider)
+/// - `None`        — network error, 404, 5xx, etc. (don't update status)
+///
+/// Result of probing a provider's API key.
+#[derive(Debug)]
+pub struct ProbeResult {
+    /// Whether the key is valid (true), invalid (false), or unknown (None).
+    pub key_valid: Option<bool>,
+    /// Model IDs available on this provider (empty if key invalid or models
+    /// could not be listed, e.g. rate-limited or non-OpenAI-compatible).
+    pub available_models: Vec<String>,
+}
+
+pub async fn probe_api_key(provider_id: &str, base_url: &str, api_key: &str) -> ProbeResult {
+    use std::time::Duration;
+
+    let client = match crate::http_client::proxied_client_builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return ProbeResult {
+                key_valid: None,
+                available_models: Vec::new(),
+            }
+        }
+    };
+
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+
+    let req = match provider_id.to_lowercase().as_str() {
+        "anthropic" => client
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        "gemini" => client.get(&url).header("x-goog-api-key", api_key),
+        _ => client
+            .get(&url)
+            .header("Authorization", format!("Bearer {api_key}")),
+    };
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(_) => {
+            return ProbeResult {
+                key_valid: None,
+                available_models: Vec::new(),
+            }
+        }
+    };
+
+    let status = resp.status().as_u16();
+    tracing::debug!(provider = %provider_id, http_status = status, "provider key probe");
+
+    match status {
+        200..=299 => {
+            // Key is valid — try to extract model IDs from the response body.
+            let models = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| {
+                    // OpenAI-compatible format: { "data": [{ "id": "gpt-4o" }, ...] }
+                    // Gemini format: { "models": [{ "name": "models/gemini-..." }, ...] }
+                    if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+                        Some(
+                            arr.iter()
+                                .filter_map(|m| {
+                                    m.get("id").and_then(|v| v.as_str()).map(String::from)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        body.get("models").and_then(|d| d.as_array()).map(|arr| {
+                            arr.iter()
+                                .filter_map(|m| {
+                                    m.get("name")
+                                        .or_else(|| m.get("id"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.strip_prefix("models/").unwrap_or(s).to_string())
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                })
+                .unwrap_or_default();
+            ProbeResult {
+                key_valid: Some(true),
+                available_models: models,
+            }
+        }
+        429 => ProbeResult {
+            key_valid: Some(true), // rate-limited but key is valid
+            available_models: Vec::new(),
+        },
+        401 | 403 => ProbeResult {
+            key_valid: Some(false),
+            available_models: Vec::new(),
+        },
+        _ => ProbeResult {
+            key_valid: None, // transient / unknown — don't penalise
+            available_models: Vec::new(),
+        },
     }
 }

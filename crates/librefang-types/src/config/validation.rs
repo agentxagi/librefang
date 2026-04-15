@@ -52,6 +52,7 @@ impl KernelConfig {
             "thinking",
             "budget",
             "provider_urls",
+            "provider_proxy_urls",
             "provider_regions",
             "provider_api_keys",
             "vertex_ai",
@@ -82,6 +83,16 @@ impl KernelConfig {
             "sanitize",
             "telemetry",
             "update_channel",
+            "skills",
+            "compaction",
+            "registry",
+            "rate_limit",
+            "tool_timeout_secs",
+            "max_upload_size_bytes",
+            "max_concurrent_bg_llm",
+            "max_agent_call_depth",
+            "max_request_body_bytes",
+            "terminal",
         ]
     }
 
@@ -567,6 +578,17 @@ impl KernelConfig {
                     ));
                 }
             }
+            SearchProvider::Jina => {
+                if std::env::var(&self.web.jina.api_key_env)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    warnings.push(format!(
+                        "Jina search selected but {} is not set",
+                        self.web.jina.api_key_env
+                    ));
+                }
+            }
             SearchProvider::DuckDuckGo | SearchProvider::Auto => {}
         }
 
@@ -636,6 +658,60 @@ impl KernelConfig {
             warnings.push("network_enabled is true but network.shared_secret is empty".to_string());
         }
 
+        // --- Terminal access control validation ---
+
+        if self.terminal.enabled {
+            // Validate each allowed_origins entry is a valid http(s) URL
+            for origin in &self.terminal.allowed_origins {
+                if origin == "*" {
+                    // Wildcard is valid syntax but requires allow_remote
+                    if !self.terminal.allow_remote {
+                        warnings.push(
+                            "terminal.allowed_origins contains \"*\" (wildcard) but terminal.allow_remote is false — \
+                             wildcard is incoherent without allow_remote, set allow_remote = true or remove \"*\""
+                                .to_string(),
+                        );
+                    }
+                    continue;
+                }
+                let looks_like_url = (origin.starts_with("http://")
+                    || origin.starts_with("https://"))
+                    && origin.contains("://");
+                if !looks_like_url {
+                    warnings.push(format!(
+                        "terminal.allowed_origins entry '{}' is not a valid URL (must use http:// or https:// scheme)",
+                        origin
+                    ));
+                }
+            }
+
+            // Warn if allow_remote is true without any authentication
+            if self.terminal.allow_remote {
+                // We can't check auth_configured here (requires runtime state),
+                // but warn about the risk
+                warnings.push(
+                    "terminal.allow_remote is true — the terminal WebSocket will accept connections from \
+                     non-local origins; ensure authentication is configured (api_key, dashboard credentials, or users)"
+                        .to_string(),
+                );
+            }
+
+            // Warn if require_proxy_headers is set but api_listen is loopback-only
+            if self.terminal.require_proxy_headers {
+                let listen = &self.api_listen;
+                if listen.starts_with("127.0.0.1:")
+                    || listen.starts_with("localhost:")
+                    || listen.starts_with("[::1]:")
+                {
+                    warnings.push(
+                        "terminal.require_proxy_headers is true but api_listen is loopback-only — \
+                         proxy headers have no effect when only local connections can reach the server"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         warnings
     }
 
@@ -673,6 +749,13 @@ impl KernelConfig {
             self.web.fetch.timeout_secs = 120;
         }
 
+        // Web search timeout: min 5s, max 120s
+        if self.web.timeout_secs == 0 {
+            self.web.timeout_secs = 15;
+        } else if self.web.timeout_secs > 120 {
+            self.web.timeout_secs = 120;
+        }
+
         // Queue concurrency: min 1 per lane (0 would deadlock)
         if self.queue.concurrency.main_lane == 0 {
             self.queue.concurrency.main_lane = 1;
@@ -697,6 +780,16 @@ impl KernelConfig {
             self.triggers.max_workflow_secs = 10;
         } else if self.triggers.max_workflow_secs > 86400 {
             self.triggers.max_workflow_secs = 86400;
+        }
+
+        // max_cron_jobs: min 1 (0 silently disables all cron job creation —
+        // CronScheduler's limit check is `len >= max`, so 0 rejects every
+        // create). Max 10_000 matches the validation warning threshold.
+        // Clamp upward to the same default used by serde (500).
+        if self.max_cron_jobs == 0 {
+            self.max_cron_jobs = 500;
+        } else if self.max_cron_jobs > 10_000 {
+            self.max_cron_jobs = 10_000;
         }
     }
 }

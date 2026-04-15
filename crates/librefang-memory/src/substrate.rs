@@ -145,8 +145,17 @@ impl MemorySubstrate {
 
     /// Remove an agent from persistent storage and cascade-delete sessions.
     pub fn remove_agent(&self, agent_id: AgentId) -> LibreFangResult<()> {
-        // Delete associated sessions first
-        let _ = self.sessions.delete_agent_sessions(agent_id);
+        // Delete associated sessions first. Log on failure rather than
+        // silently swallowing — the agent row will still be removed, but
+        // the caller should know about the orphaned session rows so the
+        // inconsistency is at least observable.
+        if let Err(e) = self.sessions.delete_agent_sessions(agent_id) {
+            tracing::warn!(
+                %agent_id,
+                error = %e,
+                "Failed to cascade-delete sessions for agent; session rows may be orphaned",
+            );
+        }
         self.structured.remove_agent(agent_id)
     }
 
@@ -236,6 +245,11 @@ impl MemorySubstrate {
         self.sessions.delete_session(session_id)
     }
 
+    /// Return all session IDs belonging to an agent.
+    pub fn get_agent_session_ids(&self, agent_id: AgentId) -> LibreFangResult<Vec<SessionId>> {
+        self.sessions.get_agent_session_ids(agent_id)
+    }
+
     /// Delete all sessions belonging to an agent.
     pub fn delete_agent_sessions(&self, agent_id: AgentId) -> LibreFangResult<()> {
         self.sessions.delete_agent_sessions(agent_id)
@@ -291,6 +305,11 @@ impl MemorySubstrate {
         self.sessions.cleanup_excess_sessions(max_per_agent)
     }
 
+    /// Delete sessions whose agent_id is not in the provided live set. Returns count deleted.
+    pub fn cleanup_orphan_sessions(&self, live_agent_ids: &[AgentId]) -> LibreFangResult<u64> {
+        self.sessions.cleanup_orphan_sessions(live_agent_ids)
+    }
+
     /// Full-text search across session content using FTS5.
     pub fn search_sessions(
         &self,
@@ -307,9 +326,11 @@ impl MemorySubstrate {
     pub fn canonical_context(
         &self,
         agent_id: AgentId,
+        session_id: Option<SessionId>,
         window_size: Option<usize>,
     ) -> LibreFangResult<(Option<String>, Vec<librefang_types::message::Message>)> {
-        self.sessions.canonical_context(agent_id, window_size)
+        self.sessions
+            .canonical_context(agent_id, session_id, window_size)
     }
 
     /// Store an LLM-generated summary, replacing older messages with the kept subset.
@@ -344,9 +365,10 @@ impl MemorySubstrate {
         agent_id: AgentId,
         messages: &[librefang_types::message::Message],
         compaction_threshold: Option<usize>,
+        session_id: Option<SessionId>,
     ) -> LibreFangResult<()> {
         self.sessions
-            .append_canonical(agent_id, messages, compaction_threshold)?;
+            .append_canonical(agent_id, messages, compaction_threshold, session_id)?;
         Ok(())
     }
 
@@ -480,6 +502,17 @@ impl MemorySubstrate {
 
         let chunks =
             chunker::chunk_text(content, chunk_config.max_chunk_size, chunk_config.overlap);
+
+        // chunk_text returns [] when max_chunk_size == 0 (or content is
+        // empty, though the should_chunk guard above excludes that case).
+        // Without this check the .expect() at the end of the loop panics.
+        if chunks.is_empty() {
+            return Err(LibreFangError::Internal(format!(
+                "chunker produced no chunks (content_len={}, max_chunk_size={})",
+                content.chars().count(),
+                chunk_config.max_chunk_size,
+            )));
+        }
 
         // Store the first chunk and use its ID as the parent_id for siblings.
         let mut parent_id: Option<MemoryId> = None;

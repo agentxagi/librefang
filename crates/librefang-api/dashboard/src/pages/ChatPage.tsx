@@ -5,18 +5,28 @@ import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { buildAuthenticatedWebSocketUrl, listAgents, sendAgentMessage, loadAgentSession, listPendingApprovals, resolveApproval } from "../api";
-import type { ApprovalItem } from "../api";
+import { buildAuthenticatedWebSocketUrl, listAgents, sendAgentMessage, loadAgentSession, listPendingApprovals, resolveApproval, getFullConfig, listAgentSessions, createAgentSession, switchAgentSession, deleteSession, listModels, patchAgentConfig, listMediaProviders, listActiveHands } from "../api";
+import type { ApprovalItem, SessionListItem, ModelItem, AgentTool, AgentItem } from "../api";
+import { groupedPicker } from "../lib/chatPicker";
 import { normalizeToolOutput } from "../lib/chat";
-import { MessageCircle, Send, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, Zap, ShieldAlert, CheckCircle, XCircle } from "lucide-react";
+import { useTtsManager } from "../lib/tts";
+import { MessageCircle, Send, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, ArrowLeft, Zap, ShieldAlert, CheckCircle, XCircle, Clock, Plus, Trash2, ChevronDown, Loader2, Copy, Volume2, Pause, Download, Brain, Eye, EyeOff, Mic, MicOff, Globe } from "lucide-react";
 import { Badge } from "../components/ui/Badge";
 import { MarkdownContent } from "../components/ui/MarkdownContent";
 import { useUIStore } from "../lib/store";
+import { copyToClipboard } from "../lib/clipboard";
+import { ToolCallCard } from "../components/ui/ToolCallCard";
+import { filterVisible } from "../lib/hiddenModels";
+import { useVoiceInput } from "../lib/useVoiceInput";
 import { Typewriter_v2 } from "../components/Typewriter_v2";
 import "katex/dist/katex.min.css";
 
 const isAuthUnavailable = (status?: string) =>
-  !!status && status !== "configured" && status !== "configured_cli" && status !== "not_required";
+  !!status && status !== "configured" && status !== "validated_key" && status !== "configured_cli" && status !== "not_required" && status !== "auto_detected";
+
+interface ChatToolCall extends AgentTool {
+  _call_id?: string;
+}
 
 interface ChatMessage {
   id: string;
@@ -29,15 +39,37 @@ interface ChatMessage {
   cost_usd?: number;
   memories_saved?: string[];
   memories_used?: string[];
+  tools?: ChatToolCall[];
+  /** Accumulated reasoning trace streamed via `thinking_delta` events. */
+  thinking?: string;
+  /** Whether the thinking block is collapsed in the UI. */
+  thinkingCollapsed?: boolean;
 }
 
-// Slash commands
+// Slash commands — desc is an i18n key under "chat.cmd_*"
+// noArgs: clicking fills + sends immediately; argsHint: shown as placeholder after completion
 const SLASH_COMMANDS = [
-  { cmd: "/help", desc: "Show available commands" },
-  { cmd: "/clear", desc: "Clear chat history" },
-  { cmd: "/agents", desc: "List available agents" },
-  { cmd: "/info", desc: "Show current agent info" },
+  { cmd: "/help",    descKey: "cmd_help",    noArgs: true },
+  { cmd: "/clear",   descKey: "cmd_clear",   noArgs: true },
+  { cmd: "/agents",  descKey: "cmd_agents",  noArgs: true },
+  { cmd: "/info",    descKey: "cmd_info",    noArgs: true },
+  { cmd: "/new",     descKey: "cmd_new",     noArgs: true },
+  { cmd: "/compact", descKey: "cmd_compact", noArgs: true },
+  { cmd: "/reset",   descKey: "cmd_reset",   noArgs: true },
+  { cmd: "/reboot",  descKey: "cmd_reboot",  noArgs: true },
+  { cmd: "/stop",    descKey: "cmd_stop",    noArgs: true },
+  { cmd: "/model",   descKey: "cmd_model",   argsHint: "<provider/model>" },
+  { cmd: "/usage",   descKey: "cmd_usage",   noArgs: true },
+  { cmd: "/context", descKey: "cmd_context", noArgs: true },
+  { cmd: "/verbose", descKey: "cmd_verbose", argsHint: "[level]" },
+  { cmd: "/budget",  descKey: "cmd_budget",  noArgs: true },
+  { cmd: "/peers",   descKey: "cmd_peers",   noArgs: true },
+  { cmd: "/a2a",     descKey: "cmd_a2a",     noArgs: true },
+  { cmd: "/queue",   descKey: "cmd_queue",   noArgs: true },
 ];
+
+// Commands that require backend processing via WebSocket command protocol
+const BACKEND_COMMANDS = ["new", "reset", "reboot", "compact", "stop", "model", "usage", "context", "verbose", "budget", "peers", "a2a", "queue"];
 
 
 // WebSocket hook with auto-reconnect
@@ -95,9 +127,16 @@ function useWebSocket(agentId: string | null) {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       retriesRef.current = 0;
       onDropRef.current = null;
-      if (wsRef.current) {
-        wsRef.current.onclose = null; // prevent reconnect on intentional close
-        wsRef.current.close();
+      const ws = wsRef.current;
+      if (ws) {
+        ws.onclose = null; // prevent reconnect on intentional close
+        if (ws.readyState === WebSocket.CONNECTING) {
+          // Closing a CONNECTING socket triggers a noisy browser warning;
+          // defer the close until it actually opens.
+          ws.onopen = () => ws.close();
+        } else if (ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
         wsRef.current = null;
       }
     };
@@ -110,46 +149,118 @@ function useWebSocket(agentId: string | null) {
 const sessionCache = new Map<string, ChatMessage[]>();
 
 // Chat message management - includes history loading and sending (with WS streaming)
-function useChatMessages(agentId: string | null, agents: any[] = []) {
+// sessionVersion: bump to force reload after session switch
+function useChatMessages(agentId: string | null, agents: any[] = [], sessionVersion = 0, onModelSwitch?: () => void) {
+  const { t } = useTranslation();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  // Per-agent loading state. A single shared `isLoading` would freeze the
+  // ChatInput on every agent while one of them is streaming (#2322). Keyed
+  // by agentId so switching away from a busy agent unblocks the new one,
+  // and coming back still reflects the in-flight status of the original.
+  const [loadingAgents, setLoadingAgents] = useState<Record<string, boolean>>({});
+  const isLoading = agentId ? loadingAgents[agentId] === true : false;
+  const setAgentLoading = useCallback((id: string, on: boolean) => {
+    setLoadingAgents(prev => {
+      if ((prev[id] ?? false) === on) return prev;
+      const next = { ...prev };
+      if (on) next[id] = true; else delete next[id];
+      return next;
+    });
+  }, []);
+  // Garbage-collect loading flags for agents that no longer exist so the
+  // map doesn't accumulate dead entries over a long session.
+  useEffect(() => {
+    const alive = new Set(agents.map(a => a.id));
+    setLoadingAgents(prev => {
+      const next: Record<string, boolean> = {};
+      let changed = false;
+      for (const [id, on] of Object.entries(prev)) {
+        if (alive.has(id)) next[id] = on; else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [agents]);
   const { ws, wsConnected, onDropRef } = useWebSocket(agentId);
   const addSkillOutput = useUIStore((s) => s.addSkillOutput);
+  const deepThinking = useUIStore((s) => s.deepThinking);
+  const showThinkingProcess = useUIStore((s) => s.showThinkingProcess);
 
-  // Save current messages to cache when switching away
+  // Track the currently-viewed agent in a ref so async handlers registered
+  // during a previous render can tell whether their target is still on screen.
+  const currentAgentRef = useRef<string | null>(agentId);
+  useEffect(() => { currentAgentRef.current = agentId; }, [agentId]);
+
+  // Route a message update to either live React state (when the target agent
+  // is on screen) or straight to the session cache (when the user has
+  // switched away). Without this, updates against a swapped-out agent fall
+  // into `setMessages(prev => prev.map(...))` whose `prev` is the OTHER
+  // agent's array — the update becomes a silent no-op and the in-flight
+  // response is lost once the user switches back.
+  const updateAgentMessages = useCallback((
+    id: string,
+    updater: (msgs: ChatMessage[]) => ChatMessage[],
+  ) => {
+    if (id === currentAgentRef.current) {
+      setMessages(updater);
+    } else {
+      const current = sessionCache.get(id) ?? [];
+      sessionCache.set(id, updater(current));
+    }
+  }, []);
+
+  // Save current messages to cache when switching away. The cleanup must
+  // read the LATEST messages at unmount/agent-swap time, so we keep a
+  // ref that tracks messages and only fire the save effect on agentId
+  // changes (previously had no deps, so cleanup+re-run every render).
   const prevAgentRef = useRef<string | null>(null);
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  messagesRef.current = messages;
   useEffect(() => {
     return () => {
       if (prevAgentRef.current) {
-        sessionCache.set(prevAgentRef.current, messages);
+        sessionCache.set(prevAgentRef.current, messagesRef.current);
       }
     };
-  });
+  }, [agentId]);
   useEffect(() => { prevAgentRef.current = agentId; }, [agentId]);
 
   // Load history — use cache if available, otherwise fetch
+  // sessionVersion changes force a fresh load (skip cache)
   useEffect(() => {
     if (!agentId) { setMessages([]); return; }
 
-    const cached = sessionCache.get(agentId);
-    if (cached) {
-      setMessages(cached);
-      return;
+    if (sessionVersion === 0) {
+      const cached = sessionCache.get(agentId);
+      if (cached) {
+        setMessages(cached);
+        return;
+      }
+    } else {
+      sessionCache.delete(agentId);
     }
 
     setMessages([]);
-    setIsLoading(true);
-    loadAgentSession(agentId)
+    const loadId = agentId;
+    setAgentLoading(loadId, true);
+    loadAgentSession(loadId)
       .then(session => {
         if (session.messages?.length) {
           const historical: ChatMessage[] = session.messages.flatMap((msg, idx) => {
-            const content = typeof msg.content === "string"
-              ? msg.content
-              : msg.content == null
-                ? ""
-                : JSON.stringify(msg.content);
+            let content: string;
+            if (typeof msg.content === "string") {
+              content = msg.content;
+            } else if (Array.isArray(msg.content)) {
+              // Extract only text blocks — skip tool_use/tool_result
+              content = (msg.content as Array<Record<string, unknown>>)
+                .filter((b) => b.type === "text" && typeof b.text === "string")
+                .map((b) => b.text as string)
+                .join("\n");
+            } else {
+              content = msg.content == null ? "" : String(msg.content);
+            }
 
-            if (!content.trim()) return [];
+            const hasTools = msg.tools && msg.tools.length > 0;
+            if (!content.trim() && !hasTools) return [];
 
             return [{
               id: `hist-${idx}`,
@@ -160,15 +271,22 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
                   : "assistant",
               content,
               timestamp: new Date(),
+              tools: msg.tools,
             }];
           });
-          setMessages(historical);
-          sessionCache.set(agentId, historical);
+          // Refresh the cache unconditionally — the data is still correct
+          // for loadId. Only touch live React state when the user is still
+          // viewing loadId; otherwise a slow A load resolving after the
+          // user has swapped to B would overwrite B's displayed messages.
+          sessionCache.set(loadId, historical);
+          if (loadId === currentAgentRef.current) {
+            setMessages(historical);
+          }
         }
       })
       .catch(() => {})
-      .finally(() => setIsLoading(false));
-  }, [agentId]);
+      .finally(() => setAgentLoading(loadId, false));
+  }, [agentId, sessionVersion]);
 
   // Send message - WS first, HTTP fallback
   const sendMessage = useCallback(async (content: string) => {
@@ -184,23 +302,71 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
         ]);
       };
       if (trimmed === "/help") {
-        sysMsg(SLASH_COMMANDS.map(c => `**${c.cmd}** — ${c.desc}`).join("\n"));
+        const rows = SLASH_COMMANDS.map(c =>
+          `| \`${c.cmd}${c.argsHint ? " " + c.argsHint : ""}\` | ${t(`chat.${c.descKey}`)} |`
+        ).join("\n");
+        sysMsg(`| ${t("chat.cmd_col_command", "命令")} | ${t("chat.cmd_col_desc", "说明")} |\n|---|---|\n${rows}`);
         return;
       }
       if (trimmed === "/clear") { setMessages([]); return; }
       if (trimmed === "/agents") {
         const names = agents.map(a => `- **${a.name}** (${a.state || "unknown"})`).join("\n");
-        sysMsg(names || "No agents available.");
+        sysMsg(names || t("chat.no_agents_available"));
         return;
       }
       if (trimmed === "/info") {
         const a = agents.find(a => a.id === agentId);
-        sysMsg(a ? `**${a.name}**\nModel: ${a.model_name || "-"}\nProvider: ${a.model_provider || "-"}\nState: ${a.state}` : "No agent selected.");
+        sysMsg(a ? `**${a.name}**\n${t("chat.info_model")}: ${a.model_name || "-"}\n${t("chat.info_provider")}: ${a.model_provider || "-"}\n${t("chat.info_state")}: ${a.state}` : t("chat.no_agent_selected"));
+        return;
+      }
+
+      // Backend commands: send as {"type": "command"} via WS, bypassing LLM
+      const parts = trimmed.slice(1).split(/\s+/, 2);
+      const cmd = parts[0];
+      const cmdArgs = trimmed.slice(1 + cmd.length).trim();
+      if (BACKEND_COMMANDS.includes(cmd)) {
+        setMessages(prev => [...prev,
+          { id: `user-${Date.now()}`, role: "user" as const, content: trimmed, timestamp: new Date() },
+        ]);
+        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+          const handleCmdResponse = (event: MessageEvent) => {
+            try {
+              const data = JSON.parse(event.data as string);
+              if (data.type === "command_result" || data.type === "error") {
+                ws.current?.removeEventListener("message", handleCmdResponse);
+                const responseText = data.message || data.content || "";
+                // /new and /reset clear the backend session, so clear frontend too
+                if (data.type === "command_result" && (cmd === "new" || cmd === "reset")) {
+                  setMessages([
+                    { id: `sys-${Date.now()}`, role: "system" as const, content: responseText, timestamp: new Date() },
+                  ]);
+                } else {
+                  setMessages(prev => [...prev,
+                    { id: `sys-${Date.now()}`, role: "system" as const, content: responseText, timestamp: new Date() },
+                  ]);
+                }
+                // Refresh agent data so model/provider badge reflects the change
+                if (data.type === "command_result" && cmd === "model") {
+                  onModelSwitch?.();
+                }
+              }
+            } catch { /* ignore non-JSON */ }
+          };
+          ws.current.addEventListener("message", handleCmdResponse);
+          ws.current.send(JSON.stringify({ type: "command", command: cmd, args: cmdArgs }));
+        } else {
+          sysMsg(t("chat.ws_not_connected"));
+        }
         return;
       }
     }
 
     if (!agentId) return;
+    // Snapshot the agent at send time. The user may switch agents before
+    // the response finishes; all completion/cleanup paths must still target
+    // the original sender so we don't flip loading state / HTTP routes on
+    // the agent the user is now looking at.
+    const sendAgentId = agentId;
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -218,14 +384,17 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
     };
 
     setMessages(prev => [...prev, userMsg, botMsg]);
-    setIsLoading(true);
+    setAgentLoading(sendAgentId, true);
 
     // Helper: send via HTTP (used as primary fallback and WS drop recovery)
     const sendViaHttp = async () => {
       try {
-        const response = await sendAgentMessage(agentId, trimmed);
+        const response = await sendAgentMessage(sendAgentId, trimmed, {
+          thinking: deepThinking,
+          show_thinking: showThinkingProcess,
+        });
         const fullContent = response.response || "";
-        setMessages(prev => prev.map(m =>
+        updateAgentMessages(sendAgentId, prev => prev.map(m =>
           m.id === botMsg.id
             ? {
                 ...m, content: fullContent, isStreaming: false,
@@ -233,22 +402,24 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
                 cost_usd: response.cost_usd,
                 memories_saved: response.memories_saved,
                 memories_used: response.memories_used,
+                thinking: response.thinking ?? m.thinking,
+                thinkingCollapsed: m.thinkingCollapsed ?? true,
               }
             : m
         ));
         if (response.memories_saved?.length) {
-          const agentName = agents.find(a => a.id === agentId)?.name;
+          const agentName = agents.find(a => a.id === sendAgentId)?.name;
           response.memories_saved.forEach((mem: string) => {
-            addSkillOutput({ skillName: "memory", agentId: agentId || undefined, agentName, content: mem });
+            addSkillOutput({ skillName: "memory", agentId: sendAgentId, agentName, content: mem });
           });
         }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : "Unknown error";
-        setMessages(prev => prev.map(m =>
+        updateAgentMessages(sendAgentId, prev => prev.map(m =>
           m.id === botMsg.id ? { ...m, isStreaming: false, error: errorMsg } : m
         ));
       } finally {
-        setIsLoading(false);
+        setAgentLoading(sendAgentId, false);
       }
     };
 
@@ -283,33 +454,89 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
             const data = JSON.parse(event.data as string);
             if (data.type === "text_delta") {
               const chunk = data.content || "";
-              setMessages(prev => prev.map(m =>
-                m.id === botMsg.id ? { ...m, content: m.content + chunk } : m
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
+                m.id === botMsg.id ? { ...m, content: m.content + chunk, error: undefined } : m
+              ));
+            } else if (data.type === "thinking_delta") {
+              const chunk = data.content || "";
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
+                m.id === botMsg.id
+                  ? {
+                      ...m,
+                      thinking: (m.thinking ?? "") + chunk,
+                      thinkingCollapsed: m.thinkingCollapsed ?? false,
+                    }
+                  : m
               ));
             } else if (data.type === "typing") {
               if (data.state === "stop") {
-                setMessages(prev => prev.map(m =>
+                updateAgentMessages(sendAgentId, prev => prev.map(m =>
                   m.id === botMsg.id ? { ...m, isStreaming: false } : m
                 ));
               }
+            } else if (data.type === "tool_start") {
+              // Agent started a tool call — add a running tool entry
+              const toolName = typeof data.tool === "string" ? data.tool : "unknown";
+              const toolId = data.id || `tool-${Date.now()}`;
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
+                m.id === botMsg.id
+                  ? { ...m, tools: [...(m.tools || []), { name: toolName, running: true, expanded: false, is_error: false, input: undefined, result: undefined, _call_id: toolId }] }
+                  : m
+              ));
+            } else if (data.type === "tool_end") {
+              // LLM finished specifying the tool call — attach input but keep running
+              // (tool_end means the LLM output is complete, NOT that the tool finished executing;
+              // the tool stays "running" until tool_result arrives)
+              const toolId = data.id;
+              let parsedInput: unknown;
+              try { parsedInput = typeof data.input === "string" ? JSON.parse(data.input) : data.input; } catch { parsedInput = data.input; }
+              updateAgentMessages(sendAgentId, prev => prev.map(m => {
+                if (m.id !== botMsg.id) return m;
+                const tools = (m.tools || []).map(t =>
+                  t._call_id === toolId ? { ...t, input: parsedInput } : t
+                );
+                return { ...m, tools };
+              }));
             } else if (data.type === "tool_result") {
+              // Attach result to the most recent tool matching by name
+              const toolName = typeof data.tool === "string" ? data.tool : "";
+              const isError = Boolean(data.is_error);
+              const result = typeof data.result === "string" ? data.result : data.result != null ? JSON.stringify(data.result) : "";
+              updateAgentMessages(sendAgentId, prev => prev.map(m => {
+                if (m.id !== botMsg.id) return m;
+                const tools = [...(m.tools || [])];
+                // Find last tool with this name that has no result yet
+                for (let i = tools.length - 1; i >= 0; i--) {
+                  if (tools[i].name === toolName && tools[i].result === undefined) {
+                    tools[i] = { ...tools[i], result, is_error: isError, running: false };
+                    break;
+                  }
+                }
+                return { ...m, tools };
+              }));
+              // Also keep the skill output panel behavior
               const entry = normalizeToolOutput(data);
               if (entry) {
-                addSkillOutput({ skillName: entry.tool, agentId: agentId || undefined, content: entry.content });
+                addSkillOutput({ skillName: entry.tool, agentId: sendAgentId, content: entry.content });
               }
             } else if (data.type === "silent_complete") {
-              setMessages(prev => prev.filter(m => m.id !== botMsg.id));
-              setIsLoading(false);
+              updateAgentMessages(sendAgentId, prev => prev.filter(m => m.id !== botMsg.id));
+              setAgentLoading(sendAgentId, false);
               cleanup();
             } else if (data.type === "error") {
               const error = data.content || "WebSocket error";
-              setMessages(prev => prev.map(m =>
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id ? { ...m, isStreaming: false, error } : m
               ));
-              setIsLoading(false);
-              cleanup();
+              // Don't cleanup immediately — the agent may recover and send a final
+              // response. Shorten the inactivity window to 30s so the user isn't
+              // blocked forever if the agent truly failed.
+              if (fallbackTimer) clearTimeout(fallbackTimer);
+              fallbackTimer = setTimeout(() => {
+                if (!responded) { cleanup(); sendViaHttp(); }
+              }, 30_000);
             } else if (data.type === "response") {
-              setMessages(prev => prev.map(m =>
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id
                   ? {
                       ...m, content: data.content || m.content, isStreaming: false,
@@ -317,15 +544,17 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
                       cost_usd: data.cost_usd,
                       memories_saved: data.memories_saved,
                       memories_used: data.memories_used,
+                      thinking: typeof data.thinking === "string" ? data.thinking : m.thinking,
+                      thinkingCollapsed: m.thinkingCollapsed ?? true,
                     }
                   : m
               ));
-              setIsLoading(false);
+              setAgentLoading(sendAgentId, false);
               cleanup();
             }
           } catch {
             // Non-JSON text chunk
-            setMessages(prev => prev.map(m =>
+            updateAgentMessages(sendAgentId, prev => prev.map(m =>
               m.id === botMsg.id ? { ...m, content: m.content + event.data } : m
             ));
           }
@@ -340,7 +569,12 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
         };
 
         ws.current.addEventListener("message", handleMessage);
-        ws.current.send(JSON.stringify({ type: "message", content: trimmed }));
+        ws.current.send(JSON.stringify({
+          type: "message",
+          content: trimmed,
+          thinking: deepThinking,
+          show_thinking: showThinkingProcess,
+        }));
 
         // Start inactivity timeout — resets on every received event
         resetFallbackTimer();
@@ -353,7 +587,7 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
 
     // HTTP fallback — direct, no fake streaming
     await sendViaHttp();
-  }, [agentId, agents, wsConnected, ws]);
+  }, [agentId, agents, wsConnected, ws, deepThinking, showThinkingProcess]);
 
   const clearHistory = useCallback(() => setMessages([]), []);
 
@@ -361,11 +595,35 @@ function useChatMessages(agentId: string | null, agents: any[] = []) {
 }
 
 // Message bubble component — memoized to skip re-render during streaming of other messages
-const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMessage }) {
+interface MessageBubbleProps {
+  message: ChatMessage;
+  usageFooter: string;
+  onCopy?: (messageId: string, content: string) => void;
+  copied?: boolean;
+  onSpeak?: (messageId: string, content: string) => void;
+  isSpeaking?: boolean;
+  ttsStatus?: "idle" | "loading" | "playing" | "paused";
+  ttsAvailable?: boolean;
+}
+
+const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy, copied, onSpeak, isSpeaking, ttsStatus, ttsAvailable }: MessageBubbleProps) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
+  const [thinkingExpanded, setThinkingExpanded] = useState(() => !(message.thinkingCollapsed ?? false));
 
   if (message.role === "system") {
+    const isMultiLine = message.content.includes("\n");
+    if (isMultiLine) {
+      return (
+        <div className="flex flex-col items-center gap-2 py-4 px-6">
+          <div className="h-px w-24 bg-gradient-to-r from-transparent via-border-subtle to-transparent" />
+          <div className="w-full max-w-lg text-[11px] text-text-dim/60 [&_table]:w-full [&_table]:border-collapse [&_td]:py-0.5 [&_td]:px-2 [&_td:first-child]:text-brand [&_td:first-child]:font-mono [&_td:first-child]:font-bold [&_th]:text-[9px] [&_th]:uppercase [&_th]:tracking-widest [&_th]:text-text-dim/40 [&_th]:pb-1 [&_th]:px-2 [&_code]:text-brand [&_code]:font-mono">
+            <MarkdownContent>{message.content}</MarkdownContent>
+          </div>
+          <div className="h-px w-24 bg-gradient-to-r from-transparent via-border-subtle to-transparent" />
+        </div>
+      );
+    }
     return (
       <div className="flex justify-center py-6">
         <div className="flex items-center gap-4">
@@ -377,13 +635,22 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
     );
   }
 
+  // Strip <tool_call>...</tool_call> XML blocks and orphaned closing tags from LLM output
+  const displayContent = useMemo(() => {
+    if (isUser) return message.content;
+    return message.content
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+      .replace(/<\/?tool_calls?>/g, "")
+      .trim();
+  }, [message.content, isUser]);
+
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-      <div className={`flex flex-col max-w-[90%] sm:max-w-[75%] ${isUser ? "items-end" : "items-start"}`}>
+    <div className={`flex animate-message-in ${isUser ? "justify-end" : "justify-start"}`}>
+      <div className={`flex flex-col min-w-0 w-fit max-w-[90%] sm:max-w-[min(75%,70ch)] ${isUser ? "items-end" : "items-start"}`}>
         {/* Avatar + name */}
         <div className={`flex items-center gap-2 mb-1.5 ${isUser ? "self-end flex-row-reverse" : "self-start"}`}>
           <div className={`h-7 w-7 rounded-lg flex items-center justify-center ${
-            isUser ? "bg-gradient-to-br from-brand to-accent text-white shadow-md" : "bg-surface border border-border-subtle"
+            isUser ? "bg-brand text-white shadow-sm" : "bg-surface border border-border-subtle"
           }`}>
             {isUser ? <User className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5 text-brand" />}
           </div>
@@ -392,19 +659,51 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
           </span>
         </div>
 
+        {/* Thinking trace — collapsible, above tools */}
+        {!isUser && message.thinking && message.thinking.trim().length > 0 && (
+          <div className="w-full mb-1.5">
+            <button
+              type="button"
+              onClick={() => setThinkingExpanded((v) => !v)}
+              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-border-subtle bg-surface text-[10px] font-medium text-text-dim hover:text-text hover:border-border transition-colors"
+            >
+              <Brain className="h-3 w-3" />
+              <span>{t("chat.thinking_label")}</span>
+              <ChevronDown
+                className={`h-3 w-3 transition-transform ${thinkingExpanded ? "rotate-180" : ""}`}
+              />
+            </button>
+            {thinkingExpanded && (
+              <div className="mt-1 px-3 py-2 rounded-lg border border-border-subtle bg-surface/50 text-[12px] leading-relaxed text-text-dim whitespace-pre-wrap break-words">
+                {message.thinking}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Tool calls — rendered above text for assistant messages */}
+        {!isUser && message.tools && message.tools.length > 0 && (
+          <div className="w-full mb-1">
+            {message.tools.map((tool, i) => (
+              <ToolCallCard key={tool._call_id ?? `${tool.name}-${i}`} tool={tool} />
+            ))}
+          </div>
+        )}
+
         {/* Message content */}
-        <div className={`relative px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm transition-colors ${
+        {(displayContent || isUser || message.isStreaming || message.error) && (
+        <div className={`relative px-3.5 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm min-w-0 [overflow-wrap:anywhere] ${
           isUser
-            ? "bg-gradient-to-br from-brand to-brand/90 text-white rounded-tr-md"
+            ? "bg-brand text-white rounded-tr-md"
             : message.error
               ? "bg-error/10 border border-error/20 text-error rounded-tl-md"
               : "bg-surface border border-border-subtle rounded-tl-md"
         }`}>
           {message.isStreaming ? (
-            message.content ? (
-              <Typewriter_v2 text={message.content} speed={10} />
+            displayContent ? (
+              <Typewriter_v2 text={displayContent} speed={10} />
             ) : (
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 py-0.5">
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
@@ -415,29 +714,82 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
               <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
               <span>{message.error}</span>
             </div>
+          ) : isUser ? (
+            // `break-words` only splits on spaces, so a bare URL/token
+            // long enough to overflow its parent used to push the whole
+            // 75%-wide bubble out of frame. `overflow-wrap: anywhere` is
+            // the standard safe-wrap value that only kicks in when the
+            // word would otherwise overflow, so normal text is untouched.
+            <p className="whitespace-pre-line [overflow-wrap:anywhere]">{displayContent}</p>
           ) : (
             <MarkdownContent
               remarkPlugins={[remarkMath]}
               rehypePlugins={[rehypeKatex]}
             >
-              {message.content}
+              {displayContent}
             </MarkdownContent>
           )}
         </div>
+        )}
 
-        {/* Meta info */}
-        <div className="flex items-center gap-2 mt-1.5 text-[10px] text-text-dim/50">
-          <span>{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-          {message.tokens?.output && !message.isStreaming && (
-            <span className="px-1.5 py-0.5 rounded bg-brand/10 text-brand/70 font-mono text-[9px]">
-              {message.tokens.output} tok
-            </span>
-          )}
-          {message.cost_usd !== undefined && message.cost_usd > 0 && (
-            <span className="px-1.5 py-0.5 rounded bg-success/10 text-success/70 font-mono text-[9px]">
-              {formatCost(message.cost_usd)}
-            </span>
-          )}
+        {/* Meta info + action buttons */}
+        <div className={`flex items-center justify-between w-full mt-1.5 ${isUser ? "flex-row-reverse" : ""}`}>
+          <div className="flex items-center gap-2 text-[10px] text-text-dim/50">
+            <span>{message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+            {!message.isStreaming && usageFooter !== "off" && (() => {
+              const showTokens = usageFooter === "full" || usageFooter === "tokens";
+              const showCost = (usageFooter === "full" || usageFooter === "cost") && message.cost_usd !== undefined && message.cost_usd > 0;
+              const hasInput = message.tokens?.input !== undefined && message.tokens.input > 0;
+              const hasOutput = message.tokens?.output !== undefined && message.tokens.output > 0;
+              if (!showTokens && !showCost) return null;
+              if (showTokens && !hasInput && !hasOutput && !showCost) return null;
+              const parts: string[] = [];
+              if (showTokens && (hasInput || hasOutput)) parts.push(`${message.tokens?.input ?? 0} in, ${message.tokens?.output ?? 0} out`);
+              if (showCost) parts.push(formatCost(message.cost_usd!));
+              if (parts.length === 0) return null;
+              return (
+                <span className="px-1.5 py-0.5 rounded bg-brand/10 text-brand/70 font-mono text-[9px]">
+                  {parts.join(" | ")}
+                </span>
+              );
+            })()}
+          </div>
+          <div className="flex items-center gap-1">
+            {!message.isStreaming && !message.error && message.role === "assistant" && ttsAvailable && onSpeak && (
+              <button
+                onClick={() => onSpeak(message.id, message.content)}
+                className="h-6 w-6 rounded-md flex items-center justify-center text-text-dim/60 hover:text-brand hover:bg-surface-hover transition-colors"
+                title={
+                  ttsStatus === "loading" ? t("chat.tts_generating") :
+                  isSpeaking && ttsStatus === "playing" ? t("chat.pause") :
+                  isSpeaking && ttsStatus === "paused" ? t("chat.resume") :
+                  t("chat.speak")
+                }
+                disabled={ttsStatus === "loading"}
+              >
+                {ttsStatus === "loading" && isSpeaking ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : isSpeaking && ttsStatus === "playing" ? (
+                  <Pause size={12} />
+                ) : (
+                  <Volume2 size={12} />
+                )}
+              </button>
+            )}
+            {!message.error && onCopy && (
+              <button
+                onClick={() => onCopy(message.id, message.content)}
+                className={`h-6 w-6 rounded-md flex items-center justify-center transition-colors ${
+                  copied
+                    ? "text-success"
+                    : "text-text-dim/60 hover:text-brand hover:bg-surface-hover"
+                }`}
+                title={copied ? t("chat.copied") : t("chat.copy")}
+              >
+                {copied ? <CheckCircle size={12} /> : <Copy size={12} />}
+              </button>
+            )}
+          </div>
         </div>
         {message.memories_saved && message.memories_saved.length > 0 && (
           <div className="mt-1 flex flex-wrap gap-1">
@@ -454,10 +806,91 @@ const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMe
 });
 
 // Input box - with shortcut hints
-function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; providerName?: string }) {
+function ChatInput({ onSend, disabled, placeholder, authMissing, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
   const { t } = useTranslation();
   const [message, setMessage] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const deepThinking = useUIStore((s) => s.deepThinking);
+  const showThinkingProcess = useUIStore((s) => s.showThinkingProcess);
+  const setDeepThinking = useUIStore((s) => s.setDeepThinking);
+  const setShowThinkingProcess = useUIStore((s) => s.setShowThinkingProcess);
+
+  const voiceInput = useVoiceInput(useCallback((text: string) => {
+    setMessage((prev) => (prev ? prev + " " + text : text));
+  }, []));
+
+  // ── Slash command completion ──────────────────────────────────────────────
+  const isSlashPrefix = message.startsWith("/") && !message.includes(" ");
+  const isModelArg = /^\/model\s/i.test(message);
+
+  const filteredCmds = useMemo(
+    () => isSlashPrefix ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(message.toLowerCase())) : [],
+    [isSlashPrefix, message],
+  );
+
+  const modelQuery = useQuery({
+    queryKey: ["models", "completion"],
+    queryFn: () => listModels(),
+    enabled: isModelArg,
+    staleTime: 60_000,
+  });
+
+  const modelArg = isModelArg ? message.slice(message.indexOf(" ") + 1).toLowerCase() : "";
+  const filteredModels = useMemo(() => {
+    if (!isModelArg || !modelQuery.data?.models) return [];
+    const all = modelQuery.data.models;
+    const q = modelArg.trim();
+    const matched = q
+      ? all.filter(m =>
+          m.id.toLowerCase().includes(q) ||
+          m.provider.toLowerCase().includes(q) ||
+          (m.display_name || "").toLowerCase().includes(q),
+        )
+      : all;
+    return matched.slice(0, 12);
+  }, [isModelArg, modelQuery.data, modelArg]);
+
+  const hasDropdown = (isSlashPrefix && filteredCmds.length > 0) || (isModelArg && filteredModels.length > 0);
+  const dropdownLen = isSlashPrefix ? filteredCmds.length : filteredModels.length;
+
+  // Reset selection when list changes
+  useEffect(() => { setActiveIndex(-1); }, [message]);
+
+  const selectCmd = useCallback((c: typeof SLASH_COMMANDS[number]) => {
+    if (c.noArgs) {
+      onSend(c.cmd);
+      setMessage("");
+    } else {
+      setMessage(c.cmd + " ");
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    }
+  }, [onSend]);
+
+  const selectModel = useCallback((m: ModelItem) => {
+    onSend(`/model ${m.provider}/${m.id}`);
+    setMessage("");
+  }, [onSend]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!hasDropdown) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex(i => Math.min(i + 1, dropdownLen - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex(i => Math.max(i - 1, 0));
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setMessage("");
+    } else if ((e.key === "Enter" || e.key === "Tab") && activeIndex >= 0) {
+      e.preventDefault();
+      if (isSlashPrefix) selectCmd(filteredCmds[activeIndex]);
+      else if (isModelArg) selectModel(filteredModels[activeIndex]);
+    }
+  }, [hasDropdown, dropdownLen, activeIndex, isSlashPrefix, isModelArg, filteredCmds, filteredModels, selectCmd, selectModel]);
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -474,9 +907,6 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
     }
   }, [message]);
 
-  const showingSlash = message.startsWith("/") && !message.includes(" ");
-  const filteredCmds = showingSlash ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(message)) : [];
-
   const effectiveDisabled = disabled || !!authMissing;
 
   return (
@@ -489,17 +919,64 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
         </div>
       )}
       {/* Slash command autocomplete */}
-      {showingSlash && filteredCmds.length > 0 && (
+      {isSlashPrefix && filteredCmds.length > 0 && (
         <div className="rounded-xl border border-border-subtle bg-surface shadow-lg p-1 mb-1">
-          {filteredCmds.map(c => (
+          {filteredCmds.map((c, i) => (
             <button key={c.cmd} type="button"
-              onClick={() => { setMessage(c.cmd); onSend(c.cmd); setMessage(""); }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-main text-left transition-colors">
+              onClick={() => selectCmd(c)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-left transition-colors ${i === activeIndex ? "bg-main" : "hover:bg-main"}`}>
               <span className="text-xs font-mono font-bold text-brand">{c.cmd}</span>
-              <span className="text-[10px] text-text-dim">{c.desc}</span>
+              {c.argsHint && <span className="text-[10px] font-mono text-text-dim/60">{c.argsHint}</span>}
+              <span className="text-[10px] text-text-dim ml-auto">{t(`chat.${c.descKey}`)}</span>
             </button>
           ))}
         </div>
+      )}
+      {/* /model second-level model completion */}
+      {isModelArg && filteredModels.length > 0 && (
+        <div className="rounded-xl border border-border-subtle bg-surface shadow-lg p-1 mb-1 max-h-48 overflow-y-auto">
+          {filteredModels.map((m, i) => (
+            <button key={`${m.provider}/${m.id}`} type="button"
+              onClick={() => selectModel(m)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-left transition-colors ${i === activeIndex ? "bg-main" : "hover:bg-main"}`}>
+              <span className="text-xs font-mono font-bold text-brand">{m.provider}</span>
+              <span className="text-xs font-mono text-text">/</span>
+              <span className="text-xs font-mono text-text">{m.id}</span>
+              {m.display_name && <span className="text-[10px] text-text-dim ml-auto truncate max-w-[120px]">{m.display_name}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+      {/* Thinking mode toggles — only shown when the model supports thinking */}
+      {supportsThinking && (
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={() => setDeepThinking(!deepThinking)}
+          title={t("chat.deep_thinking_hint")}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium transition-colors ${
+            deepThinking
+              ? "border-brand/40 bg-brand/10 text-brand"
+              : "border-border-subtle bg-surface text-text-dim hover:text-text hover:border-border"
+          }`}
+        >
+          <Brain className="h-3 w-3" />
+          <span>{t("chat.deep_thinking")}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowThinkingProcess(!showThinkingProcess)}
+          title={t("chat.show_thinking_hint")}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium transition-colors ${
+            showThinkingProcess
+              ? "border-brand/40 bg-brand/10 text-brand"
+              : "border-border-subtle bg-surface text-text-dim hover:text-text hover:border-border"
+          }`}
+        >
+          {showThinkingProcess ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+          <span>{t("chat.show_thinking")}</span>
+        </button>
+      </div>
       )}
       <div className="flex gap-2 sm:gap-3 items-end">
         <div className="flex-1">
@@ -508,17 +985,39 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             onKeyDown={(e) => {
+              // Dropdown navigation takes priority
+              if (hasDropdown) {
+                handleKeyDown(e);
+                if (e.defaultPrevented) return;
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey) {
                 e.preventDefault();
                 handleSubmit(e);
               }
             }}
-            placeholder={placeholder}
+            placeholder={voiceInput.isRecording ? t("chat.voice_recording") : voiceInput.isTranscribing ? t("chat.voice_transcribing") : placeholder}
             disabled={effectiveDisabled}
             rows={1}
             className="w-full min-h-[44px] sm:min-h-[52px] max-h-[150px] rounded-2xl border border-border-subtle bg-surface px-3 sm:px-5 py-2.5 sm:py-3.5 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none placeholder:text-text-dim/40 shadow-sm"
           />
         </div>
+        {voiceInput.isSupported && (
+          <button
+            type="button"
+            onClick={sttAvailable ? voiceInput.toggleRecording : undefined}
+            disabled={!sttAvailable || effectiveDisabled || voiceInput.isTranscribing}
+            title={!sttAvailable ? t("chat.voice_not_configured") : voiceInput.isRecording ? t("chat.voice_stop") : t("chat.voice_input")}
+            className={`group relative px-3 sm:px-3.5 py-2.5 sm:py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed ${
+              voiceInput.isRecording
+                ? "bg-error/10 text-error border border-error/30 animate-pulse"
+                : voiceInput.isTranscribing
+                  ? "bg-warning/10 text-warning border border-warning/30"
+                  : "bg-surface text-text-dim border border-border-subtle hover:text-text hover:border-border hover:-translate-y-0.5"
+            }`}
+          >
+            {voiceInput.isRecording ? <MicOff className="h-4 w-4" /> : voiceInput.isTranscribing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mic className="h-4 w-4" />}
+          </button>
+        )}
         <button
           type="submit"
           disabled={!message.trim() || effectiveDisabled}
@@ -534,9 +1033,130 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
   );
 }
 
-// Connection status bar
-function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnected, modelName }: { agentName: string; isLoading: boolean; messageCount: number; onClear: () => void; wsConnected?: boolean; modelName?: string }) {
+// Connection status bar with session dropdown
+function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, wsConnected, modelName, modelProvider, sessions, activeSessionId, onSwitchSession, onNewSession, onDeleteSession, agentId, onModelChange, webSearchAugmentation, onWebSearchChange, webSearchAvailable }: {
+  agentName: string; isLoading: boolean; messageCount: number; onClear: () => void; onExport: () => void; wsConnected?: boolean; modelName?: string; modelProvider?: string;
+  sessions?: SessionListItem[]; activeSessionId?: string;
+  onSwitchSession?: (sessionId: string) => void; onNewSession?: () => void; onDeleteSession?: (sessionId: string) => void;
+  agentId: string; onModelChange: () => void;
+  webSearchAugmentation?: "off" | "auto" | "always"; onWebSearchChange?: (mode: "off" | "auto" | "always") => void;
+  webSearchAvailable?: boolean;
+}) {
   const { t } = useTranslation();
+  const [sessionOpen, setSessionOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Model popover state
+  const [modelOpen, setModelOpen] = useState(false);
+  const modelRef = useRef<HTMLDivElement>(null);
+  const [models, setModels] = useState<ModelItem[]>([]);
+  const [modelSearch, setModelSearch] = useState("");
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelFetchError, setModelFetchError] = useState<string | null>(null);
+  const [patchError, setPatchError] = useState<string | null>(null);
+  const [patchPending, setPatchPending] = useState(false);
+  const [optimisticModel, setOptimisticModel] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<string>("");
+
+  const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
+  const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+
+  // Clear optimistic model once the real modelName catches up
+  useEffect(() => {
+    if (optimisticModel && modelName === optimisticModel) {
+      setOptimisticModel(null);
+    }
+  }, [modelName, optimisticModel]);
+
+  // Close session dropdown on outside click
+  useEffect(() => {
+    if (!sessionOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setSessionOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [sessionOpen]);
+
+  // Close model popover on outside click
+  useEffect(() => {
+    if (!modelOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (modelRef.current && !modelRef.current.contains(e.target as Node)) {
+        setModelOpen(false);
+        setSelectedProvider("");
+        setModelSearch("");
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [modelOpen]);
+
+  // Fetch available models lazily when popover first opens
+  useEffect(() => {
+    if (!modelOpen || models.length > 0 || modelLoading) return;
+    setModelLoading(true);
+    setModelFetchError(null);
+    listModels({ available: true })
+      .then(res => setModels(res.models))
+      .catch(() => setModelFetchError(t("chat.unable_to_load_models")))
+      .finally(() => setModelLoading(false));
+  }, [modelOpen, models.length, modelLoading]);
+
+  const visibleModels = useMemo(() => filterVisible(models, hiddenSet), [models, hiddenSet]);
+
+  // Unique providers derived from loaded models, sorted alphabetically
+  const providers = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const m of visibleModels) {
+      map.set(m.provider, (map.get(m.provider) ?? 0) + 1);
+    }
+    return Array.from(map.entries())
+      .map(([id, count]) => ({ id, count }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }, [visibleModels]);
+
+  // Models filtered by selected provider, then by search
+  const filteredModels = useMemo(() => {
+    let list = visibleModels;
+    if (selectedProvider) {
+      list = list.filter(m => m.provider === selectedProvider);
+    }
+    if (modelSearch) {
+      const q = modelSearch.toLowerCase();
+      list = list.filter(m => (m.id || "").toLowerCase().includes(q) || (m.display_name || "").toLowerCase().includes(q));
+    }
+    return list;
+  }, [visibleModels, selectedProvider, modelSearch]);
+
+  // Filter providers by search when in provider view
+  const filteredProviders = useMemo(() => {
+    if (!modelSearch) return providers;
+    const q = modelSearch.toLowerCase();
+    return providers.filter(p => p.id.toLowerCase().includes(q));
+  }, [providers, modelSearch]);
+
+  async function handleSelectModel(model: ModelItem) {
+    const prev = optimisticModel ?? modelName ?? null;
+    setOptimisticModel(model.id);
+    setPatchPending(true);
+    setPatchError(null);
+    try {
+      await patchAgentConfig(agentId, { model: model.id, provider: model.provider });
+      setModelOpen(false);
+      setSelectedProvider("");
+      setModelSearch("");
+      onModelChange(); // invalidates queries; useEffect clears optimisticModel when modelName catches up
+    } catch {
+      setOptimisticModel(prev);
+      setPatchError(t("chat.model_update_failed"));
+    } finally {
+      setPatchPending(false);
+    }
+  }
+
   return (
     <div className="px-2 sm:px-4 py-2 sm:py-2.5 border-b border-border-subtle/50 bg-gradient-to-r from-surface to-transparent flex items-center justify-between">
       <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
@@ -560,14 +1180,264 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, wsConnecte
         )}
       </div>
       <div className="flex items-center gap-2">
-        {modelName && (
-          <span className="hidden sm:inline text-[10px] text-text-dim/50 font-mono truncate max-w-[200px]">{modelName}</span>
+        {/* Model switcher */}
+        <div className="relative hidden sm:block" ref={modelRef}>
+          <button
+            onClick={() => { setModelOpen(v => { if (v) { setSelectedProvider(""); setModelSearch(""); } return !v; }); }}
+            className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono text-text-dim/50 hover:text-text hover:bg-surface-hover transition-colors truncate max-w-[200px]"
+            title={t("chat.switch_model")}
+          >
+            <span className="truncate">{optimisticModel ?? modelName ?? t("chat.no_model")}</span>
+            <ChevronDown className={`h-2.5 w-2.5 shrink-0 transition-transform ${modelOpen ? "rotate-180" : ""}`} />
+          </button>
+          {modelOpen && (
+            <div className="absolute right-0 top-full mt-1 w-80 bg-surface border border-border-subtle rounded-xl shadow-xl z-50 overflow-hidden">
+              {/* Header */}
+              <div className="p-2 border-b border-border-subtle/50 flex items-center gap-2">
+                {selectedProvider && (
+                  <button
+                    onClick={() => { setSelectedProvider(""); setModelSearch(""); }}
+                    className="p-0.5 rounded hover:bg-surface-hover transition-colors"
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5 text-text-dim" />
+                  </button>
+                )}
+                <span className="text-[10px] font-semibold text-text-dim/50 uppercase tracking-wider px-1">
+                  {selectedProvider || t("chat.select_provider", { defaultValue: "Select Provider" })}
+                </span>
+              </div>
+              {/* Search */}
+              <div className="p-2 border-b border-border-subtle/50">
+                <input
+                  autoFocus
+                  type="text"
+                  value={modelSearch}
+                  onChange={e => setModelSearch(e.target.value)}
+                  placeholder={selectedProvider ? t("chat.search_models") : t("chat.search_providers", { defaultValue: "Search providers..." })}
+                  className="w-full px-2.5 py-1.5 text-xs rounded-lg bg-main border border-border-subtle focus:outline-none focus:border-brand"
+                />
+                {patchError && (
+                  <p className="text-error text-[10px] mt-1.5 px-1">{patchError}</p>
+                )}
+              </div>
+              <div className={`max-h-64 overflow-y-auto scrollbar-thin p-1.5 space-y-0.5 ${patchPending ? "pointer-events-none opacity-60" : ""}`}>
+                {modelLoading && (
+                  <div className="flex items-center gap-2 px-2.5 py-2 text-xs text-text-dim">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    {t("chat.loading_models")}
+                  </div>
+                )}
+                {modelFetchError && (
+                  <div className="px-2.5 py-2 space-y-1.5">
+                    <p className="text-xs text-error">{modelFetchError}</p>
+                    <button
+                      onClick={() => { setModels([]); setModelFetchError(null); }}
+                      className="text-[10px] text-brand hover:underline"
+                    >
+                      {t("chat.retry")}
+                    </button>
+                  </div>
+                )}
+
+                {/* Provider list view */}
+                {!modelLoading && !modelFetchError && !selectedProvider && (() => {
+                  // Use the agent's known provider (from props) to highlight the current provider.
+                  // Falls back to scanning the model list only if the prop is unavailable.
+                  const agentProvider = modelProvider || models.find(m => m.id === (optimisticModel ?? modelName))?.provider;
+                  return (
+                  <>
+                    {filteredProviders.length === 0 && (
+                      <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
+                    )}
+                    {filteredProviders.map(p => {
+                      const isCurrent = p.id === agentProvider;
+                      return (
+                        <div
+                          key={p.id}
+                          onClick={() => { setSelectedProvider(p.id); setModelSearch(""); }}
+                          className={`flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isCurrent ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
+                        >
+                          <div className="flex items-center gap-2">
+                            {isCurrent && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />}
+                            <span className="text-xs font-medium">{p.id}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] text-text-dim/40">{p.count} {p.count === 1 ? "model" : "models"}</span>
+                            <ArrowRight className="h-3 w-3 text-text-dim/30" />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
+                  );
+                })()}
+
+                {/* Model list view (filtered by selected provider) */}
+                {!modelLoading && !modelFetchError && selectedProvider && (
+                  <>
+                    {filteredModels.length === 0 && (
+                      <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
+                    )}
+                    {filteredModels.map(model => {
+                      const isActive = model.id === (optimisticModel ?? modelName) && model.provider === selectedProvider;
+                      return (
+                        <div
+                          key={`${model.provider}/${model.id}`}
+                          onClick={() => { if (!isActive) handleSelectModel(model); }}
+                          className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isActive ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
+                        >
+                          {isActive && patchPending
+                            ? <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                            : isActive && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
+                          }
+                          <span className="text-xs font-medium truncate">{model.display_name || model.id}</span>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+        {/* Web Search toggle (off → auto → always → off) with config check */}
+        {onWebSearchChange && (() => {
+          const mode = webSearchAugmentation || "auto";
+          const isActive = mode !== "off";
+          const noKey = !webSearchAvailable;
+          return (
+            <div className="hidden sm:flex items-center gap-1.5">
+              <button
+                onClick={() => {
+                  if (noKey && mode === "off") {
+                    // No search key configured — navigate to Config page Web section
+                    window.location.href = "/dashboard/config";
+                    return;
+                  }
+                  const cycle: Record<string, "off" | "auto" | "always"> = { off: "auto", auto: "always", always: "off" };
+                  onWebSearchChange(cycle[mode] || "auto");
+                }}
+                title={noKey ? t("chat.web_search_no_key", { defaultValue: "No search API key configured. Click to open settings." }) : undefined}
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono transition-colors ${
+                  noKey && !isActive
+                    ? "text-warning/50 hover:text-warning hover:bg-warning/10"
+                    : mode === "always"
+                      ? "text-brand bg-brand/10 hover:bg-brand/20"
+                      : mode === "auto"
+                        ? "text-text-dim/50 hover:text-text hover:bg-surface-hover"
+                        : "text-text-dim/30 hover:text-text-dim/60 hover:bg-surface-hover"
+                }`}
+              >
+                <Globe className="h-3 w-3" />
+                <span>{noKey && !isActive
+                  ? t("chat.web_search_setup", { defaultValue: "Search" })
+                  : mode === "always" ? t("common.always", { defaultValue: "Always" }) : mode === "auto" ? t("common.auto", { defaultValue: "Auto" }) : t("common.off", { defaultValue: "Off" })
+                }</span>
+                {noKey && !isActive && <AlertCircle className="h-2.5 w-2.5 text-warning" />}
+              </button>
+              {isActive && noKey && (
+                <button
+                  onClick={() => { window.location.href = "/dashboard/config"; }}
+                  className="text-[9px] text-warning hover:text-warning/80 underline hidden xl:inline"
+                >
+                  {t("chat.web_search_configure", { defaultValue: "Configure API key" })}
+                </button>
+              )}
+            </div>
+          );
+        })()}
+        {/* Session dropdown */}
+        {sessions && sessions.length > 0 && (
+          <div className="relative" ref={dropdownRef}>
+            <button
+              onClick={() => setSessionOpen(v => !v)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-text-dim/70 hover:text-text hover:bg-surface-hover transition-colors"
+            >
+              <Clock className="h-3 w-3" />
+              <span className="hidden sm:inline truncate max-w-[100px]">
+                {(() => {
+                  const active = sessions.find(s => s.session_id === activeSessionId);
+                  return active?.label || activeSessionId?.slice(0, 8) || t("chat.session");
+                })()}
+              </span>
+              <ChevronDown className={`h-3 w-3 transition-transform ${sessionOpen ? "rotate-180" : ""}`} />
+            </button>
+            {sessionOpen && (
+              <div className="absolute right-0 top-full mt-1 w-72 bg-surface border border-border-subtle rounded-xl shadow-xl z-50 overflow-hidden">
+                <div className="p-2 border-b border-border-subtle/50">
+                  <span className="text-[10px] font-semibold text-text-dim/50 uppercase tracking-wider px-2">{t("chat.sessions_title", { defaultValue: "Sessions" })}</span>
+                </div>
+                <div className="max-h-64 overflow-y-auto scrollbar-thin p-1.5 space-y-0.5">
+                  {sessions.map(session => {
+                    const isActive = session.session_id === activeSessionId;
+                    return (
+                      <div
+                        key={session.session_id}
+                        className={`group flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isActive ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
+                        onClick={() => {
+                          if (!isActive) {
+                            onSwitchSession?.(session.session_id);
+                            setSessionOpen(false);
+                          }
+                        }}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            {isActive && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />}
+                            <span className="text-xs font-medium truncate">
+                              {session.label || session.session_id?.slice(0, 12)}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <span className="text-[10px] text-text-dim/50">{session.message_count ?? 0} msgs</span>
+                            {session.created_at && (
+                              <span className="text-[10px] text-text-dim/40">{new Date(session.created_at).toLocaleDateString()}</span>
+                            )}
+                          </div>
+                        </div>
+                        {!isActive && onDeleteSession && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); onDeleteSession(session.session_id); }}
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-error/10 hover:text-error transition-all"
+                            title={t("chat.delete_session", { defaultValue: "Delete session" })}
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {onNewSession && (
+                  <div className="p-1.5 border-t border-border-subtle/50">
+                    <button
+                      onClick={() => { onNewSession(); setSessionOpen(false); }}
+                      className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium text-brand hover:bg-brand/5 transition-colors"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      {t("chat.new_session", { defaultValue: "New session" })}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
         {messageCount > 0 && (
-          <button onClick={onClear} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-text-dim/60 hover:text-error hover:bg-error/5 transition-colors">
-            <X className="h-3 w-3" />
-            {t("chat.clear_chat")}
-          </button>
+          <>
+            <button
+              onClick={onExport}
+              title={t("chat.export_markdown", { defaultValue: "Export as Markdown" })}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-text-dim/60 hover:text-brand hover:bg-brand/5 transition-colors"
+            >
+              <Download className="h-3 w-3" />
+              <span className="hidden sm:inline">{t("chat.export", { defaultValue: "Export" })}</span>
+            </button>
+            <button onClick={onClear} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-text-dim/60 hover:text-error hover:bg-error/5 transition-colors">
+              <X className="h-3 w-3" />
+              {t("chat.clear_chat")}
+            </button>
+          </>
         )}
       </div>
     </div>
@@ -699,6 +1569,8 @@ export function ChatPage() {
   const initialAgentId = search?.agentId || "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const addToast = useUIStore((s) => s.addToast);
 
   // Sync agent selection to URL search params
   const selectAgent = useCallback((id: string) => {
@@ -706,20 +1578,221 @@ export function ChatPage() {
     navigate({ to: "/chat", search: { agentId: id }, replace: true });
   }, [navigate]);
 
-  const agentsQuery = useQuery({ queryKey: ["agents", "list", "chat"], queryFn: listAgents, staleTime: 30000 });
-  const agents = useMemo(() => [...(agentsQuery.data ?? [])].filter(a => !a.name.endsWith("-hand")).sort((a, b) => {
-    // Auth missing → sort to bottom
-    const aNoAuth = isAuthUnavailable(a.auth_status) ? 1 : 0;
-    const bNoAuth = isAuthUnavailable(b.auth_status) ? 1 : 0;
-    if (aNoAuth !== bNoAuth) return aNoAuth - bNoAuth;
-    const aSusp = (a.state || "").toLowerCase() === "suspended" ? 1 : 0;
-    const bSusp = (b.state || "").toLowerCase() === "suspended" ? 1 : 0;
-    if (aSusp !== bSusp) return aSusp - bSusp;
-    return a.name.localeCompare(b.name);
-  }), [agentsQuery.data]);
-  const { messages, isLoading, sendMessage, clearHistory, wsConnected } = useChatMessages(selectedAgentId || null, agents);
+  // Check TTS provider availability
+  const mediaProvidersQuery = useQuery({
+    queryKey: ["media-providers"],
+    queryFn: listMediaProviders,
+    staleTime: 60000,
+  });
+  const ttsAvailable = useMemo(
+    () => (mediaProvidersQuery.data ?? []).some(p => p.configured && p.capabilities.includes("text_to_speech")),
+    [mediaProvidersQuery.data],
+  );
+
+  const handleCopy = useCallback(async (messageId: string, content: string) => {
+    if (await copyToClipboard(content)) {
+      setCopiedMessageId(messageId);
+      setTimeout(() => setCopiedMessageId(null), 1500);
+    } else {
+      addToast(t("common.copy_failed"), "error");
+    }
+  }, [addToast, t]);
+
+  const configQuery = useQuery({ queryKey: ["config"], queryFn: getFullConfig, staleTime: 60000 });
+  const usageFooter = (configQuery.data as Record<string, unknown>)?.usage_footer as string | undefined ?? "full";
+  const mediaConfigRaw = (configQuery.data as Record<string, unknown>)?.media as Record<string, unknown> | undefined;
+  const sttAvailable = mediaConfigRaw?.stt_available === true;
+  const ttsConfigRaw = (configQuery.data as Record<string, unknown>)?.tts as Record<string, unknown> | undefined;
+  const ttsProvider = ttsConfigRaw?.provider as string | undefined;
+  const ttsSpeechConfig = useMemo(() => {
+    if (!ttsConfigRaw || !ttsProvider) return undefined;
+    const subKey = ttsProvider === "google_tts" ? "google" : ttsProvider;
+    const sub = ttsConfigRaw[subKey] as Record<string, unknown> | undefined;
+    if (!sub) return { provider: ttsProvider };
+    switch (ttsProvider) {
+      case "google_tts":
+        return {
+          provider: ttsProvider,
+          voice: sub.voice as string | undefined,
+          language: sub.language_code as string | undefined,
+          speed: sub.speaking_rate as number | undefined,
+        };
+      case "openai":
+        return {
+          provider: ttsProvider,
+          voice: sub.voice as string | undefined,
+          speed: sub.speed as number | undefined,
+        };
+      case "elevenlabs":
+        return {
+          provider: ttsProvider,
+          voice: sub.voice_id as string | undefined,
+        };
+      default:
+        return { provider: ttsProvider, voice: sub.voice as string | undefined };
+    }
+  }, [ttsConfigRaw, ttsProvider]);
+  const tts = useTtsManager(ttsSpeechConfig);
+
+  // Stop TTS when agent changes
+  useEffect(() => {
+    tts.stop();
+  }, [selectedAgentId, tts.stop]);
+
+  const [showHandAgents, setShowHandAgents] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("librefang.chat.show_hand_agents") === "1";
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(
+      "librefang.chat.show_hand_agents",
+      showHandAgents ? "1" : "0",
+    );
+  }, [showHandAgents]);
+
+  const agentsQuery = useQuery({
+    queryKey: ["agents", "list", "chat", showHandAgents],
+    queryFn: () => listAgents({ includeHands: showHandAgents }),
+    staleTime: 30000,
+  });
+  // Check if web search is available (any search API key configured)
+  const webSearchAvailable = ((configQuery.data as any)?.web?.search_available === true);
+  const handsQuery = useQuery({
+    queryKey: ["hands", "active", "chat"],
+    queryFn: listActiveHands,
+    enabled: showHandAgents,
+    staleTime: 30000,
+    refetchInterval: 30000,
+  });
+
+  const sortedAgents = useMemo(
+    () =>
+      [...(agentsQuery.data ?? [])].sort((a, b) => {
+        // Auth missing → sort to bottom
+        const aNoAuth = isAuthUnavailable(a.auth_status) ? 1 : 0;
+        const bNoAuth = isAuthUnavailable(b.auth_status) ? 1 : 0;
+        if (aNoAuth !== bNoAuth) return aNoAuth - bNoAuth;
+        const aSusp = (a.state || "").toLowerCase() === "suspended" ? 1 : 0;
+        const bSusp = (b.state || "").toLowerCase() === "suspended" ? 1 : 0;
+        if (aSusp !== bSusp) return aSusp - bSusp;
+        return a.name.localeCompare(b.name);
+      }),
+    [agentsQuery.data],
+  );
+
+  const picker = useMemo(
+    () =>
+      groupedPicker(sortedAgents, handsQuery.data, showHandAgents),
+    [sortedAgents, handsQuery.data, showHandAgents],
+  );
+
+  // Flat view used by downstream consumers (default-selection logic,
+  // selectedAgent lookup, export). Standalone first, then groups in order.
+  const agents = useMemo(
+    () => [
+      ...picker.standalone,
+      ...picker.handGroups.flatMap((g) => g.agents),
+    ],
+    [picker],
+  );
+  // Session state — bump version to force message reload after switch
+  const [sessionVersion, setSessionVersion] = useState(0);
+  const { messages, isLoading, sendMessage, clearHistory, wsConnected } = useChatMessages(
+    selectedAgentId || null,
+    agents,
+    sessionVersion,
+    () => queryClient.invalidateQueries({ queryKey: ["agents", "list"] }),
+  );
+
+  // Export current conversation as a markdown file. Keeps the local
+  // timestamp, role, content, and (when present) tool call summaries
+  // so operators can archive or share transcripts.
+  const handleExport = useCallback(() => {
+    if (messages.length === 0) return;
+    const agentName = agents.find(a => a.id === selectedAgentId)?.name ?? selectedAgentId;
+    const lines: string[] = [
+      `# Conversation with ${agentName}`,
+      "",
+      `_Exported: ${new Date().toISOString()}_`,
+      `_${messages.length} messages_`,
+      "",
+      "---",
+      "",
+    ];
+    for (const m of messages) {
+      const ts = m.timestamp instanceof Date ? m.timestamp.toISOString() : new Date(m.timestamp as any).toISOString();
+      const role = m.role === "assistant" ? agentName : m.role;
+      lines.push(`### ${role} · ${ts}`);
+      lines.push("");
+      if (m.content) {
+        lines.push(m.content);
+        lines.push("");
+      }
+      if (m.tools && m.tools.length > 0) {
+        lines.push(`_Tools: ${m.tools.map(t => t.name).join(", ")}_`);
+        lines.push("");
+      }
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const date = new Date().toISOString().slice(0, 10);
+    a.download = `chat-${agentName.replace(/[^a-zA-Z0-9-_]/g, "_")}-${date}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [messages, agents, selectedAgentId]);
   const { pendingApprovals, removeApproval } = useApprovalPoller(selectedAgentId || null);
   const selectedAgent = agents.find(a => a.id === selectedAgentId);
+
+  // Per-agent session list
+  const sessionsQuery = useQuery({
+    queryKey: ["agent-sessions", selectedAgentId],
+    queryFn: () => listAgentSessions(selectedAgentId!),
+    enabled: !!selectedAgentId,
+    staleTime: 10_000,
+  });
+  const activeSessionId = useMemo(() => {
+    const active = sessionsQuery.data?.find((s: any) => s.active);
+    return active?.session_id;
+  }, [sessionsQuery.data]);
+
+  const handleSwitchSession = useCallback(async (sessionId: string) => {
+    if (!selectedAgentId) return;
+    await switchAgentSession(selectedAgentId, sessionId);
+    queryClient.invalidateQueries({ queryKey: ["agents"] });
+    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    setSessionVersion(v => v + 1);
+  }, [selectedAgentId, queryClient]);
+
+  const handleNewSession = useCallback(async () => {
+    if (!selectedAgentId) return;
+    const result = await createAgentSession(selectedAgentId);
+    await switchAgentSession(selectedAgentId, result.session_id);
+    queryClient.invalidateQueries({ queryKey: ["agents"] });
+    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    setSessionVersion(v => v + 1);
+  }, [selectedAgentId, queryClient]);
+
+  const handleDeleteSession = useCallback(async (sessionId: string) => {
+    await deleteSession(sessionId);
+    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+  }, [selectedAgentId, queryClient]);
+
+  // If the current selection is no longer visible (e.g. hand agents toggled
+  // off while a hand-spawned agent was selected), clear it so the auto-select
+  // effect below picks a new one instead of leaving the chat pane in a broken
+  // state with selectedAgent === undefined.
+  useEffect(() => {
+    if (!selectedAgentId) return;
+    if (agentsQuery.data === undefined) return;
+    if (!agents.some(a => a.id === selectedAgentId)) {
+      setSelectedAgentId("");
+    }
+  }, [agents, selectedAgentId, agentsQuery.data]);
 
   useEffect(() => {
     // Auto-select first running agent
@@ -740,6 +1813,56 @@ export function ChatPage() {
     }
     prevMsgCountRef.current = messages.length;
   }, [messages]);
+
+  const renderAgentButton = (
+    agent: AgentItem,
+    role?: string,
+    isCoordinator?: boolean,
+  ) => (
+    <button
+      key={agent.id}
+      onClick={() => selectAgent(agent.id)}
+      className={`w-full flex items-center gap-3 p-3 rounded-xl transition-colors text-left group ${
+        selectedAgentId === agent.id
+          ? "bg-brand text-white shadow-lg shadow-brand/20"
+          : "hover:bg-surface-hover"
+      }`}
+    >
+      <div className={`relative h-10 w-10 rounded-xl flex items-center justify-center font-black text-lg ${
+        selectedAgentId === agent.id ? "bg-white/20"
+        : (agent.state || "").toLowerCase() === "running" ? "bg-gradient-to-br from-brand/20 to-accent/20 text-brand"
+        : "bg-main text-text-dim/40"
+      }`}>
+        {t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name }).charAt(0).toUpperCase()}
+        {(agent.state || "").toLowerCase() === "running" ? (
+          <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-success border-2 border-white dark:border-surface animate-pulse" />
+        ) : (
+          <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-text-dim/30 border-2 border-white dark:border-surface" />
+        )}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <p className={`text-sm font-bold truncate ${(agent.state || "").toLowerCase() !== "running" ? "opacity-50" : ""}`}>
+            {role ?? t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })}
+          </p>
+          {(agent.auth_status === "configured" || agent.auth_status === "validated_key") && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-brand/10 text-brand"}`}>KEY</span>}
+          {agent.auth_status === "configured_cli" && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-accent/10 text-accent"}`}>CLI</span>}
+          {agent.auth_status === "auto_detected" && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-warning/10 text-warning"}`}>AUTO</span>}
+          {isAuthUnavailable(agent.auth_status) && <AlertCircle className="h-3 w-3 text-warning flex-shrink-0" />}
+        </div>
+        {isCoordinator ? (
+          <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
+            {t("chat.hand_coordinator", { defaultValue: "coordinator" })}
+          </p>
+        ) : (
+          <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
+            {agent.model_provider || t("common.unknown")}
+          </p>
+        )}
+      </div>
+      <ArrowRight className={`h-4 w-4 flex-shrink-0 transition-transform ${selectedAgentId === agent.id ? "rotate-90" : "opacity-0 group-hover:opacity-100"}`} />
+    </button>
+  );
 
   return (
     <div className="flex h-[calc(100vh-100px)] sm:h-[calc(100vh-140px)] flex-col">
@@ -767,49 +1890,47 @@ export function ChatPage() {
       <div className="flex flex-1 overflow-hidden rounded-2xl border border-border-subtle bg-surface shadow-xl ring-1 ring-black/5 dark:ring-white/5">
         {/* Left sidebar - Agent list */}
         <aside className="hidden md:flex w-64 flex-shrink-0 border-r border-border-subtle bg-main flex-col">
-          <div className="p-4 border-b border-border-subtle">
+          <div className="p-4 border-b border-border-subtle space-y-2">
             <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60">{t("nav.agents")}</h3>
+            <button
+              onClick={() => setShowHandAgents((value) => !value)}
+              aria-pressed={showHandAgents}
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-bold transition-colors ${
+                showHandAgents
+                  ? "border-brand/30 bg-brand/10 text-brand"
+                  : "border-border-subtle bg-surface text-text-dim hover:border-brand/20 hover:text-brand"
+              }`}
+            >
+              <span>{t("agents.show_hand_agents", { defaultValue: "Show hand agents" })}</span>
+            </button>
           </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-2 scrollbar-thin">
-            {agents.length === 0 ? (
+            {picker.standalone.length === 0 && picker.handGroups.length === 0 ? (
               <div className="p-4 text-center text-text-dim text-sm">{t("common.no_data")}</div>
             ) : (
-              agents.map(agent => (
-                <button
-                  key={agent.id}
-                  onClick={() => selectAgent(agent.id)}
-                  className={`w-full flex items-center gap-3 p-3 rounded-xl transition-colors text-left group ${
-                    selectedAgentId === agent.id
-                      ? "bg-brand text-white shadow-lg shadow-brand/20"
-                      : "hover:bg-surface-hover"
-                  }`}
-                >
-                  <div className={`relative h-10 w-10 rounded-xl flex items-center justify-center font-black text-lg ${
-                    selectedAgentId === agent.id ? "bg-white/20"
-                    : (agent.state || "").toLowerCase() === "running" ? "bg-gradient-to-br from-brand/20 to-accent/20 text-brand"
-                    : "bg-main text-text-dim/40"
-                  }`}>
-                    {agent.name.charAt(0).toUpperCase()}
-                    {(agent.state || "").toLowerCase() === "running" ? (
-                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-success border-2 border-white dark:border-surface animate-pulse" />
-                    ) : (
-                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-text-dim/30 border-2 border-white dark:border-surface" />
+              <>
+                {picker.standalone.length > 0 && (
+                  <div className="space-y-2">
+                    {picker.handGroups.length > 0 && (
+                      <h4 className="px-1 pt-1 text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60">
+                        {t("chat.group_standalone", { defaultValue: "Standalone" })}
+                      </h4>
+                    )}
+                    {picker.standalone.map((agent) => renderAgentButton(agent))}
+                  </div>
+                )}
+                {picker.handGroups.map((group) => (
+                  <div key={group.hand_id} className="space-y-2 pt-3">
+                    <h4 className="px-1 text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60 flex items-center gap-1.5">
+                      {group.hand_icon && <span aria-hidden="true">{group.hand_icon}</span>}
+                      <span>{group.hand_name}</span>
+                    </h4>
+                    {group.agents.map((agent) =>
+                      renderAgentButton(agent, agent.role, agent.isCoordinator),
                     )}
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <p className={`text-sm font-bold truncate ${(agent.state || "").toLowerCase() !== "running" ? "opacity-50" : ""}`}>{agent.name}</p>
-                      {agent.auth_status === "configured" && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-brand/10 text-brand"}`}>KEY</span>}
-                      {agent.auth_status === "configured_cli" && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-accent/10 text-accent"}`}>CLI</span>}
-                      {isAuthUnavailable(agent.auth_status) && <AlertCircle className="h-3 w-3 text-warning flex-shrink-0" />}
-                    </div>
-                    <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
-                      {agent.model_provider || t("common.unknown")}
-                    </p>
-                  </div>
-                  <ArrowRight className={`h-4 w-4 flex-shrink-0 transition-transform ${selectedAgentId === agent.id ? "rotate-90" : "opacity-0 group-hover:opacity-100"}`} />
-                </button>
-              ))
+                ))}
+              </>
             )}
           </div>
         </aside>
@@ -830,10 +1951,25 @@ export function ChatPage() {
               className="w-full rounded-lg border border-border-subtle bg-main px-3 py-2 text-sm font-bold outline-none focus:border-brand"
             >
               <option value="">{t("chat.select_agent")}</option>
-              {agents.map(agent => (
+              {picker.standalone.map((agent) => (
                 <option key={agent.id} value={agent.id}>
-                  {agent.name} ({agent.state || "unknown"})
+                  {t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })} ({agent.state || "unknown"})
                 </option>
+              ))}
+              {picker.handGroups.map((group) => (
+                <optgroup
+                  key={group.hand_id}
+                  label={`${group.hand_icon ?? ""} ${group.hand_name}`.trim()}
+                >
+                  {group.agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.role}
+                      {agent.isCoordinator
+                        ? ` (${t("chat.hand_coordinator", { defaultValue: "coordinator" })})`
+                        : ""}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
           </div>
@@ -844,13 +1980,32 @@ export function ChatPage() {
               isLoading={isLoading}
               messageCount={messages.length}
               onClear={clearHistory}
+              onExport={handleExport}
               wsConnected={wsConnected}
               modelName={selectedAgent?.model_name}
+              modelProvider={selectedAgent?.model_provider}
+              sessions={sessionsQuery.data}
+              activeSessionId={activeSessionId}
+              onSwitchSession={handleSwitchSession}
+              onNewSession={handleNewSession}
+              onDeleteSession={handleDeleteSession}
+              agentId={selectedAgentId}
+              onModelChange={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
+              webSearchAugmentation={selectedAgent?.web_search_augmentation}
+              webSearchAvailable={webSearchAvailable}
+              onWebSearchChange={async (mode) => {
+                try {
+                  await patchAgentConfig(selectedAgentId, { web_search_augmentation: mode });
+                  queryClient.invalidateQueries({ queryKey: ["agents", "list"] });
+                  queryClient.invalidateQueries({ queryKey: ["dashboard", "snapshot"] });
+                } catch {}
+              }}
             />
           )}
 
           {/* Message area */}
-          <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 sm:space-y-6 scrollbar-thin">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6 scrollbar-thin">
+            <div className="w-full space-y-4 sm:space-y-6">
             {!selectedAgentId ? (
               <div className="h-full flex flex-col items-center justify-center text-center relative">
                 <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-main/50" />
@@ -873,7 +2028,19 @@ export function ChatPage() {
               </div>
             ) : (
               <div className="space-y-6">
-                {messages.map(msg => <MessageBubble key={msg.id} message={msg} />)}
+                {messages.map(msg => (
+                  <MessageBubble
+                    key={msg.id}
+                    message={msg}
+                    usageFooter={usageFooter}
+                    onCopy={handleCopy}
+                    copied={copiedMessageId === msg.id}
+                    onSpeak={ttsAvailable ? tts.toggle : undefined}
+                    isSpeaking={tts.speakingMessageId === msg.id}
+                    ttsStatus={tts.speakingMessageId === msg.id ? tts.status : "idle"}
+                    ttsAvailable={ttsAvailable}
+                  />
+                ))}
                 {/* Inline approval cards for pending requests */}
                 {pendingApprovals.map(approval => (
                   <ApprovalCard key={approval.id} approval={approval} onResolved={removeApproval} />
@@ -881,6 +2048,7 @@ export function ChatPage() {
                 <div ref={messagesEndRef} />
               </div>
             )}
+            </div>
           </div>
 
           {/* Input area */}
@@ -888,9 +2056,11 @@ export function ChatPage() {
             <ChatInput
               onSend={sendMessage}
               disabled={isLoading}
-              placeholder={selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
+              placeholder={isLoading ? t("chat.generating") : selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
               authMissing={isAuthUnavailable(selectedAgent?.auth_status)}
               providerName={selectedAgent?.model_provider}
+              supportsThinking={selectedAgent?.supports_thinking}
+              sttAvailable={sttAvailable}
             />
           </div>
         </main>

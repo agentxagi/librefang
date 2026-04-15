@@ -201,8 +201,9 @@ shared_secret = ""                    # Required when network_enabled = true
 
 # --- Web Tools ---
 [web]
-search_provider = "auto"              # auto | brave | tavily | perplexity | duckduckgo
+search_provider = "auto"              # auto | brave | jina | tavily | perplexity | duckduckgo
 cache_ttl_minutes = 15
+timeout_secs = 15
 
 [web.brave]
 api_key_env = "BRAVE_API_KEY"
@@ -216,6 +217,10 @@ api_key_env = "TAVILY_API_KEY"
 search_depth = "basic"                # basic | advanced
 max_results = 5
 include_answer = true
+
+[web.jina]
+api_key_env = "JINA_API_KEY"
+max_results = 5
 
 [web.perplexity]
 api_key_env = "PERPLEXITY_API_KEY"
@@ -579,19 +584,22 @@ Configures web search and web fetch capabilities used by agent tools.
 [web]
 search_provider = "auto"
 cache_ttl_minutes = 15
+timeout_secs = 15
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `search_provider` | string | `"auto"` | Which search engine to use. See values below. |
 | `cache_ttl_minutes` | u64 | `15` | Cache duration for search/fetch results in minutes. `0` = caching disabled. |
+| `timeout_secs` | u64 | `15` | HTTP timeout in seconds for all web search requests. Recommended: 15 for most providers, 30+ for Jina. |
 
 **`search_provider` values:**
 
 | Value | Description |
 |-------|-------------|
-| `auto` | Cascading fallback: tries Tavily, then Brave, then Perplexity, then DuckDuckGo, based on which API keys are available. |
+| `auto` | Cascading fallback: tries Tavily, then Brave, then Jina, then Perplexity, then DuckDuckGo, based on which API keys are available. |
 | `brave` | Brave Search API. Requires `BRAVE_API_KEY`. |
+| `jina` | Jina AI search and grounding. Requires `JINA_API_KEY`. |
 | `tavily` | Tavily AI-native search. Requires `TAVILY_API_KEY`. |
 | `perplexity` | Perplexity AI search. Requires `PERPLEXITY_API_KEY`. |
 | `duckduckgo` | DuckDuckGo HTML scraping. No API key needed. |
@@ -632,6 +640,19 @@ include_answer = true
 | `max_results` | usize | `5` | Maximum number of search results to return. |
 | `include_answer` | bool | `true` | Whether to include Tavily's AI-generated answer summary in results. |
 
+#### `[web.jina]`
+
+```toml
+[web.jina]
+api_key_env = "JINA_API_KEY"
+max_results = 5
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `api_key_env` | string | `"JINA_API_KEY"` | Environment variable name holding the Jina AI API key. |
+| `max_results` | usize | `5` | Maximum number of search results to return. |
+
 #### `[web.perplexity]`
 
 ```toml
@@ -653,6 +674,14 @@ max_chars = 50000
 max_response_bytes = 10485760
 timeout_secs = 30
 readability = true
+
+# Optional: allow agents to reach internal services (self-hosted / K8s).
+# Cloud metadata endpoints (169.254.x.x, 100.64.x.x) remain blocked unconditionally.
+# ssrf_allowed_hosts = [
+#   "10.0.0.0/8",                # CIDR — entire private subnet
+#   "*.internal.example.com",    # glob — all subdomains
+#   "svc.cluster.local",         # literal hostname
+# ]
 ```
 
 | Field | Type | Default | Description |
@@ -661,6 +690,7 @@ readability = true
 | `max_response_bytes` | usize | `10485760` (10 MB) | Maximum HTTP response body size in bytes. |
 | `timeout_secs` | u64 | `30` | HTTP request timeout in seconds. |
 | `readability` | bool | `true` | Enable HTML-to-Markdown readability extraction. When true, fetched HTML is converted to clean Markdown. |
+| `ssrf_allowed_hosts` | list of strings | `[]` | Hosts/CIDRs exempt from SSRF blocking. Supports CIDR notation (`"10.0.0.0/8"`), glob prefix patterns (`"*.internal.example.com"`), and literal IPs or hostnames. Cloud metadata ranges (`169.254.0.0/16`, `100.64.0.0/10`) are **always blocked** regardless of this list. |
 
 ---
 
@@ -737,7 +767,7 @@ poll_interval_secs = 1
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `bot_token_env` | string | `"TELEGRAM_BOT_TOKEN"` | Env var holding the Telegram Bot API token. |
-| `allowed_users` | list of i64 | `[]` | Telegram user IDs allowed to interact. Empty = allow all. |
+| `allowed_users` | list of strings | `[]` | Telegram user IDs or usernames allowed to interact. Accepts numeric user IDs (`"123456789"`), usernames (`"alice"`), or usernames with `@` (`"@alice"`). Case-insensitive. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 | `poll_interval_secs` | u64 | `1` | Long-polling interval in seconds. |
 | `account_id` | string or null | `null` | Unique bot instance identifier for multi-bot routing. |
@@ -1682,6 +1712,9 @@ threading = true
 output_format = "telegram_html"
 usage_footer = "tokens"
 typing_mode = "instant"
+disable_commands = false
+allowed_commands = []
+blocked_commands = []
 ```
 
 | Field | Type | Default | Description |
@@ -1696,6 +1729,9 @@ typing_mode = "instant"
 | `output_format` | string or null | `null` | Override output formatting. See below. |
 | `usage_footer` | string or null | `null` | Override usage footer mode for this channel. Values: `off`, `tokens`, `cost`, `full`. |
 | `typing_mode` | string or null | `null` | Typing indicator behavior. See below. Defaults to `instant`. |
+| `disable_commands` | bool | `false` | Disable all built-in slash commands on this channel. Blocked commands are forwarded to the agent as plain text. |
+| `allowed_commands` | list of strings | `[]` | Whitelist of command names (no leading `/`). When non-empty, only these are allowed; others are forwarded to the agent. |
+| `blocked_commands` | list of strings | `[]` | Blacklist of command names (no leading `/`). Applied when `allowed_commands` is empty. |
 
 **`dm_policy` values:**
 
@@ -2541,6 +2577,7 @@ engine = "default"
 [context_engine.hooks]
 # ingest = "~/.librefang/scripts/my_recall.py"
 # after_turn = "~/.librefang/scripts/my_indexer.py"
+# runtime = "python"   # python (default) | native | v | node | deno | go | ruby | bash | bun | php | lua
 
 [[context_engine.plugin_registries]]
 name = "Official"
@@ -2551,9 +2588,59 @@ github_repo = "librefang/librefang-registry"
 |-------|------|---------|-------------|
 | `engine` | string | `"default"` | Built-in engine name. Currently only `"default"` is supported. |
 | `plugin` | string or null | `null` | Plugin name. Resolves to `~/.librefang/plugins/<name>/plugin.toml`. Takes precedence over manual `hooks` if set. |
-| `hooks.ingest` | string or null | `null` | Python script path for the `ingest` hook (called on new user message). |
-| `hooks.after_turn` | string or null | `null` | Python script path for the `after_turn` hook (called after each completed turn). |
+| `hooks.ingest` | string or null | `null` | Script path for the `ingest` hook (called on new user message). |
+| `hooks.after_turn` | string or null | `null` | Script path for the `after_turn` hook (called after each completed turn). |
+| `hooks.runtime` | string or null | `"python"` | Which launcher runs the hook scripts. Supported: `python`, `native` (exec a pre-compiled binary), `v`, `node`, `deno`, `go`, `ruby`, `bash`, `bun`, `php`, `lua`. Unknown values fall back to `python` with a warning. |
 | `plugin_registries` | list of objects | Official registry | Plugin registries (GitHub `owner/repo`) to browse for installable plugins. |
+
+Hooks speak a language-agnostic JSON-over-stdin/stdout protocol — pick the runtime that matches your script:
+
+```toml
+# Go plugin
+[context_engine.hooks]
+ingest = "~/.librefang/plugins/my-go-recall/hooks/ingest.go"
+runtime = "go"
+
+# V plugin compiled to a native binary
+[context_engine.hooks]
+ingest = "~/.librefang/plugins/fast-recall/hooks/ingest"
+runtime = "native"
+```
+
+#### Checking runtime availability
+
+Call `GET /api/plugins/doctor` to probe every runtime on the host and see which ones are missing — the response includes each runtime's detected version and an install hint. It also cross-references installed plugins and flags any whose declared runtime is not usable on this host.
+
+#### Runtimes in the official Docker image
+
+The official image (`node:lts-bookworm-slim` base) ships with **`python`, `node`, `bash`, `native`** ready to go. Other runtimes are not bundled to keep the image small — if you need them, extend the image with one of these snippets:
+
+```dockerfile
+# V
+RUN git clone --depth 1 https://github.com/vlang/v /opt/v \
+    && make -C /opt/v && ln -s /opt/v/v /usr/local/bin/v
+
+# Deno
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# Go
+RUN curl -fsSL https://go.dev/dl/go1.23.0.linux-amd64.tar.gz | tar -C /usr/local -xz \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go
+
+# Ruby
+RUN apt-get update && apt-get install -y --no-install-recommends ruby && rm -rf /var/lib/apt/lists/*
+
+# Bun
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
+
+# PHP
+RUN apt-get update && apt-get install -y --no-install-recommends php-cli && rm -rf /var/lib/apt/lists/*
+
+# Lua (with dkjson for the Lua scaffold template)
+RUN apt-get update && apt-get install -y --no-install-recommends lua5.4 lua-dkjson && rm -rf /var/lib/apt/lists/*
+```
+
+If a plugin's declared runtime is not on PATH, the hook returns a `LauncherNotFound` error with the install hint — existing plugins keep running, only the misconfigured one is affected.
 
 ---
 
@@ -2604,7 +2691,7 @@ plugin_registries = ["acme-corp/librefang-plugins"]
 
 ### `[prompt_intelligence]`
 
-Configures prompt versioning and A/B experiment support. When enabled, LibreFang automatically tracks prompt version history and supports running A/B experiments to compare prompt variants. See the [Prompt Intelligence guide](/prompt-intelligence) for full documentation.
+Configures prompt versioning and A/B experiment support. When enabled, LibreFang automatically tracks prompt version history and supports running A/B experiments to compare prompt variants. See the [Prompt Intelligence guide](/agent/prompt-intelligence) for full documentation.
 
 ```toml
 [prompt_intelligence]
@@ -2652,6 +2739,7 @@ Complete table of all environment variables referenced by the configuration. Non
 | Variable | Used By | Description |
 |----------|---------|-------------|
 | `BRAVE_API_KEY` | `[web.brave]` | Brave Search API key. |
+| `JINA_API_KEY` | `[web.jina]` | Jina AI Search API key. |
 | `TAVILY_API_KEY` | `[web.tavily]` | Tavily Search API key. |
 | `PERPLEXITY_API_KEY` | `[web.perplexity]` | Perplexity Search API key (shared with LLM provider). |
 
@@ -2763,6 +2851,7 @@ For **web search providers**, the validator checks:
 | Provider | Env var checked |
 |----------|----------------|
 | `brave` | `web.brave.api_key_env` |
+| `jina` | `web.jina.api_key_env` |
 | `tavily` | `web.tavily.api_key_env` |
 | `perplexity` | `web.perplexity.api_key_env` |
 | `duckduckgo` | (no check -- no API key needed) |

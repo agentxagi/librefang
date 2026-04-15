@@ -19,6 +19,7 @@ pub mod channels;
 pub mod config;
 pub mod goals;
 pub mod inbox;
+pub mod mcp_auth;
 pub mod media;
 pub mod memory;
 pub mod network;
@@ -27,6 +28,7 @@ pub mod prompts;
 pub mod providers;
 pub mod skills;
 pub mod system;
+pub mod terminal;
 pub mod workflows;
 
 // Glob re-export to keep `routes::handler_name` backward compatible
@@ -45,6 +47,7 @@ pub use channels::*;
 pub use config::*;
 pub use goals::*;
 pub use inbox::*;
+pub use mcp_auth::*;
 pub use media::*;
 pub use memory::*;
 pub use network::*;
@@ -52,6 +55,7 @@ pub use plugins::*;
 pub use providers::*;
 pub use skills::*;
 pub use system::*;
+pub use terminal::*;
 pub use workflows::*;
 
 use crate::middleware::RequestLanguage;
@@ -106,14 +110,26 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: librefang_runtime::provider_health::ProbeCache,
+    /// Cache for manual provider test results (latency, timestamp, reachable).
+    /// Populated by POST /api/providers/{name}/test, consumed by GET /api/providers.
+    pub provider_test_cache: DashMap<String, (Instant, u128, String, bool)>,
     /// Webhook subscription store for outbound event notifications.
     pub webhook_store: crate::webhook_store::WebhookStore,
     /// Active session tokens issued by dashboard login.
     /// Maps token string -> SessionToken (with creation timestamp for expiry checks).
     pub active_sessions:
         Arc<tokio::sync::RwLock<HashMap<String, crate::password_hash::SessionToken>>>,
+    /// Shared api_key_lock from the auth middleware — updated on password/api_key change
+    /// so the new credentials take effect immediately without restart.
+    pub api_key_lock: Arc<tokio::sync::RwLock<String>>,
     /// Media generation driver cache for image/TTS/video/music.
     pub media_drivers: librefang_runtime::media::MediaDriverCache,
+    /// Dynamic webhook router for channel webhook endpoints.
+    /// Mounted under `/channels` on the main server. Updated on hot-reload.
+    pub webhook_router: Arc<tokio::sync::RwLock<Arc<axum::Router>>>,
+    /// Mutex for serializing config file writes — prevents concurrent config_set
+    /// calls from reading the same file and overwriting each other's changes.
+    pub config_write_lock: tokio::sync::Mutex<()>,
     /// Prometheus metrics handle (only set when `telemetry` feature + config enabled).
     #[cfg(feature = "telemetry")]
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,

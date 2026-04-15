@@ -67,6 +67,12 @@ pub enum TriggerPattern {
     All,
     /// Match custom events by content substring.
     ContentMatch { substring: String },
+    /// Match when a task is posted to the Task Board.
+    TaskPosted,
+    /// Match when a task is claimed from the Task Board.
+    TaskClaimed,
+    /// Match when a task is completed on the Task Board.
+    TaskCompleted,
 }
 
 /// A registered trigger definition.
@@ -97,6 +103,22 @@ pub struct Trigger {
     /// Set to `Some(0)` to disable cooldown for this trigger.
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// Per-trigger session mode override.
+    /// `None` inherits from the target agent's manifest `session_mode`.
+    /// `Some(mode)` overrides for this specific trigger.
+    #[serde(default)]
+    pub session_mode: Option<librefang_types::agent::SessionMode>,
+}
+
+/// A trigger match result with optional session mode override.
+#[derive(Debug, Clone)]
+pub struct TriggerMatch {
+    /// The agent to dispatch the triggered message to.
+    pub agent_id: AgentId,
+    /// The rendered message to send.
+    pub message: String,
+    /// Per-trigger session mode override (None = inherit from agent manifest).
+    pub session_mode_override: Option<librefang_types::agent::SessionMode>,
 }
 
 /// The trigger engine manages event-to-agent routing.
@@ -183,6 +205,7 @@ impl TriggerEngine {
             max_fires,
             target_agent,
             cooldown_secs: None,
+            session_mode: None,
         };
         let id = trigger.id;
         self.triggers.insert(id, trigger);
@@ -278,6 +301,7 @@ impl TriggerEngine {
                 max_fires: old.max_fires,
                 target_agent: old.target_agent,
                 cooldown_secs: old.cooldown_secs,
+                session_mode: old.session_mode,
             };
             self.triggers.insert(new_id, trigger);
             self.agent_triggers
@@ -365,7 +389,7 @@ impl TriggerEngine {
     ///    on a trigger to disable its cooldown.
     /// 2. **Per-event budget** — at most `max_triggers_per_event` triggers may fire
     ///    from a single event evaluation. Excess matches are dropped with a warning.
-    pub fn evaluate(&self, event: &Event) -> Vec<(AgentId, String)> {
+    pub fn evaluate(&self, event: &Event) -> Vec<TriggerMatch> {
         let event_description = describe_event(event);
         let mut matches = Vec::new();
         let now = Instant::now();
@@ -430,7 +454,11 @@ impl TriggerEngine {
                     .replace("{{event}}", &event_description);
                 // Route to target_agent if set (cross-session wake), else owner.
                 let recipient = trigger.target_agent.unwrap_or(trigger.agent_id);
-                matches.push((recipient, message));
+                matches.push(TriggerMatch {
+                    agent_id: recipient,
+                    message,
+                    session_mode_override: trigger.session_mode,
+                });
                 trigger.fire_count += 1;
                 self.last_fired.insert(trigger.id, now);
 
@@ -502,6 +530,18 @@ fn matches_pattern(pattern: &TriggerPattern, event: &Event, description: &str) -
         TriggerPattern::ContentMatch { substring } => description
             .to_lowercase()
             .contains(&substring.to_lowercase()),
+        TriggerPattern::TaskPosted => matches!(
+            event.payload,
+            EventPayload::System(SystemEvent::TaskPosted { .. })
+        ),
+        TriggerPattern::TaskClaimed => matches!(
+            event.payload,
+            EventPayload::System(SystemEvent::TaskClaimed { .. })
+        ),
+        TriggerPattern::TaskCompleted => matches!(
+            event.payload,
+            EventPayload::System(SystemEvent::TaskCompleted { .. })
+        ),
     }
 }
 
@@ -589,6 +629,18 @@ fn describe_event(event: &Event) -> String {
                     "Health check failed: agent {agent_id}, unresponsive for {unresponsive_secs}s"
                 )
             }
+            SystemEvent::TaskPosted { task_id, title, .. } => {
+                format!("Task posted: {task_id} \"{title}\"")
+            }
+            SystemEvent::TaskClaimed {
+                task_id,
+                claimed_by,
+            } => {
+                format!("Task claimed: {task_id} by {claimed_by}")
+            }
+            SystemEvent::TaskCompleted { task_id, result } => {
+                format!("Task completed: {task_id} result={result}")
+            }
         },
         EventPayload::ApprovalRequested(ar) => {
             format!(
@@ -596,8 +648,30 @@ fn describe_event(event: &Event) -> String {
                 ar.agent_id, ar.tool_name, ar.risk_level, ar.description
             )
         }
+        EventPayload::ApprovalResolved(ar) => {
+            format!(
+                "Approval resolved: request {} — {}",
+                ar.request_id, ar.decision
+            )
+        }
         EventPayload::Custom(data) => {
-            format!("Custom event ({} bytes)", data.len())
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
+                let event_type = val
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown");
+                let summary = {
+                    let s = val.to_string();
+                    if s.len() > 300 {
+                        format!("{}...", &s[..300])
+                    } else {
+                        s
+                    }
+                };
+                format!("Custom event: type={}, payload={}", event_type, summary)
+            } else {
+                format!("Custom event ({} bytes)", data.len())
+            }
         }
     }
 }
@@ -642,8 +716,8 @@ mod tests {
 
         let matches = engine.evaluate(&event);
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0, watcher);
-        assert!(matches[0].1.contains("new-agent"));
+        assert_eq!(matches[0].agent_id, watcher);
+        assert!(matches[0].message.contains("new-agent"));
     }
 
     #[test]
@@ -781,7 +855,7 @@ mod tests {
         );
         let matches = engine.evaluate(&event);
         assert_eq!(matches.len(), 2);
-        assert!(matches.iter().all(|(id, _)| *id == new_agent));
+        assert!(matches.iter().all(|m| m.agent_id == new_agent));
     }
 
     #[test]
@@ -903,7 +977,7 @@ mod tests {
         let matches = engine.evaluate(&event);
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            matches[0].0, owner,
+            matches[0].agent_id, owner,
             "Without target_agent, owner should be woken"
         );
     }
@@ -931,10 +1005,10 @@ mod tests {
         let matches = engine.evaluate(&event);
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            matches[0].0, target,
+            matches[0].agent_id, target,
             "With target_agent set, target should be woken"
         );
-        assert!(matches[0].1.contains("Cross-wake"));
+        assert!(matches[0].message.contains("Cross-wake"));
     }
 
     #[test]
@@ -967,7 +1041,7 @@ mod tests {
         );
         let matches = engine.evaluate(&event);
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0, target);
+        assert_eq!(matches[0].agent_id, target);
     }
 
     #[test]
@@ -1130,5 +1204,155 @@ mod tests {
             Some(30),
             "cooldown_secs should survive take/restore"
         );
+    }
+
+    // -- describe_event: Custom payload decoding (#2438) -----------------------
+
+    #[test]
+    fn test_describe_event_custom_json() {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"type": "deploy", "data": {"env": "prod"}}))
+                .unwrap();
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Custom(payload),
+        );
+        let desc = describe_event(&event);
+        assert!(
+            desc.contains("type=deploy"),
+            "Should include the event type, got: {desc}"
+        );
+        assert!(
+            desc.contains("prod"),
+            "Should include payload data, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn test_describe_event_custom_non_json_fallback() {
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Custom(vec![0xFF, 0xFE, 0x00]),
+        );
+        let desc = describe_event(&event);
+        assert!(
+            desc.contains("3 bytes"),
+            "Non-JSON should fall back to byte-length description, got: {desc}"
+        );
+    }
+
+    #[test]
+    fn test_describe_event_custom_json_no_type_field() {
+        let payload = serde_json::to_vec(&serde_json::json!({"action": "restart"})).unwrap();
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Custom(payload),
+        );
+        let desc = describe_event(&event);
+        assert!(
+            desc.contains("type=unknown"),
+            "Missing 'type' field should show 'unknown', got: {desc}"
+        );
+    }
+
+    #[test]
+    fn test_content_match_on_custom_json_event() {
+        let engine = TriggerEngine::new();
+        let agent_id = AgentId::new();
+        engine.register(
+            agent_id,
+            TriggerPattern::ContentMatch {
+                substring: "deploy".to_string(),
+            },
+            "Deploy alert: {{event}}".to_string(),
+            0,
+        );
+
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"type": "deploy", "data": {"env": "prod"}}))
+                .unwrap();
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::Custom(payload),
+        );
+        let matches = engine.evaluate(&event);
+        assert_eq!(
+            matches.len(),
+            1,
+            "ContentMatch should match decoded Custom JSON payload"
+        );
+    }
+
+    // -- MemoryUpdate trigger matching (#2438) ---------------------------------
+
+    #[test]
+    fn test_memory_update_trigger_fires() {
+        let engine = TriggerEngine::new();
+        let watcher = AgentId::new();
+        engine.register(
+            watcher,
+            TriggerPattern::MemoryUpdate,
+            "Memory changed: {{event}}".to_string(),
+            0,
+        );
+
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::MemoryUpdate(MemoryDelta {
+                operation: MemoryOperation::Created,
+                key: "user.prefs".to_string(),
+                agent_id: AgentId::new(),
+            }),
+        );
+        let matches = engine.evaluate(&event);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].message.contains("user.prefs"));
+    }
+
+    #[test]
+    fn test_memory_key_pattern_trigger_fires() {
+        let engine = TriggerEngine::new();
+        let watcher = AgentId::new();
+        engine.register(
+            watcher,
+            TriggerPattern::MemoryKeyPattern {
+                key_pattern: "user.".to_string(),
+            },
+            "User memory changed: {{event}}".to_string(),
+            0,
+        );
+
+        // Should match
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::MemoryUpdate(MemoryDelta {
+                operation: MemoryOperation::Updated,
+                key: "user.settings".to_string(),
+                agent_id: AgentId::new(),
+            }),
+        );
+        assert_eq!(engine.evaluate(&event).len(), 1);
+
+        // Should NOT match (different key)
+        let event2 = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::MemoryUpdate(MemoryDelta {
+                operation: MemoryOperation::Deleted,
+                key: "system.config".to_string(),
+                agent_id: AgentId::new(),
+            }),
+        );
+        // Disable cooldown for second evaluation
+        for mut entry in engine.triggers.iter_mut() {
+            entry.cooldown_secs = Some(0);
+        }
+        assert_eq!(engine.evaluate(&event2).len(), 0);
     }
 }

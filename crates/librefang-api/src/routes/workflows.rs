@@ -45,8 +45,16 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::post(run_workflow),
         )
         .route(
+            "/workflows/{id}/dry-run",
+            axum::routing::post(dry_run_workflow),
+        )
+        .route(
             "/workflows/{id}/runs",
             axum::routing::get(list_workflow_runs),
+        )
+        .route(
+            "/workflows/runs/{run_id}",
+            axum::routing::get(get_workflow_run),
         )
         // Workflow templates (distinct from the agent templates in system.rs)
         .route(
@@ -91,7 +99,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use librefang_kernel::triggers::{TriggerId, TriggerPattern};
 use librefang_kernel::workflow::{
-    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowStep,
+    ErrorMode, StepAgent, StepMode, Workflow, WorkflowId, WorkflowRunId, WorkflowStep,
 };
 use librefang_runtime::kernel_handle::KernelHandle;
 use librefang_types::agent::AgentId;
@@ -369,24 +377,28 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
         *run_counts.entry(r.workflow_id.to_string()).or_default() += 1;
     }
 
-    // Load schedules to find workflow-bound ones
-    let shared_id = schedule_shared_agent_id();
-    let schedules: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
-    };
+    // Load cron jobs to find workflow-bound schedules
+    let all_cron_jobs = state.kernel.cron().list_all_jobs();
 
     let list: Vec<serde_json::Value> = workflows
         .iter()
         .map(|w| {
             let wid = w.id.to_string();
-            let schedule = schedules
-                .iter()
-                .find(|s| s["workflow_id"].as_str() == Some(&wid));
+            let schedule = all_cron_jobs.iter().find(|j| {
+                matches!(&j.action, librefang_types::scheduler::CronAction::Workflow { workflow_id, .. } if workflow_id == &wid)
+            });
+            let schedule_json = schedule.map(|j| {
+                let cron_expr = match &j.schedule {
+                    librefang_types::scheduler::CronSchedule::Cron { expr, .. } => expr.clone(),
+                    librefang_types::scheduler::CronSchedule::Every { every_secs } => format!("every {every_secs}s"),
+                    librefang_types::scheduler::CronSchedule::At { at } => format!("at {}", at.to_rfc3339()),
+                };
+                serde_json::json!({
+                    "cron": cron_expr,
+                    "enabled": j.enabled,
+                    "last_run": j.last_run.map(|t| t.to_rfc3339()),
+                })
+            });
             serde_json::json!({
                 "id": wid,
                 "name": w.name,
@@ -394,11 +406,7 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "steps": w.steps.len(),
                 "run_count": run_counts.get(&wid).copied().unwrap_or(0),
                 "created_at": w.created_at.to_rfc3339(),
-                "schedule": schedule.map(|s| serde_json::json!({
-                    "cron": s["cron"],
-                    "enabled": s["enabled"],
-                    "last_run": s["last_run"],
-                })),
+                "schedule": schedule_json,
             })
         })
         .collect();
@@ -648,18 +656,149 @@ pub async fn run_workflow(
     let input = req["input"].as_str().unwrap_or("").to_string();
 
     match state.kernel.run_workflow(workflow_id, input).await {
-        Ok((run_id, output)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "run_id": run_id.to_string(),
-                "output": output,
-                "status": "completed",
-            })),
-        ),
+        Ok((run_id, output)) => {
+            // Include step-level detail in the response so callers can inspect I/O
+            let run = state.kernel.workflow_engine().get_run(run_id).await;
+            let step_results = run.as_ref().map(|r| {
+                r.step_results
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "step_name": s.step_name,
+                            "agent_name": s.agent_name,
+                            "prompt": s.prompt,
+                            "output": s.output,
+                            "input_tokens": s.input_tokens,
+                            "output_tokens": s.output_tokens,
+                            "duration_ms": s.duration_ms,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "output": output,
+                    "status": "completed",
+                    "step_results": step_results.unwrap_or_default(),
+                })),
+            )
+        }
         Err(e) => {
             tracing::warn!("Workflow run failed for {id}: {e}");
-            ApiErrorResponse::internal("Workflow execution failed").into_json_tuple()
+            // Return the actual error message, not a generic one, to aid debugging
+            let detail = e.to_string();
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "workflow_failed",
+                    "detail": detail,
+                })),
+            )
         }
+    }
+}
+
+/// POST /api/workflows/:id/dry-run — Validate and preview a workflow without executing it.
+#[utoipa::path(
+    post,
+    path = "/api/workflows/{id}/dry-run",
+    tag = "workflows",
+    params(("id" = String, Path, description = "Workflow ID")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Dry-run preview", body = serde_json::Value),
+        (status = 404, description = "Workflow not found")
+    )
+)]
+pub async fn dry_run_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let workflow_id = WorkflowId(match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return ApiErrorResponse::bad_request("Invalid workflow ID").into_json_tuple();
+        }
+    });
+
+    let input = req["input"].as_str().unwrap_or("").to_string();
+
+    match state.kernel.dry_run_workflow(workflow_id, input).await {
+        Ok(steps) => {
+            let all_agents_found = steps.iter().all(|s| s.agent_found);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "valid": all_agents_found,
+                    "steps": steps.iter().map(|s| serde_json::json!({
+                        "step_name": s.step_name,
+                        "agent_name": s.agent_name,
+                        "agent_found": s.agent_found,
+                        "resolved_prompt": s.resolved_prompt,
+                        "skipped": s.skipped,
+                        "skip_reason": s.skip_reason,
+                    })).collect::<Vec<_>>(),
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Workflow dry-run failed for {id}: {e}");
+            ApiErrorResponse::not_found(e.to_string()).into_json_tuple()
+        }
+    }
+}
+
+/// GET /api/workflows/runs/:run_id — Get detailed info for a single workflow run.
+#[utoipa::path(
+    get,
+    path = "/api/workflows/runs/{run_id}",
+    tag = "workflows",
+    params(("run_id" = String, Path, description = "Workflow run ID")),
+    responses(
+        (status = 200, description = "Workflow run details", body = serde_json::Value),
+        (status = 404, description = "Run not found")
+    )
+)]
+pub async fn get_workflow_run(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    let run_id = WorkflowRunId(match run_id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return ApiErrorResponse::bad_request("Invalid run ID").into_json_tuple();
+        }
+    });
+
+    match state.kernel.workflow_engine().get_run(run_id).await {
+        Some(run) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": run.id.to_string(),
+                "workflow_id": run.workflow_id.to_string(),
+                "workflow_name": run.workflow_name,
+                "input": run.input,
+                "state": serde_json::to_value(&run.state).unwrap_or_default(),
+                "output": run.output,
+                "error": run.error,
+                "started_at": run.started_at.to_rfc3339(),
+                "completed_at": run.completed_at.map(|t| t.to_rfc3339()),
+                "step_results": run.step_results.iter().map(|s| serde_json::json!({
+                    "step_name": s.step_name,
+                    "agent_id": s.agent_id,
+                    "agent_name": s.agent_name,
+                    "prompt": s.prompt,
+                    "output": s.output,
+                    "input_tokens": s.input_tokens,
+                    "output_tokens": s.output_tokens,
+                    "duration_ms": s.duration_ms,
+                })).collect::<Vec<_>>(),
+            })),
+        ),
+        None => ApiErrorResponse::not_found(format!("Run '{run_id}' not found")).into_json_tuple(),
     }
 }
 
@@ -815,10 +954,21 @@ pub async fn create_trigger(
     let max_fires = req["max_fires"].as_u64().unwrap_or(0);
 
     // Optional cross-session target: route triggered message to a different agent.
-    let target_agent: Option<AgentId> = req
-        .get("target_agent_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
+    // If the caller supplied a value but it is malformed, reject explicitly —
+    // otherwise the trigger would silently register without any target and the
+    // caller would assume the routing was accepted.
+    let target_agent: Option<AgentId> = match req.get("target_agent_id").and_then(|v| v.as_str()) {
+        None => None,
+        Some(s) => match s.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return ApiErrorResponse::bad_request(format!(
+                    "Invalid 'target_agent_id': '{s}' is not a valid UUID"
+                ))
+                .into_json_tuple();
+            }
+        },
+    };
 
     match state.kernel.register_trigger_with_target(
         agent_id,
@@ -947,18 +1097,63 @@ pub async fn update_trigger(
 // Scheduled Jobs (cron) endpoints
 // ---------------------------------------------------------------------------
 
-/// The well-known shared-memory agent ID used for cross-agent KV storage.
-/// Must match the value in `librefang-kernel/src/kernel.rs::shared_memory_agent_id()`.
-fn schedule_shared_agent_id() -> AgentId {
-    AgentId(uuid::Uuid::from_bytes([
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x01,
-    ]))
+// ---------------------------------------------------------------------------
+// Schedule endpoints — backed by CronScheduler (unified with cron_* system)
+// ---------------------------------------------------------------------------
+// Previously these read/wrote a separate `__librefang_schedules` JSON blob in
+// shared memory, which had no execution engine. Now they delegate to the real
+// CronScheduler so scheduled jobs actually fire via the kernel tick loop (#2024).
+
+/// Helper: parse a CronJobId from a string, returning an API error on failure.
+fn parse_cron_job_id(
+    id: &str,
+) -> Result<librefang_types::scheduler::CronJobId, (StatusCode, Json<serde_json::Value>)> {
+    id.parse::<librefang_types::scheduler::CronJobId>()
+        .map_err(|_| {
+            ApiErrorResponse::bad_request(format!("Invalid schedule ID: {id}")).into_json_tuple()
+        })
 }
 
-const SCHEDULES_KEY: &str = "__librefang_schedules";
+/// Helper: serialize a CronJob to the JSON shape the dashboard expects.
+fn cron_job_to_schedule_json(job: &librefang_types::scheduler::CronJob) -> serde_json::Value {
+    let (cron_expr, tz) = match &job.schedule {
+        librefang_types::scheduler::CronSchedule::Cron { expr, tz } => (expr.clone(), tz.clone()),
+        librefang_types::scheduler::CronSchedule::Every { every_secs } => {
+            (format!("every {every_secs}s"), None)
+        }
+        librefang_types::scheduler::CronSchedule::At { at } => {
+            (format!("at {}", at.to_rfc3339()), None)
+        }
+    };
+    let message = match &job.action {
+        librefang_types::scheduler::CronAction::AgentTurn { message, .. } => message.clone(),
+        librefang_types::scheduler::CronAction::Workflow {
+            workflow_id, input, ..
+        } => input
+            .clone()
+            .unwrap_or_else(|| format!("workflow:{workflow_id}")),
+        librefang_types::scheduler::CronAction::SystemEvent { text } => text.clone(),
+    };
+    let workflow_id = match &job.action {
+        librefang_types::scheduler::CronAction::Workflow { workflow_id, .. } => workflow_id.clone(),
+        _ => String::new(),
+    };
+    serde_json::json!({
+        "id": job.id.to_string(),
+        "name": job.name,
+        "cron": cron_expr,
+        "tz": tz,
+        "agent_id": job.agent_id.to_string(),
+        "workflow_id": workflow_id,
+        "message": message,
+        "enabled": job.enabled,
+        "created_at": job.created_at.to_rfc3339(),
+        "last_run": job.last_run.map(|t| t.to_rfc3339()),
+        "next_run": job.next_run.map(|t| t.to_rfc3339()),
+    })
+}
 
-/// GET /api/schedules — List all cron-based scheduled jobs.
+/// GET /api/schedules — List all scheduled jobs.
 #[utoipa::path(
     get,
     path = "/api/schedules",
@@ -968,22 +1163,10 @@ const SCHEDULES_KEY: &str = "__librefang_schedules";
     )
 )]
 pub async fn list_schedules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agent_id = schedule_shared_agent_id();
-    match state
-        .kernel
-        .memory_substrate()
-        .structured_get(agent_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => {
-            let total = arr.len();
-            Json(serde_json::json!({"schedules": arr, "total": total}))
-        }
-        Ok(_) => Json(serde_json::json!({"schedules": [], "total": 0})),
-        Err(e) => {
-            tracing::warn!("Failed to load schedules: {e}");
-            Json(serde_json::json!({"schedules": [], "total": 0, "error": format!("{e}")}))
-        }
-    }
+    let jobs = state.kernel.cron().list_all_jobs();
+    let schedules: Vec<serde_json::Value> = jobs.iter().map(cron_job_to_schedule_json).collect();
+    let total = schedules.len();
+    Json(serde_json::json!({"schedules": schedules, "total": total}))
 }
 
 /// GET /api/schedules/{id} — Get a specific schedule by ID.
@@ -992,31 +1175,17 @@ pub async fn get_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id = schedule_shared_agent_id();
-    match state
-        .kernel
-        .memory_substrate()
-        .structured_get(agent_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => {
-            if let Some(schedule) = arr.iter().find(|s| s["id"].as_str() == Some(&id)) {
-                (StatusCode::OK, Json(schedule.clone()))
-            } else {
-                ApiErrorResponse::not_found(format!("Schedule '{}' not found", id))
-                    .into_json_tuple()
-            }
-        }
-        Ok(_) => {
-            ApiErrorResponse::not_found(format!("Schedule '{}' not found", id)).into_json_tuple()
-        }
-        Err(e) => {
-            tracing::warn!("Failed to load schedules: {e}");
-            ApiErrorResponse::internal(format!("Failed to load schedules: {e}")).into_json_tuple()
-        }
+    let job_id = match parse_cron_job_id(&id) {
+        Ok(jid) => jid,
+        Err(e) => return e,
+    };
+    match state.kernel.cron().get_job(job_id) {
+        Some(job) => (StatusCode::OK, Json(cron_job_to_schedule_json(&job))),
+        None => ApiErrorResponse::not_found(format!("Schedule '{id}' not found")).into_json_tuple(),
     }
 }
 
-/// POST /api/schedules — Create a new cron-based scheduled job.
+/// POST /api/schedules — Create a new scheduled job (backed by CronScheduler).
 #[utoipa::path(
     post,
     path = "/api/schedules",
@@ -1063,23 +1232,34 @@ pub async fn create_schedule(
             .into_json_tuple();
     }
 
-    // Validate agent exists if provided
-    if !agent_id_str.is_empty() {
-        let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            state.kernel.agent_registry().get(aid).is_some()
+    // Resolve agent_id to a UUID
+    let resolved_agent_id = if !agent_id_str.is_empty() {
+        if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+            if state.kernel.agent_registry().get(aid).is_some() {
+                aid
+            } else {
+                return ApiErrorResponse::not_found(format!("Agent not found: {agent_id_str}"))
+                    .into_json_tuple();
+            }
+        } else if let Some(agent) = state
+            .kernel
+            .agent_registry()
+            .list()
+            .iter()
+            .find(|a| a.name == agent_id_str)
+        {
+            agent.id
         } else {
-            state
-                .kernel
-                .agent_registry()
-                .list()
-                .iter()
-                .any(|a| a.name == agent_id_str)
-        };
-        if !agent_exists {
             return ApiErrorResponse::not_found(format!("Agent not found: {agent_id_str}"))
                 .into_json_tuple();
         }
-    }
+    } else {
+        // For workflow-only schedules, use a system agent ID
+        AgentId(uuid::Uuid::from_bytes([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]))
+    };
 
     // Validate workflow exists if provided
     if !workflow_id_str.is_empty() {
@@ -1102,44 +1282,71 @@ pub async fn create_schedule(
     }
 
     let message = req["message"].as_str().unwrap_or("").to_string();
-    let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let tz = req["tz"]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
 
-    let schedule_id = uuid::Uuid::new_v4().to_string();
-    let entry = serde_json::json!({
-        "id": schedule_id,
-        "name": name,
-        "cron": cron,
-        "agent_id": agent_id_str,
-        "workflow_id": workflow_id_str,
-        "message": message,
-        "enabled": enabled,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "last_run": null,
-        "run_count": 0,
-    });
-
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
-    };
-
-    schedules.push(entry.clone());
-    if let Err(e) = state.kernel.memory_substrate().structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        tracing::warn!("Failed to save schedule: {e}");
-        return ApiErrorResponse::internal(format!("Failed to save schedule: {e}"))
+    // Validate timezone string if provided
+    if let Some(ref tz_str) = tz {
+        if tz_str != "UTC" && tz_str.parse::<chrono_tz::Tz>().is_err() {
+            return ApiErrorResponse::bad_request(format!(
+                "Invalid timezone '{tz_str}'. Use IANA format (e.g. 'America/New_York', 'Europe/Rome')"
+            ))
             .into_json_tuple();
+        }
     }
 
-    (StatusCode::CREATED, Json(entry))
+    // Build the CronJob action
+    let action = if !workflow_id_str.is_empty() {
+        librefang_types::scheduler::CronAction::Workflow {
+            workflow_id: workflow_id_str,
+            input: if message.is_empty() {
+                None
+            } else {
+                Some(message)
+            },
+            timeout_secs: None,
+        }
+    } else {
+        let msg = if message.is_empty() {
+            format!("[Scheduled task '{}' triggered]", name)
+        } else {
+            message
+        };
+        librefang_types::scheduler::CronAction::AgentTurn {
+            message: msg,
+            model_override: None,
+            timeout_secs: None,
+        }
+    };
+
+    let job = librefang_types::scheduler::CronJob {
+        id: librefang_types::scheduler::CronJobId::new(),
+        agent_id: resolved_agent_id,
+        name,
+        enabled: req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+        schedule: librefang_types::scheduler::CronSchedule::Cron { expr: cron, tz },
+        action,
+        delivery: librefang_types::scheduler::CronDelivery::None,
+        created_at: chrono::Utc::now(),
+        last_run: None,
+        next_run: None,
+    };
+
+    match state.kernel.cron().add_job(job.clone(), false) {
+        Ok(job_id) => {
+            if let Err(e) = state.kernel.cron().persist() {
+                tracing::warn!("Failed to persist cron jobs: {e}");
+            }
+            let mut entry = cron_job_to_schedule_json(&job);
+            entry["id"] = serde_json::Value::String(job_id.to_string());
+            (StatusCode::CREATED, Json(entry))
+        }
+        Err(e) => {
+            ApiErrorResponse::internal(format!("Failed to create schedule: {e}")).into_json_tuple()
+        }
+    }
 }
 
 /// PUT /api/schedules/:id — Update a scheduled job (toggle enabled, edit fields).
@@ -1149,61 +1356,91 @@ pub async fn update_schedule(
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
+    let job_id = match parse_cron_job_id(&id) {
+        Ok(jid) => jid,
+        Err(e) => return e,
     };
 
-    let mut found = false;
-    for s in schedules.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            found = true;
-            if let Some(enabled) = req.get("enabled").and_then(|v| v.as_bool()) {
-                s["enabled"] = serde_json::Value::Bool(enabled);
-            }
-            if let Some(name) = req.get("name").and_then(|v| v.as_str()) {
-                s["name"] = serde_json::Value::String(name.to_string());
-            }
-            if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
-                let cron_parts: Vec<&str> = cron.split_whitespace().collect();
-                if cron_parts.len() != 5 {
-                    return ApiErrorResponse::bad_request("Invalid cron expression")
-                        .into_json_tuple();
-                }
-                s["cron"] = serde_json::Value::String(cron.to_string());
-            }
-            if let Some(agent_id) = req.get("agent_id").and_then(|v| v.as_str()) {
-                s["agent_id"] = serde_json::Value::String(agent_id.to_string());
-            }
-            if let Some(message) = req.get("message").and_then(|v| v.as_str()) {
-                s["message"] = serde_json::Value::String(message.to_string());
-            }
-            break;
+    // Build update payload compatible with CronScheduler::update_job
+    let mut updates = serde_json::Map::new();
+    if let Some(enabled) = req.get("enabled") {
+        updates.insert("enabled".to_string(), enabled.clone());
+    }
+    if let Some(name) = req.get("name") {
+        updates.insert("name".to_string(), name.clone());
+    }
+    // Read tz from the request (if provided).  When the caller sends
+    // a new `cron` expression we must carry over the timezone — otherwise
+    // replacing the entire schedule object would reset tz to null.
+    let req_tz = req
+        .get("tz")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Validate timezone string if provided
+    if let Some(ref tz_str) = req_tz {
+        if tz_str != "UTC" && tz_str.parse::<chrono_tz::Tz>().is_err() {
+            return ApiErrorResponse::bad_request(format!(
+                "Invalid timezone '{tz_str}'. Use IANA format (e.g. 'America/New_York', 'Europe/Rome')"
+            ))
+            .into_json_tuple();
         }
     }
 
-    if !found {
-        return ApiErrorResponse::not_found("Schedule not found").into_json_tuple();
+    if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
+        let cron_parts: Vec<&str> = cron.split_whitespace().collect();
+        if cron_parts.len() != 5 {
+            return ApiErrorResponse::bad_request("Invalid cron expression").into_json_tuple();
+        }
+        // If tz not in this request, preserve the existing tz from the job.
+        let tz = req_tz.clone().or_else(|| {
+            state.kernel.cron().get_meta(job_id).and_then(|meta| {
+                if let librefang_types::scheduler::CronSchedule::Cron { tz, .. } =
+                    &meta.job.schedule
+                {
+                    tz.clone()
+                } else {
+                    None
+                }
+            })
+        });
+        updates.insert(
+            "schedule".to_string(),
+            serde_json::json!({"kind": "cron", "expr": cron, "tz": tz}),
+        );
+    } else if req_tz.is_some() {
+        // Caller wants to change only the timezone — read current cron expr.
+        if let Some(meta) = state.kernel.cron().get_meta(job_id) {
+            if let librefang_types::scheduler::CronSchedule::Cron { expr, .. } = &meta.job.schedule
+            {
+                updates.insert(
+                    "schedule".to_string(),
+                    serde_json::json!({"kind": "cron", "expr": expr, "tz": req_tz}),
+                );
+            }
+        }
+    }
+    if let Some(agent_id) = req.get("agent_id") {
+        updates.insert("agent_id".to_string(), agent_id.clone());
     }
 
-    if let Err(e) = state.kernel.memory_substrate().structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return ApiErrorResponse::internal(format!("Failed to update schedule: {e}"))
-            .into_json_tuple();
+    match state
+        .kernel
+        .cron()
+        .update_job(job_id, &serde_json::Value::Object(updates))
+    {
+        Ok(_job) => {
+            if let Err(e) = state.kernel.cron().persist() {
+                tracing::warn!("Failed to persist cron jobs: {e}");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "updated", "schedule_id": id})),
+            )
+        }
+        Err(e) => ApiErrorResponse::not_found(format!("Schedule not found: {e}")).into_json_tuple(),
     }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "updated", "schedule_id": id})),
-    )
 }
 
 /// DELETE /api/schedules/:id — Remove a scheduled job.
@@ -1212,188 +1449,123 @@ pub async fn delete_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let mut schedules: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
+    let job_id = match parse_cron_job_id(&id) {
+        Ok(jid) => jid,
+        Err(e) => return e,
     };
 
-    let before = schedules.len();
-    schedules.retain(|s| s["id"].as_str() != Some(&id));
-
-    if schedules.len() == before {
-        return ApiErrorResponse::not_found("Schedule not found").into_json_tuple();
+    match state.kernel.cron().remove_job(job_id) {
+        Ok(_) => {
+            if let Err(e) = state.kernel.cron().persist() {
+                tracing::warn!("Failed to persist cron jobs: {e}");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "removed", "schedule_id": id})),
+            )
+        }
+        Err(e) => ApiErrorResponse::not_found(format!("Schedule not found: {e}")).into_json_tuple(),
     }
-
-    if let Err(e) = state.kernel.memory_substrate().structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules),
-    ) {
-        return ApiErrorResponse::internal(format!("Failed to delete schedule: {e}"))
-            .into_json_tuple();
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "schedule_id": id})),
-    )
 }
 
-/// POST /api/schedules/:id/run — Manually run a scheduled job now.
+/// POST /api/schedules/:id/run — Manually trigger a scheduled job now.
 #[utoipa::path(post, path = "/api/schedules/{id}/run", tag = "workflows", params(("id" = String, Path, description = "Schedule ID")), responses((status = 200, description = "Schedule triggered", body = serde_json::Value)))]
 pub async fn run_schedule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let shared_id = schedule_shared_agent_id();
-    let schedules: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
+    let job_id = match parse_cron_job_id(&id) {
+        Ok(jid) => jid,
+        Err(e) => return e,
     };
 
-    let schedule = match schedules.iter().find(|s| s["id"].as_str() == Some(&id)) {
-        Some(s) => s.clone(),
+    let job = match state.kernel.cron().get_job(job_id) {
+        Some(j) => j,
         None => {
             return ApiErrorResponse::not_found("Schedule not found").into_json_tuple();
         }
     };
 
-    let agent_id_str = schedule["agent_id"].as_str().unwrap_or("");
-    let workflow_id_str = schedule["workflow_id"].as_str().unwrap_or("");
-    let message = schedule["message"]
-        .as_str()
-        .unwrap_or("Scheduled task triggered manually.");
-    let name = schedule["name"].as_str().unwrap_or("(unnamed)");
+    let name = job.name.clone();
+    let agent_id = job.agent_id;
 
-    // Update last_run and run_count
-    let mut schedules_updated: Vec<serde_json::Value> = match state
-        .kernel
-        .memory_substrate()
-        .structured_get(shared_id, SCHEDULES_KEY)
-    {
-        Ok(Some(serde_json::Value::Array(arr))) => arr,
-        _ => Vec::new(),
-    };
-    for s in schedules_updated.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            s["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            let count = s["run_count"].as_u64().unwrap_or(0);
-            s["run_count"] = serde_json::json!(count + 1);
-            break;
-        }
-    }
-    if let Err(e) = state.kernel.memory_substrate().structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules_updated),
-    ) {
-        tracing::warn!("Failed to save structured data: {e}");
-    }
-
-    // Route: workflow execution or agent message
-    if !workflow_id_str.is_empty() {
-        // Run workflow
-        let wid = match workflow_id_str.parse::<uuid::Uuid>() {
-            Ok(u) => WorkflowId(u),
-            Err(_) => {
-                return ApiErrorResponse::bad_request("Invalid workflow_id").into_json_tuple();
-            }
-        };
-        let input = if message.is_empty() {
-            format!("[Scheduled workflow '{}' triggered]", name)
-        } else {
-            message.to_string()
-        };
-        match state.kernel.run_workflow(wid, input).await {
-            Ok((run_id, output)) => (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "completed",
-                    "schedule_id": id,
-                    "workflow_id": workflow_id_str,
-                    "run_id": run_id.to_string(),
-                    "output": output,
-                })),
-            ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "failed",
-                    "schedule_id": id,
-                    "error": format!("{e}"),
-                })),
-            ),
-        }
-    } else {
-        // Send message to agent
-        let target_agent = if !agent_id_str.is_empty() {
-            if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-                if state.kernel.agent_registry().get(aid).is_some() {
-                    Some(aid)
-                } else {
-                    None
+    match &job.action {
+        librefang_types::scheduler::CronAction::Workflow {
+            workflow_id, input, ..
+        } => {
+            let wid = match workflow_id.parse::<uuid::Uuid>() {
+                Ok(u) => WorkflowId(u),
+                Err(_) => {
+                    return ApiErrorResponse::bad_request("Invalid workflow_id").into_json_tuple();
                 }
-            } else {
-                state
-                    .kernel
-                    .agent_registry()
-                    .list()
-                    .iter()
-                    .find(|a| a.name == agent_id_str)
-                    .map(|a| a.id)
+            };
+            let wf_input = input
+                .clone()
+                .unwrap_or_else(|| format!("[Scheduled workflow '{}' triggered]", name));
+            match state.kernel.run_workflow(wid, wf_input).await {
+                Ok((run_id, output)) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "completed",
+                        "schedule_id": id,
+                        "workflow_id": workflow_id,
+                        "run_id": run_id.to_string(),
+                        "output": output,
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "failed",
+                        "schedule_id": id,
+                        "error": format!("{e}"),
+                    })),
+                ),
             }
-        } else {
-            None
-        };
-
-        let target_agent = match target_agent {
-            Some(a) => a,
-            None => {
-                return ApiErrorResponse::not_found(
-                    "No target agent found. Specify an agent_id or start an agent first.",
-                )
-                .into_json_tuple();
+        }
+        librefang_types::scheduler::CronAction::AgentTurn { message, .. } => {
+            let kernel_handle: Arc<dyn KernelHandle> =
+                state.kernel.clone() as Arc<dyn KernelHandle>;
+            match state
+                .kernel
+                .send_message_with_handle(agent_id, message, Some(kernel_handle))
+                .await
+            {
+                Ok(result) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "completed",
+                        "schedule_id": id,
+                        "agent_id": agent_id.to_string(),
+                        "response": result.response,
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "failed",
+                        "schedule_id": id,
+                        "error": format!("{e}"),
+                    })),
+                ),
             }
-        };
-
-        let run_message = if message.is_empty() {
-            format!("[Scheduled task '{}' triggered]", name)
-        } else {
-            message.to_string()
-        };
-
-        let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-        match state
-            .kernel
-            .send_message_with_handle(target_agent, &run_message, Some(kernel_handle))
-            .await
-        {
-            Ok(result) => (
+        }
+        librefang_types::scheduler::CronAction::SystemEvent { text } => {
+            // Fire-and-forget system event
+            let event = librefang_types::event::Event::new(
+                AgentId::new(),
+                librefang_types::event::EventTarget::Broadcast,
+                librefang_types::event::EventPayload::Custom(text.as_bytes().to_vec()),
+            );
+            state.kernel.publish_event(event).await;
+            (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "completed",
                     "schedule_id": id,
-                    "agent_id": target_agent.to_string(),
-                    "response": result.response,
+                    "type": "system_event",
                 })),
-            ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "status": "failed",
-                    "schedule_id": id,
-                    "error": format!("{e}"),
-                })),
-            ),
+            )
         }
     }
 }

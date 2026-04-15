@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 19;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -69,6 +69,22 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 15 {
         migrate_v15(conn)?;
+    }
+
+    if current_version < 16 {
+        migrate_v16(conn)?;
+    }
+
+    if current_version < 17 {
+        migrate_v17(conn)?;
+    }
+
+    if current_version < 18 {
+        migrate_v18(conn)?;
+    }
+
+    if current_version < 19 {
+        migrate_v19(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -533,6 +549,96 @@ fn migrate_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
     }
     conn.execute(
         "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (15, datetime('now'), 'Add multimodal memory columns (image_url, image_embedding, modality)')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v16: Add peer_id column to memories and sessions for per-user isolation.
+fn migrate_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "peer_id") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN peer_id TEXT DEFAULT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_peer ON memories(agent_id, peer_id)",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "sessions", "peer_id") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN peer_id TEXT DEFAULT NULL",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_peer ON sessions(agent_id, peer_id)",
+            [],
+        )?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (16, datetime('now'), 'Add peer_id to memories and sessions for per-user isolation')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// V17: Persistent approval audit log.
+fn migrate_v17(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS approval_audit (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            action_summary TEXT NOT NULL DEFAULT '',
+            risk_level TEXT NOT NULL DEFAULT 'low',
+            decision TEXT NOT NULL,
+            decided_by TEXT,
+            decided_at TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            feedback TEXT,
+            second_factor_used INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_audit_agent ON approval_audit(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_approval_audit_decided ON approval_audit(decided_at);
+        ",
+    )?;
+    // Migration: add second_factor_used column (ignore error if already exists)
+    let _ = conn.execute(
+        "ALTER TABLE approval_audit ADD COLUMN second_factor_used INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    Ok(())
+}
+
+fn migrate_v18(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS totp_lockout (
+            sender_id  TEXT    PRIMARY KEY,
+            failures   INTEGER NOT NULL DEFAULT 0,
+            locked_at  INTEGER             -- Unix timestamp (seconds) when lockout started, NULL if below threshold
+        );",
+    )
+}
+
+/// Version 19: Add `provider` column to usage_events so the metering engine
+/// can enforce per-provider budget caps (issue #2316).
+fn migrate_v19(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "usage_events", "provider") {
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_provider_time ON usage_events(provider, timestamp)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (19, datetime('now'), 'Add provider column for per-provider budgets')",
         [],
     )?;
     Ok(())

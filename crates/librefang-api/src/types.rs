@@ -122,10 +122,14 @@ pub struct SpawnRequest {
     /// Agent manifest as TOML string (optional if `template` is provided).
     #[serde(default)]
     pub manifest_toml: String,
-    /// Template name from `~/.librefang/agents/{template}/agent.toml`.
+    /// Template name from `~/.librefang/workspaces/agents/{template}/agent.toml`.
     /// When provided and `manifest_toml` is empty, the template is loaded automatically.
     #[serde(default)]
     pub template: Option<String>,
+    /// Optional custom name for the agent. Overrides the name from the template
+    /// or manifest, allowing multiple agents from the same template.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Optional Ed25519 signed manifest envelope (JSON).
     /// When present, the signature is verified before spawning.
     #[serde(default)]
@@ -137,6 +141,21 @@ pub struct SpawnRequest {
 pub struct SpawnResponse {
     pub agent_id: String,
     pub name: String,
+}
+
+/// OpenAPI schema stand-in for `librefang_channels::types::ParticipantRef`.
+///
+/// The real type lives in `librefang-channels`, which does not depend on
+/// utoipa. This mirror struct exists only so `#[schema(value_type = ...)]`
+/// on `MessageRequest.group_participants` can expose the shape to the
+/// generated OpenAPI document.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct ParticipantRefSchema {
+    /// Platform JID (e.g. `1234567890@s.whatsapp.net`).
+    pub jid: String,
+    /// Human-readable name (push-name, contact name, or first part of JID).
+    pub display_name: String,
 }
 
 /// A file attachment reference (from a prior upload).
@@ -171,11 +190,34 @@ pub struct MessageRequest {
     /// Whether the bot was @mentioned in a group message.
     #[serde(default)]
     pub was_mentioned: bool,
+    /// Optional group participant roster (Phase 2 §C addressee guard).
+    ///
+    /// Forwarded by the WhatsApp gateway for group messages so the kernel's
+    /// addressee guard (`is_addressed_to_other_participant`) can detect when
+    /// a turn is addressed to a named participant other than the agent.
+    ///
+    /// `#[serde(default)]` ensures backward compatibility for callers (Telegram,
+    /// direct API) that don't populate this field.
+    #[serde(default)]
+    #[schema(value_type = Option<Vec<ParticipantRefSchema>>)]
+    pub group_participants: Option<Vec<librefang_channels::types::ParticipantRef>>,
     /// If true, this is an ephemeral "side question" (`/btw`).
     /// The message is answered using the agent's system prompt but WITHOUT
     /// loading or saving session history — the real conversation is untouched.
     #[serde(default)]
     pub ephemeral: bool,
+    /// Per-call deep-thinking override.
+    ///
+    /// - `Some(true)`: force thinking on (even if the manifest has it off)
+    /// - `Some(false)`: force thinking off (even if the manifest has it on)
+    /// - `None`: use the manifest/global default
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// Whether the response should include the model's thinking/reasoning trace.
+    ///
+    /// `None` defaults to `true` when thinking content is available.
+    #[serde(default)]
+    pub show_thinking: Option<bool>,
 }
 
 /// Response from sending a message.
@@ -205,6 +247,10 @@ pub struct MessageResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = Vec<serde_json::Value>)]
     pub memory_conflicts: Vec<librefang_types::memory::MemoryConflict>,
+    /// Combined thinking/reasoning trace from the model, when the caller
+    /// requested `show_thinking = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// Request to inject a message into a running agent's tool-execution loop (#956).
@@ -225,6 +271,9 @@ pub struct InjectMessageResponse {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SkillInstallRequest {
     pub name: String,
+    /// Install into a specific hand's workspace instead of globally.
+    #[serde(default)]
+    pub hand: Option<String>,
 }
 
 /// Request to uninstall a skill.
@@ -267,6 +316,9 @@ pub struct MigrateScanRequest {
 pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
+    /// Install into a specific hand's workspace instead of globally.
+    #[serde(default)]
+    pub hand: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +397,8 @@ pub struct AgentListQuery {
     pub sort: Option<String>,
     /// Sort direction: "asc" or "desc" (default: "asc").
     pub order: Option<String>,
+    /// Include hand agents in the response (default: false).
+    pub include_hands: Option<bool>,
 }
 
 /// Paginated list response wrapper.

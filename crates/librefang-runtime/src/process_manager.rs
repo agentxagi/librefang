@@ -84,11 +84,23 @@ impl ProcessManager {
             ));
         }
 
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Put the child in its own process group so `kill_process_tree`
+        // can safely use `kill(-pgid, ...)` to reach the whole subtree.
+        // Without this the child inherits the parent's pgid and the
+        // tree-kill path would target whichever unrelated process group
+        // happens to have the child's PID as its PGID — see
+        // `is_process_group_leader` in subprocess_sandbox.rs for why
+        // that matters on long-lived runners like GitHub Actions.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start process '{}': {}", command, e))?;
 
@@ -264,17 +276,40 @@ impl Default for ProcessManager {
 mod tests {
     use super::*;
 
+    /// Long-running, IO-quiet placeholder process for tests that need
+    /// "something alive in the registry until we kill it". The earlier
+    /// history of this helper is a cautionary tale: it used `cat`,
+    /// which blocked on stdin and exposed a latent bug where
+    /// `kill_process_tree` sent `kill -TERM -<pid>` to a non-leader
+    /// (because `ProcessManager::start` didn't put the child in its
+    /// own pgid). On Ubuntu CI the resulting signal would occasionally
+    /// land on the actions-runner session leader, killing the whole
+    /// job mid-test. Moving to `sleep` narrowed the window but didn't
+    /// fix the root cause — that took
+    /// (a) spawning children with `process_group(0)` and
+    /// (b) gating the negative-PID kill on `is_process_group_leader`
+    /// in `subprocess_sandbox::kill_tree_unix`.
+    fn long_running_proc() -> (&'static str, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd",
+                vec![
+                    "/C".to_string(),
+                    "timeout".to_string(),
+                    "/t".to_string(),
+                    "30".to_string(),
+                ],
+            )
+        } else {
+            ("sleep", vec!["30".to_string()])
+        }
+    }
+
     #[tokio::test]
     async fn test_start_and_list() {
         let pm = ProcessManager::new(5);
 
-        let cmd = if cfg!(windows) { "cmd" } else { "cat" };
-        let args: Vec<String> = if cfg!(windows) {
-            vec!["/C".to_string(), "echo".to_string(), "hello".to_string()]
-        } else {
-            vec![]
-        };
-
+        let (cmd, args) = long_running_proc();
         let id = pm.start("agent1", cmd, &args).await.unwrap();
         assert!(id.starts_with("proc_"));
 
@@ -290,18 +325,7 @@ mod tests {
     async fn test_per_agent_limit() {
         let pm = ProcessManager::new(1);
 
-        let cmd = if cfg!(windows) { "cmd" } else { "cat" };
-        let args: Vec<String> = if cfg!(windows) {
-            vec![
-                "/C".to_string(),
-                "timeout".to_string(),
-                "/t".to_string(),
-                "10".to_string(),
-            ]
-        } else {
-            vec![]
-        };
-
+        let (cmd, args) = long_running_proc();
         let id1 = pm.start("agent1", cmd, &args).await.unwrap();
         let result = pm.start("agent1", cmd, &args).await;
         assert!(result.is_err());

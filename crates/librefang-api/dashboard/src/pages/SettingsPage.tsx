@@ -1,261 +1,428 @@
-import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Card } from "../components/ui/Card";
-import { Badge } from "../components/ui/Badge";
-import { Button } from "../components/ui/Button";
-import { Input } from "../components/ui/Input";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { PageHeader } from "../components/ui/PageHeader";
-import { ListSkeleton } from "../components/ui/Skeleton";
-import { Globe, Sun, Moon, Settings, PanelLeftClose, PanelLeft, Wrench, Search, RefreshCw, Lock } from "lucide-react";
+import { Button } from "../components/ui/Button";
+import { Badge } from "../components/ui/Badge";
+import {
+  Globe, Sun, Moon, Settings, PanelLeftClose, PanelLeft, Languages, LayoutDashboard,
+  Shield, CheckCircle, XCircle, Download,
+} from "lucide-react";
 import { useUIStore } from "../lib/store";
-import { changePassword, checkDashboardAuthMode, clearApiKey, listTools } from "../api";
+import { totpSetup, totpConfirm, totpStatus, totpRevoke } from "../api";
 
-// Tool name i18n mapping for Chinese
-const toolNameZh: Record<string, string> = {
-  file_read: "读取文件", file_write: "写入文件", file_list: "列出文件",
-  apply_patch: "应用补丁", web_fetch: "网页抓取", web_search: "网页搜索",
-  shell_exec: "执行命令", memory_store: "存储记忆", memory_recall: "回忆记忆",
-  schedule_create: "创建调度", schedule_list: "调度列表", schedule_delete: "删除调度",
-  knowledge_add_entity: "添加实体", knowledge_add_relation: "添加关系", knowledge_query: "知识查询",
-  event_publish: "发布事件", cron_create: "创建定时", cron_delete: "删除定时",
-  agent_send: "发送消息", agent_list: "智能体列表",
-};
+interface SegmentOption<T extends string> {
+  value: T;
+  icon: React.ElementType;
+  label: string;
+}
 
-const toolDescZh: Record<string, string> = {
-  file_read: "读取指定路径的文件内容", file_write: "将内容写入指定文件", file_list: "列出目录下的文件",
-  apply_patch: "应用代码补丁到文件", web_fetch: "抓取网页内容", web_search: "搜索互联网信息",
-  shell_exec: "在系统终端执行命令", memory_store: "将信息存储到长期记忆", memory_recall: "从长期记忆中检索信息",
-  schedule_create: "创建新的调度任务", schedule_list: "列出所有调度任务", schedule_delete: "删除指定的调度任务",
-  knowledge_add_entity: "向知识图谱添加实体", knowledge_add_relation: "向知识图谱添加关系", knowledge_query: "查询知识图谱",
-  event_publish: "发布事件到事件总线", cron_create: "创建定时任务", cron_delete: "删除定时任务",
-  agent_send: "向智能体发送消息", agent_list: "列出所有智能体",
-};
-
-function OptionCard({ active, icon: Icon, label, onClick }: { active: boolean; icon: any; label: string; onClick: () => void }) {
+function SegmentControl<T extends string>({
+  options,
+  value,
+  onChange,
+}: {
+  options: SegmentOption<T>[];
+  value: T;
+  onChange: (v: T) => void;
+}) {
   return (
-    <button
-      onClick={onClick}
-      className={`flex flex-1 items-center justify-center gap-2 rounded-xl border py-2.5 text-sm font-bold transition-colors duration-300 ${
-        active
-          ? "border-brand/30 bg-brand/10 text-brand shadow-sm shadow-brand/10"
-          : "border-border-subtle bg-surface text-text-dim hover:border-brand/20 hover:text-brand"
-      }`}
-    >
-      <Icon className="h-4 w-4" />
-      <span className="truncate">{label}</span>
-    </button>
+    <div className="flex bg-main rounded-lg p-0.5 border border-border-subtle gap-0.5 shrink-0">
+      {options.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            onClick={() => onChange(opt.value)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all duration-150 ${
+              active
+                ? "bg-surface shadow-sm text-brand border border-brand/15"
+                : "text-text-dim hover:text-text"
+            }`}
+          >
+            <opt.icon className="w-3 h-3 shrink-0" />
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SettingRow({
+  icon: Icon,
+  iconColor,
+  label,
+  description,
+  children,
+}: {
+  icon: React.ElementType;
+  iconColor: string;
+  label: string;
+  description: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-4 py-4 border-b border-border-subtle/50 last:border-0">
+      <Icon className={`w-4 h-4 shrink-0 ${iconColor}`} />
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-semibold">{label}</p>
+        <p className="text-xs text-text-dim mt-0.5">{description}</p>
+      </div>
+      {children}
+    </div>
   );
 }
 
 export function SettingsPage() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const theme = useUIStore((s) => s.theme);
   const toggleTheme = useUIStore((s) => s.toggleTheme);
   const language = useUIStore((s) => s.language);
   const setLanguage = useUIStore((s) => s.setLanguage);
   const navLayout = useUIStore((s) => s.navLayout);
   const setNavLayout = useUIStore((s) => s.setNavLayout);
-  const isZh = i18n.language === "zh";
-  const [toolSearch, setToolSearch] = useState("");
-
-  // Password change state
-  const [currentPassword, setCurrentPassword] = useState("");
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [pwChanging, setPwChanging] = useState(false);
-  const [pwMessage, setPwMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
-
-  const authModeQuery = useQuery({ queryKey: ["authMode"], queryFn: checkDashboardAuthMode });
-  const hasCredentialAuth = authModeQuery.data === "credentials";
-
-  const toolsQuery = useQuery({ queryKey: ["tools"], queryFn: listTools });
-  const tools = toolsQuery.data ?? [];
-  const filteredTools = useMemo(() =>
-    tools.filter((tool: any) => !toolSearch || (tool.name || "").toLowerCase().includes(toolSearch.toLowerCase()) || (tool.description || "").toLowerCase().includes(toolSearch.toLowerCase())),
-    [tools, toolSearch]
-  );
-
-  const labelClass = "text-[10px] font-black uppercase tracking-widest text-text-dim mb-2.5 block";
-
   return (
-    <div className="flex flex-col gap-4 sm:gap-6 transition-colors duration-300">
+    <div className="flex flex-col gap-6 transition-colors duration-300">
       <PageHeader
         badge={t("settings.system_config")}
         title={t("settings.title")}
         subtitle={t("settings.subtitle")}
         icon={<Settings className="h-4 w-4" />}
-        helpText={t("settings.help")}
+
       />
 
-      <div className="grid gap-4 sm:gap-6 lg:grid-cols-2">
-        {/* Appearance Settings */}
-        <Card padding="lg" hover className="min-w-0 overflow-hidden">
-          <h2 className="text-base sm:text-lg font-black tracking-tight mb-5 sm:mb-6">{t("settings.appearance")}</h2>
-          <div className="space-y-5 sm:space-y-8">
-            <div>
-              <span className={labelClass}>{t("settings.theme")}</span>
-              <div className="flex gap-2 sm:gap-3">
-                <OptionCard active={theme === "light"} icon={Sun} label={t("settings.theme_light")} onClick={() => theme !== "light" && toggleTheme()} />
-                <OptionCard active={theme === "dark"} icon={Moon} label={t("settings.theme_dark")} onClick={() => theme !== "dark" && toggleTheme()} />
-              </div>
-            </div>
-            <div>
-              <span className={labelClass}>{t("settings.language")}</span>
-              <div className="flex gap-2 sm:gap-3">
-                <OptionCard active={language === "en"} icon={Globe} label="English" onClick={() => setLanguage("en")} />
-                <OptionCard active={language === "zh"} icon={Globe} label="中文" onClick={() => setLanguage("zh")} />
-              </div>
-            </div>
-            <div>
-              <span className={labelClass}>{t("settings.nav_layout")}</span>
-              <div className="flex gap-2 sm:gap-3">
-                <OptionCard active={navLayout === "grouped"} icon={PanelLeft} label={t("settings.nav_grouped")} onClick={() => setNavLayout("grouped")} />
-                <OptionCard active={navLayout === "collapsible"} icon={PanelLeftClose} label={t("settings.nav_collapsible")} onClick={() => setNavLayout("collapsible")} />
-              </div>
-            </div>
-          </div>
-        </Card>
+      <div className="rounded-2xl border border-border-subtle bg-surface">
+        <div className="px-5 py-3 border-b border-border-subtle/50">
+          <p className="text-[10px] font-black uppercase tracking-widest text-text-dim">
+            {t("settings.appearance")}
+          </p>
+        </div>
+        <div className="px-5">
+          <SettingRow
+            icon={theme === "dark" ? Moon : Sun}
+            iconColor="text-amber-500"
+            label={t("settings.theme")}
+            description={t("settings.theme_desc")}
+          >
+            <SegmentControl
+              value={theme}
+              onChange={(v) => v !== theme && toggleTheme()}
+              options={[
+                { value: "light", icon: Sun, label: t("settings.theme_light") },
+                { value: "dark", icon: Moon, label: t("settings.theme_dark") },
+              ]}
+            />
+          </SettingRow>
 
-        {/* Tools Management */}
-        <Card padding="lg" hover className="min-w-0 overflow-hidden">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-base sm:text-lg font-black tracking-tight flex items-center gap-2">
-              <Wrench className="w-4 h-4 sm:w-5 sm:h-5 text-brand" />
-              {t("settings.tools_title")}
-            </h2>
-            <div className="flex items-center gap-2">
-              <Badge variant="brand">{tools.length}</Badge>
-              <button onClick={() => toolsQuery.refetch()} className="p-1.5 rounded-lg hover:bg-main">
-                <RefreshCw className={`w-3.5 h-3.5 text-text-dim ${toolsQuery.isFetching ? "animate-spin" : ""}`} />
-              </button>
-            </div>
-          </div>
+          <SettingRow
+            icon={Languages}
+            iconColor="text-sky-500"
+            label={t("settings.language")}
+            description={t("settings.language_desc")}
+          >
+            <SegmentControl
+              value={language}
+              onChange={setLanguage}
+              options={[
+                { value: "en", icon: Globe, label: "English" },
+                { value: "zh", icon: Globe, label: "中文" },
+              ]}
+            />
+          </SettingRow>
 
-          <div className="mb-3">
-            <Input value={toolSearch} onChange={(e) => setToolSearch(e.target.value)}
-              placeholder={t("settings.tools_search")}
-              leftIcon={<Search className="h-3.5 w-3.5" />}
-              className="text-xs!" />
-          </div>
+          <SettingRow
+            icon={LayoutDashboard}
+            iconColor="text-violet-500"
+            label={t("settings.nav_layout")}
+            description={t("settings.nav_layout_desc")}
+          >
+            <SegmentControl
+              value={navLayout}
+              onChange={setNavLayout}
+              options={[
+                { value: "grouped", icon: PanelLeft, label: t("settings.nav_grouped") },
+                { value: "collapsible", icon: PanelLeftClose, label: t("settings.nav_collapsible") },
+              ]}
+            />
+          </SettingRow>
+        </div>
+      </div>
 
-          <div className="space-y-1 sm:max-h-80 sm:overflow-y-auto scrollbar-thin">
-            {toolsQuery.isLoading ? (
-              <ListSkeleton rows={3} />
-            ) : filteredTools.length === 0 ? (
-              <p className="text-xs text-text-dim italic text-center py-4">{t("common.no_data")}</p>
+      {/* TOTP Second Factor */}
+      <TotpSection />
+
+      {/* Config Backup */}
+      <ConfigBackupSection />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  TOTP Management Section                                            */
+/* ------------------------------------------------------------------ */
+
+function TotpSection() {
+  const { t } = useTranslation();
+  const [setupData, setSetupData] = useState<{ otpauth_uri: string; secret: string; qr_code: string | null; recovery_codes: string[] } | null>(null);
+  const [confirmCode, setConfirmCode] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [revokeCode, setRevokeCode] = useState("");
+  const [showResetPrompt, setShowResetPrompt] = useState(false);
+  const [showRevokePrompt, setShowRevokePrompt] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const statusQuery = useQuery({
+    queryKey: ["totp", "status"],
+    queryFn: totpStatus,
+  });
+
+  const status = statusQuery.data;
+
+  async function handleSetup(currentCode?: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await totpSetup(currentCode);
+      setSetupData({ otpauth_uri: data.otpauth_uri, secret: data.secret, qr_code: data.qr_code, recovery_codes: data.recovery_codes });
+      setShowResetPrompt(false);
+      setResetCode("");
+    } catch (e: any) {
+      setError(e.message || "Setup failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function initiateSetup() {
+    if (status?.confirmed) {
+      setShowResetPrompt(true);
+      setShowRevokePrompt(false);
+      setError(null);
+    } else {
+      handleSetup();
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokeCode) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await totpRevoke(revokeCode);
+      setSuccess("TOTP revoked. Set second_factor = \"none\" in config.");
+      setShowRevokePrompt(false);
+      setRevokeCode("");
+      statusQuery.refetch();
+    } catch (e: any) {
+      setError(e.message || "Revoke failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleConfirm() {
+    if (confirmCode.length !== 6) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await totpConfirm(confirmCode);
+      setSuccess("TOTP confirmed. Set second_factor = \"totp\" in config to enforce.");
+      setSetupData(null);
+      setConfirmCode("");
+      statusQuery.refetch();
+    } catch (e: any) {
+      setError(e.message || "Invalid code");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border border-border-subtle bg-surface">
+      <div className="px-5 py-3 border-b border-border-subtle/50">
+        <p className="text-[10px] font-black uppercase tracking-widest text-text-dim">
+          {t("settings.security", "Security")}
+        </p>
+      </div>
+      <div className="px-5">
+        <SettingRow
+          icon={Shield}
+          iconColor="text-emerald-500"
+          label={t("settings.totp_title", "TOTP Second Factor")}
+          description={t("settings.totp_desc", "Require authenticator app code when approving critical tool executions")}
+        >
+          <div className="flex items-center gap-2">
+            {status?.confirmed ? (
+              <Badge variant="success">
+                <CheckCircle className="w-3 h-3 mr-1" />
+                {t("settings.totp_enrolled", "Enrolled")}
+              </Badge>
             ) : (
-              filteredTools.map((tool: any, i: number) => (
-                <div key={tool.name || i} className="flex items-start gap-3 px-3 py-2.5 rounded-xl border border-transparent hover:border-brand/15 hover:bg-gradient-to-r hover:from-brand/5 hover:to-transparent transition-colors duration-300 group cursor-default">
-                  <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-brand/15 to-brand/5 flex items-center justify-center shrink-0 ring-1 ring-brand/10 group-hover:ring-brand/25 group-hover:shadow-sm group-hover:shadow-brand/10 transition-shadow duration-300">
-                    <Wrench className="w-3.5 h-3.5 text-brand/70 group-hover:text-brand transition-colors duration-300" />
-                  </div>
-                  <div className="min-w-0 flex-1 pt-0.5">
-                    <div className="flex items-center gap-2">
-                      <p className="text-[13px] font-bold truncate group-hover:text-brand transition-colors duration-300">{isZh ? (toolNameZh[tool.name] || tool.name) : (tool.name || tool.id)}</p>
-                      {tool.source && (
-                        <span className="text-[8px] px-1.5 py-[1px] rounded-full bg-brand/8 text-brand/50 font-semibold uppercase tracking-wider shrink-0 border border-brand/10">{tool.source}</span>
-                      )}
-                    </div>
-                    {tool.description && <p className="text-[11px] text-text-dim/80 truncate mt-0.5 leading-relaxed">{isZh ? (toolDescZh[tool.name] || tool.description) : tool.description}</p>}
-                  </div>
-                </div>
-              ))
+              <Badge variant="default">
+                <XCircle className="w-3 h-3 mr-1" />
+                {t("settings.totp_not_enrolled", "Not enrolled")}
+              </Badge>
+            )}
+            {status?.enforced && (
+              <Badge variant="info">{t("settings.totp_enforced", "Enforced")}</Badge>
             )}
           </div>
-        </Card>
+        </SettingRow>
 
-        {/* Change Password — only shown when credential auth is active */}
-        {hasCredentialAuth && (
-          <Card padding="lg" hover className="min-w-0 overflow-hidden">
-            <h2 className="text-base sm:text-lg font-black tracking-tight flex items-center gap-2 mb-5 sm:mb-6">
-              <Lock className="w-4 h-4 sm:w-5 sm:h-5 text-brand" />
-              {t("settings.change_password")}
-            </h2>
-            <form
-              className="space-y-4"
-              onSubmit={async (e) => {
-                e.preventDefault();
-                setPwMessage(null);
-                if (newPassword !== confirmPassword) {
-                  setPwMessage({ type: "error", text: t("settings.pw_mismatch") });
-                  return;
-                }
-                if (!newPassword.trim()) {
-                  setPwMessage({ type: "error", text: t("settings.pw_empty") });
-                  return;
-                }
-                if (newPassword.length < 8) {
-                  setPwMessage({ type: "error", text: t("settings.pw_too_short") });
-                  return;
-                }
-                setPwChanging(true);
-                try {
-                  const res = await changePassword(currentPassword, newPassword);
-                  if (res.ok) {
-                    setPwMessage({ type: "success", text: t("settings.pw_success") });
-                    setCurrentPassword("");
-                    setNewPassword("");
-                    setConfirmPassword("");
-                    // Server invalidated all sessions, force re-login after short delay
-                    setTimeout(() => {
-                      clearApiKey();
-                      window.location.reload();
-                    }, 1500);
-                  } else {
-                    setPwMessage({ type: "error", text: res.error || t("settings.pw_failed") });
-                  }
-                } catch (err: any) {
-                  setPwMessage({ type: "error", text: err.message || t("settings.pw_failed") });
-                } finally {
-                  setPwChanging(false);
-                }
-              }}
-            >
-              <Input
-                type="password"
-                label={t("settings.pw_current")}
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                placeholder="********"
-                autoComplete="current-password"
-                leftIcon={<Lock className="h-3.5 w-3.5" />}
-                className="text-xs!"
-                required
-              />
-              <Input
-                type="password"
-                label={t("settings.pw_new")}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="********"
-                autoComplete="new-password"
-                leftIcon={<Lock className="h-3.5 w-3.5" />}
-                className="text-xs!"
-                required
-              />
-              <Input
-                type="password"
-                label={t("settings.pw_confirm")}
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="********"
-                autoComplete="new-password"
-                leftIcon={<Lock className="h-3.5 w-3.5" />}
-                className="text-xs!"
-                required
-              />
-              {pwMessage && (
-                <p className={`text-xs font-semibold ${pwMessage.type === "success" ? "text-success" : "text-error"}`}>
-                  {pwMessage.text}
-                </p>
-              )}
-              <Button type="submit" variant="primary" size="sm" isLoading={pwChanging} leftIcon={<Lock className="h-3.5 w-3.5" />}>
-                {t("settings.pw_submit")}
-              </Button>
-            </form>
-          </Card>
+
+        {status?.confirmed && status.remaining_recovery_codes <= 2 && (
+          <div className="px-1 py-2 text-sm text-warning flex items-center gap-2">
+            <Shield className="w-4 h-4 shrink-0" />
+            {status.remaining_recovery_codes === 0
+              ? t("settings.totp_no_recovery", "No recovery codes remaining. Reset TOTP to generate new ones.")
+              : t("settings.totp_low_recovery", {
+                  defaultValue: "Only {{count}} recovery code(s) remaining.",
+                  count: status.remaining_recovery_codes,
+                })}
+          </div>
         )}
+
+        <div className="py-4">
+          {showResetPrompt && !setupData ? (
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <input
+                type="text"
+                value={resetCode}
+                onChange={(e) => setResetCode(e.target.value)}
+                placeholder={t("settings.totp_reset_placeholder", "Current TOTP or recovery code")}
+                className="w-full sm:w-48 rounded-xl border border-border-subtle bg-main px-3 py-2 text-sm font-mono focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none transition-colors"
+                onKeyDown={(e) => e.key === "Enter" && resetCode && handleSetup(resetCode)}
+              />
+              <Button variant="primary" size="sm" onClick={() => handleSetup(resetCode)} disabled={!resetCode || loading} isLoading={loading}>
+                {t("settings.totp_verify_reset", "Verify & Reset")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => { setShowResetPrompt(false); setResetCode(""); }}>
+                {t("common.cancel", "Cancel")}
+              </Button>
+            </div>
+          ) : showRevokePrompt && !setupData ? (
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <input
+                type="text"
+                value={revokeCode}
+                onChange={(e) => setRevokeCode(e.target.value)}
+                placeholder={t("settings.totp_revoke_placeholder", "TOTP or recovery code")}
+                className="w-full sm:w-48 rounded-xl border border-border-subtle bg-main px-3 py-2 text-sm font-mono focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none transition-colors"
+                onKeyDown={(e) => e.key === "Enter" && revokeCode && handleRevoke()}
+              />
+              <Button variant="danger" size="sm" onClick={handleRevoke} disabled={!revokeCode || loading} isLoading={loading}>
+                {t("settings.totp_confirm_revoke", "Confirm Revoke")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => { setShowRevokePrompt(false); setRevokeCode(""); }}>
+                {t("common.cancel", "Cancel")}
+              </Button>
+            </div>
+          ) : !setupData ? (
+            <div className="flex gap-2">
+              <Button variant="secondary" size="sm" onClick={initiateSetup} isLoading={loading}>
+                {status?.confirmed
+                  ? t("settings.totp_reset", "Reset TOTP")
+                  : t("settings.totp_setup", "Set up TOTP")}
+              </Button>
+              {status?.confirmed && (
+                <Button
+                  variant="danger"
+                  size="sm"
+                  onClick={() => { setShowRevokePrompt(true); setShowResetPrompt(false); setError(null); }}
+                >
+                  {t("settings.totp_revoke", "Revoke TOTP")}
+                </Button>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <p className="text-sm text-text-dim">
+                {t("settings.totp_scan", "Scan the QR code or enter the secret in your authenticator app:")}
+              </p>
+              {setupData.qr_code && (
+                <div className="flex justify-center p-4 bg-white rounded-xl border border-border-subtle">
+                  <img src={setupData.qr_code} alt="TOTP QR Code" className="w-40 h-40 sm:w-48 sm:h-48" />
+                </div>
+              )}
+              <code className="block text-sm font-mono bg-main border border-border-subtle rounded-lg px-3 py-2 break-all select-all">
+                {setupData.secret}
+              </code>
+              {setupData.recovery_codes.length > 0 && (
+                <div className="mt-2">
+                  <p className="text-xs font-bold text-text-dim mb-1">
+                    {t("settings.totp_recovery_title", "Recovery Codes (save these somewhere safe):")}
+                  </p>
+                  <div className="grid grid-cols-2 gap-1 bg-main border border-border-subtle rounded-lg p-3">
+                    {setupData.recovery_codes.map((code, i) => (
+                      <code key={i} className="text-sm font-mono text-center select-all">{code}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  pattern="[0-9]*"
+                  value={confirmCode}
+                  onChange={(e) => setConfirmCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="000000"
+                  className="w-28 rounded-xl border border-border-subtle bg-main px-3 py-2 text-sm font-mono tracking-widest text-center focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none transition-colors"
+                  onKeyDown={(e) => e.key === "Enter" && handleConfirm()}
+                />
+                <Button variant="primary" size="sm" onClick={handleConfirm} disabled={confirmCode.length !== 6 || loading} isLoading={loading}>
+                  {t("settings.totp_confirm", "Confirm")}
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => { setSetupData(null); setConfirmCode(""); setError(null); }}>
+                  {t("common.cancel", "Cancel")}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {error && <p className="mt-2 text-sm text-danger">{error}</p>}
+          {success && <p className="mt-2 text-sm text-success">{success}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Config Backup Section                                              */
+/* ------------------------------------------------------------------ */
+
+function ConfigBackupSection() {
+  const { t } = useTranslation();
+
+  return (
+    <div className="rounded-2xl border border-border-subtle bg-surface">
+      <div className="px-5 py-3 border-b border-border-subtle/50">
+        <p className="text-[10px] font-black uppercase tracking-widest text-text-dim">
+          {t("settings.backup", "Backup")}
+        </p>
+      </div>
+      <div className="px-5">
+        <SettingRow
+          icon={Download}
+          iconColor="text-blue-500"
+          label={t("settings.export_config_title", "Export Config")}
+          description={t(
+            "settings.export_config_desc",
+            "Download a backup of your current config.toml settings file"
+          )}
+        >
+          <a href="/api/config/export" download="librefang-config.toml">
+            <Button variant="secondary" size="sm">
+              <Download className="w-3.5 h-3.5 mr-1.5" />
+              {t("settings.export_config_btn", "Download")}
+            </Button>
+          </a>
+        </SettingRow>
       </div>
     </div>
   );

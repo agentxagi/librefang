@@ -17,6 +17,12 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
             "/models/custom/{*id}",
             axum::routing::delete(remove_custom_model),
         )
+        .route(
+            "/models/overrides/{*id}",
+            axum::routing::get(get_model_overrides)
+                .put(set_model_overrides)
+                .delete(delete_model_overrides),
+        )
         .route("/models/{*id}", axum::routing::get(get_model))
         .route("/providers", axum::routing::get(list_providers))
         .route("/catalog/update", axum::routing::post(catalog_update))
@@ -127,6 +133,8 @@ pub async fn list_models(
                 "supports_tools": m.supports_tools,
                 "supports_vision": m.supports_vision,
                 "supports_streaming": m.supports_streaming,
+                "supports_thinking": m.supports_thinking,
+                "aliases": m.aliases,
                 "available": available,
             })
         })
@@ -259,6 +267,8 @@ pub async fn get_model(
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status.is_available())
                 .unwrap_or(m.tier == librefang_types::model_catalog::ModelTier::Custom);
+            let override_key = format!("{}:{}", m.provider, m.id);
+            let overrides = catalog.get_overrides(&override_key);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -275,11 +285,77 @@ pub async fn get_model(
                     "supports_streaming": m.supports_streaming,
                     "aliases": m.aliases,
                     "available": available,
+                    "overrides": overrides,
                 })),
             )
         }
         None => ApiErrorResponse::not_found(format!("Model '{}' not found", id)).into_json_tuple(),
     }
+}
+
+// ── Per-model overrides ─────────────────────────────────────────────────────
+
+/// GET /api/models/overrides/{id} — Get inference parameter overrides for a model.
+pub async fn get_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let catalog = state
+        .kernel
+        .model_catalog_ref()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    match catalog.get_overrides(&id) {
+        Some(o) => (StatusCode::OK, Json(serde_json::to_value(o).unwrap())),
+        None => (StatusCode::OK, Json(serde_json::json!({}))),
+    }
+}
+
+/// PUT /api/models/overrides/{id} — Set inference parameter overrides for a model.
+pub async fn set_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<librefang_types::model_catalog::ModelOverrides>,
+) -> impl IntoResponse {
+    let overrides_path = state.kernel.home_dir().join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = catalog.get_overrides(&id).cloned();
+    catalog.set_overrides(id.clone(), body);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+        // Roll back in-memory change so catalog stays consistent with disk.
+        match previous {
+            Some(prev) => catalog.set_overrides(id, prev),
+            None => {
+                catalog.remove_overrides(&id);
+            }
+        }
+        return ApiErrorResponse::internal(format!("Failed to persist overrides: {e}"))
+            .into_json_tuple();
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// DELETE /api/models/overrides/{id} — Remove inference parameter overrides for a model.
+pub async fn delete_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let overrides_path = state.kernel.home_dir().join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    catalog.remove_overrides(&id);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 /// Attach local-provider probe results to a JSON entry and optionally merge
@@ -372,7 +448,9 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "key_required": p.key_required,
             "api_key_env": p.api_key_env,
             "base_url": p.base_url,
+            "proxy_url": p.proxy_url,
             "media_capabilities": p.media_capabilities,
+            "is_custom": p.is_custom,
         });
 
         // Attach region map so the dashboard can show available regions
@@ -398,12 +476,30 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             }
         }
 
-        // For local providers, attach the probe result
+        // For local providers, attach the probe result and downgrade
+        // auth_status when the service is not reachable so the dashboard
+        // shows "needs setup" instead of "configured".
         if let Some(probe) = probe_map.remove(&i) {
             attach_probe_result(&mut entry, &probe, &p.id, state.kernel.model_catalog_ref());
+            if !probe.reachable {
+                entry["auth_status"] = serde_json::json!("missing");
+            }
         } else if librefang_runtime::provider_health::is_local_provider(&p.id) {
             // Local HTTP provider with no probe result yet — still label it local.
             entry["is_local"] = serde_json::json!(true);
+        }
+
+        // Attach cached manual test result if no probe already set it.
+        // TTL: 10 minutes — stale results are ignored.
+        if let Some(ref_entry) = state.provider_test_cache.get(&p.id) {
+            let (tested_at, ms, tested_rfc3339, reachable) = ref_entry.value();
+            if tested_at.elapsed() < std::time::Duration::from_secs(600) {
+                if entry.get("latency_ms").is_none() || entry["latency_ms"].is_null() {
+                    entry["latency_ms"] = serde_json::json!(ms);
+                }
+                entry["last_tested"] = serde_json::json!(tested_rfc3339);
+                entry["reachable"] = serde_json::json!(reachable);
+            }
         }
 
         providers.push(entry);
@@ -417,6 +513,69 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "total": total,
         })),
     )
+}
+
+/// Returns providers list for the dashboard snapshot endpoint.
+pub(crate) async fn providers_snapshot(state: &Arc<AppState>) -> Vec<serde_json::Value> {
+    let provider_list: Vec<librefang_types::model_catalog::ProviderInfo> = {
+        let catalog = state
+            .kernel
+            .model_catalog_ref()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.list_providers().to_vec()
+    };
+
+    let local_providers: Vec<(usize, String, String)> = provider_list
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            librefang_runtime::provider_health::is_local_provider(&p.id) && !p.base_url.is_empty()
+        })
+        .map(|(i, p)| (i, p.id.clone(), p.base_url.clone()))
+        .collect();
+
+    let cache = &state.provider_probe_cache;
+    let probe_futures: Vec<_> = local_providers
+        .iter()
+        .map(|(_, id, url)| {
+            librefang_runtime::provider_health::probe_provider_cached(id, url, cache)
+        })
+        .collect();
+    let probe_results = futures::future::join_all(probe_futures).await;
+
+    let mut probe_map: HashMap<usize, librefang_runtime::provider_health::ProbeResult> =
+        HashMap::with_capacity(local_providers.len());
+    for ((idx, _, _), result) in local_providers.iter().zip(probe_results.into_iter()) {
+        probe_map.insert(*idx, result);
+    }
+
+    let mut providers: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
+    for (i, p) in provider_list.iter().enumerate() {
+        let mut entry = serde_json::json!({
+            "id": p.id,
+            "display_name": p.display_name,
+            "auth_status": p.auth_status,
+            "model_count": p.model_count,
+            "key_required": p.key_required,
+            "api_key_env": p.api_key_env,
+            "base_url": p.base_url,
+            "proxy_url": p.proxy_url,
+            "media_capabilities": p.media_capabilities,
+            "is_custom": p.is_custom,
+        });
+        if let Some(probe) = probe_map.remove(&i) {
+            attach_probe_result(&mut entry, &probe, &p.id, state.kernel.model_catalog_ref());
+            if !probe.reachable {
+                entry["auth_status"] = serde_json::json!("missing");
+            }
+        } else if librefang_runtime::provider_health::is_local_provider(&p.id) {
+            entry["is_local"] = serde_json::json!(true);
+        }
+        providers.push(entry);
+    }
+
+    providers
 }
 
 /// GET /api/providers/{name} — Get details for a single provider.
@@ -477,6 +636,7 @@ pub async fn get_provider(
         "key_required": provider.key_required,
         "api_key_env": provider.api_key_env,
         "base_url": provider.base_url,
+        "proxy_url": provider.proxy_url,
         "models": models,
     });
 
@@ -498,6 +658,9 @@ pub async fn get_provider(
             &provider.id,
             state.kernel.model_catalog_ref(),
         );
+        if !probe.reachable {
+            entry["auth_status"] = serde_json::json!("missing");
+        }
     } else if librefang_runtime::provider_health::is_local_provider(&provider.id) {
         entry["is_local"] = serde_json::json!(true);
     }
@@ -571,6 +734,10 @@ pub async fn add_custom_model(
             .get("supports_streaming")
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
+        supports_thinking: body
+            .get("supports_thinking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         aliases: vec![],
     };
 
@@ -588,10 +755,15 @@ pub async fn add_custom_model(
         .into_json_tuple();
     }
 
-    // Persist to disk
+    // Persist to disk. If save fails, roll back the in-memory add so the
+    // catalog stays consistent with what's on disk — otherwise the caller
+    // sees "added" now but the model vanishes on the next daemon restart.
     let custom_path = state.kernel.home_dir().join("custom_models.json");
     if let Err(e) = catalog.save_custom_models(&custom_path) {
         tracing::warn!("Failed to persist custom models: {e}");
+        catalog.remove_custom_model(&id);
+        return ApiErrorResponse::internal(format!("Failed to persist custom model: {e}"))
+            .into_json_tuple();
     }
 
     (
@@ -616,6 +788,10 @@ pub async fn remove_custom_model(
         .write()
         .unwrap_or_else(|e| e.into_inner());
 
+    // Snapshot the entry before removing so we can restore it if the
+    // subsequent persist fails — keeps the in-memory catalog consistent
+    // with disk across failure paths.
+    let snapshot = catalog.find_model(&model_id).cloned();
     if !catalog.remove_custom_model(&model_id) {
         return ApiErrorResponse::not_found(format!("Custom model '{}' not found", model_id))
             .into_json_tuple();
@@ -624,6 +800,11 @@ pub async fn remove_custom_model(
     let custom_path = state.kernel.home_dir().join("custom_models.json");
     if let Err(e) = catalog.save_custom_models(&custom_path) {
         tracing::warn!("Failed to persist custom models: {e}");
+        if let Some(entry) = snapshot {
+            catalog.add_custom_model(entry);
+        }
+        return ApiErrorResponse::internal(format!("Failed to persist custom model: {e}"))
+            .into_json_tuple();
     }
 
     (
@@ -674,13 +855,22 @@ pub async fn set_provider_key(
     // Set env var in current process so detect_auth picks it up
     std::env::set_var(&env_var, &key);
 
-    // Refresh auth detection
-    state
-        .kernel
-        .model_catalog_ref()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .detect_auth();
+    // Re-enable fallback detection (user is adding a key, undo any prior suppress)
+    // and refresh auth status.
+    {
+        let mut catalog = state
+            .kernel
+            .model_catalog_ref()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.unsuppress_provider(&name);
+        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.detect_auth();
+    }
+
+    // Kick off a background probe to validate the new key immediately so the
+    // dashboard reflects ValidatedKey / InvalidKey without waiting for restart.
+    state.kernel.clone().spawn_key_validation();
 
     // Auto-switch default provider if current default has no working key.
     // This fixes the common case where a user adds e.g. a Gemini key via dashboard
@@ -697,10 +887,10 @@ pub async fn set_provider_key(
             .unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(dm) => (dm.provider.clone(), dm.api_key_env.clone()),
-            None => (
-                state.kernel.config_ref().default_model.provider.clone(),
-                state.kernel.config_ref().default_model.api_key_env.clone(),
-            ),
+            None => {
+                let dm = state.kernel.config_ref().default_model.clone();
+                (dm.provider, dm.api_key_env)
+            }
         }
     };
     let current_has_key = if current_key_env.is_empty() {
@@ -736,7 +926,7 @@ pub async fn set_provider_key(
                     model: model_id,
                     api_key_env: env_var.clone(),
                     base_url: None,
-                    message_timeout_secs: 300,
+                    ..Default::default()
                 };
                 let mut guard = state
                     .kernel
@@ -792,6 +982,24 @@ pub async fn set_provider_key(
     // Trigger all active hands so they resume immediately
     state.kernel.trigger_all_hands();
 
+    // If default provider switched, update registry entries for agents that were
+    // using the old default so they immediately pick up the new provider/model.
+    if switched {
+        let new_dm = {
+            let guard = state
+                .kernel
+                .default_model_override_ref()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard
+                .clone()
+                .unwrap_or_else(|| state.kernel.config_ref().default_model.clone())
+        };
+        state
+            .kernel
+            .sync_default_model_agents(&current_provider, &new_dm);
+    }
+
     let mut resp = serde_json::json!({"status": "saved", "provider": name});
     if switched {
         resp["switched_default"] = serde_json::json!(true);
@@ -841,13 +1049,17 @@ pub async fn delete_provider_key(
     // Remove from process environment
     std::env::remove_var(&env_var);
 
-    // Refresh auth detection
-    state
-        .kernel
-        .model_catalog_ref()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .detect_auth();
+    // Suppress fallback/CLI detection for this provider and refresh auth
+    {
+        let mut catalog = state
+            .kernel
+            .model_catalog_ref()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog.suppress_provider(&name);
+        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.detect_auth();
+    }
 
     (
         StatusCode::OK,
@@ -861,14 +1073,19 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let (env_var, base_url, key_required) = {
+    let (env_var, base_url, key_required, auth_status) = {
         let catalog = state
             .kernel
             .model_catalog_ref()
             .read()
             .unwrap_or_else(|e| e.into_inner());
         match catalog.get_provider(&name) {
-            Some(p) => (p.api_key_env.clone(), p.base_url.clone(), p.key_required),
+            Some(p) => (
+                p.api_key_env.clone(),
+                p.base_url.clone(),
+                p.key_required,
+                p.auth_status,
+            ),
             None => {
                 return ApiErrorResponse::not_found(format!("Unknown provider '{}'", name))
                     .into_json_tuple();
@@ -876,19 +1093,27 @@ pub async fn test_provider(
         }
     };
 
-    let api_key = std::env::var(&env_var).ok();
-    // Only require API key for providers that need one (skip local providers like ollama/vllm/lmstudio)
-    if key_required && api_key.is_none() && !env_var.is_empty() {
-        return ApiErrorResponse::bad_request("Provider API key not configured").into_json_tuple();
-    }
-
     // ── CLI-based providers (no HTTP base URL) ──
-    if base_url.is_empty() {
+    // Only treat as CLI provider if key is not required (true CLI providers
+    // like claude-code, gemini-cli). Providers with key_required but empty
+    // base_url are API providers missing configuration (e.g. OpenRouter proxied).
+    if base_url.is_empty() && !key_required {
+        let cli_start = Instant::now();
         let cli_ok = librefang_runtime::drivers::cli_provider_available(name.as_str());
+        let cli_latency = cli_start.elapsed().as_millis();
+        state.provider_test_cache.insert(
+            name.clone(),
+            (
+                Instant::now(),
+                cli_latency,
+                chrono::Utc::now().to_rfc3339(),
+                cli_ok,
+            ),
+        );
         return if cli_ok {
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status":"ok","provider":name,"latency_ms":0})),
+                Json(serde_json::json!({"status":"ok","provider":name,"latency_ms":cli_latency})),
             )
         } else {
             (
@@ -900,15 +1125,80 @@ pub async fn test_provider(
         };
     }
 
+    // API provider with CLI fallback but no API key — test the CLI instead.
+    if auth_status == librefang_types::model_catalog::AuthStatus::ConfiguredCli {
+        let cli_start = Instant::now();
+        // The CLI name may differ from the provider name (e.g. gemini → gemini-cli)
+        let cli_name = match name.as_str() {
+            "gemini" => "gemini-cli",
+            "anthropic" => "claude-code",
+            "openai" | "codex" => "codex-cli",
+            "qwen" => "qwen-code",
+            _ => name.as_str(),
+        };
+        let cli_ok = librefang_runtime::drivers::cli_provider_available(cli_name);
+        let cli_latency = cli_start.elapsed().as_millis();
+        state.provider_test_cache.insert(
+            name.clone(),
+            (
+                Instant::now(),
+                cli_latency,
+                chrono::Utc::now().to_rfc3339(),
+                cli_ok,
+            ),
+        );
+        return if cli_ok {
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"status":"ok","provider":name,"latency_ms":cli_latency,"note":format!("via {cli_name} CLI")}),
+                ),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"status":"error","provider":name,"error":format!("{cli_name} CLI not found in PATH")}),
+                ),
+            )
+        };
+    }
+
+    // API providers with no base_url configured cannot be tested.
+    if base_url.is_empty() {
+        return ApiErrorResponse::bad_request("Provider base URL not configured").into_json_tuple();
+    }
+
+    // Treat empty-string env vars the same as missing — an env var set to ""
+    // (e.g. `DEEPSEEK_API_KEY=` in secrets.env) should not bypass the guard.
+    let api_key = std::env::var(&env_var)
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    if key_required && api_key.is_none() && !env_var.is_empty() {
+        return ApiErrorResponse::bad_request("Provider API key not configured").into_json_tuple();
+    }
+
     let start = std::time::Instant::now();
     let api_key_val = api_key.unwrap_or_default();
-    let client = librefang_runtime::http_client::proxied_client_builder()
+    let client = match librefang_runtime::http_client::proxied_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .expect("HTTP client build");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiErrorResponse::internal(format!(
+                "Failed to build HTTP client for provider test: {e}"
+            ))
+            .into_json_tuple();
+        }
+    };
 
     // ── Bedrock: AWS Signature auth — can't test with simple HTTP ──
     if name == "bedrock" || name == "aws-bedrock" {
+        state.provider_test_cache.insert(
+            name.clone(),
+            (Instant::now(), 0, chrono::Utc::now().to_rfc3339(), true),
+        );
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -930,6 +1220,7 @@ pub async fn test_provider(
         ),
         "chatgpt" => format!("{}/me", base_url.trim_end_matches('/')),
         "github-copilot" => format!("{}/models", base_url.trim_end_matches('/')),
+        "elevenlabs" => format!("{}/user", base_url.trim_end_matches('/')),
         _ => format!("{}/models", base_url.trim_end_matches('/')),
     };
 
@@ -946,6 +1237,9 @@ pub async fn test_provider(
         "github-copilot" => {
             req = req.header("Authorization", format!("token {}", api_key_val));
         }
+        "elevenlabs" => {
+            req = req.header("xi-api-key", &api_key_val);
+        }
         _ => {
             if !api_key_val.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", api_key_val));
@@ -955,12 +1249,8 @@ pub async fn test_provider(
 
     let result = req.send().await;
 
-    let (first_status, _first_body) = match result {
-        Ok(resp) => {
-            let sc = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            (sc, body)
-        }
+    let status_code = match result {
+        Ok(resp) => resp.status().as_u16(),
         Err(e) => {
             return (
                 StatusCode::OK,
@@ -973,45 +1263,23 @@ pub async fn test_provider(
         }
     };
 
-    // If /models returned 404, fall back to base URL (some providers don't expose /models).
-    let status_code = if first_status == 404 {
-        let mut fallback = client.get(&base_url);
-        match name.as_str() {
-            "anthropic" => {
-                fallback = fallback
-                    .header("x-api-key", &api_key_val)
-                    .header("anthropic-version", "2023-06-01");
-            }
-            "gemini" | "google" => {}
-            "github-copilot" => {
-                fallback = fallback.header("Authorization", format!("token {}", api_key_val));
-            }
-            _ => {
-                if !api_key_val.is_empty() {
-                    fallback = fallback.header("Authorization", format!("Bearer {}", api_key_val));
-                }
-            }
-        }
-        match fallback.send().await {
-            Ok(resp) => resp.status().as_u16(),
-            Err(_) => first_status,
-        }
-    } else {
-        first_status
-    };
-
+    // Any HTTP response (even 400/404/500) means the service is reachable.
+    // Only connection failures (handled above as Err) indicate unreachable.
+    // Treat auth errors (401/403) specially — key is wrong.
     let latency_ms = start.elapsed().as_millis();
 
-    if (200..300).contains(&status_code) {
+    // Cache test result so GET /api/providers can show latency for all providers.
+    state.provider_test_cache.insert(
+        name.clone(),
         (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "ok",
-                "provider": name,
-                "latency_ms": latency_ms,
-            })),
-        )
-    } else if status_code == 401 || status_code == 403 {
+            Instant::now(),
+            latency_ms,
+            chrono::Utc::now().to_rfc3339(),
+            true,
+        ),
+    );
+
+    if status_code == 401 || status_code == 403 {
         (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1020,22 +1288,15 @@ pub async fn test_provider(
                 "error": format!("Authentication failed (HTTP {})", status_code),
             })),
         )
-    } else if status_code == 429 {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "error",
-                "provider": name,
-                "error": format!("Rate limited (HTTP 429)"),
-            })),
-        )
     } else {
+        // Any other HTTP response (200, 400, 404, 429, 500, etc.) means
+        // the service is reachable. Report success with the status code.
         (
             StatusCode::OK,
             Json(serde_json::json!({
-                "status": "error",
+                "status": "ok",
                 "provider": name,
-                "error": format!("HTTP {}", status_code),
+                "latency_ms": latency_ms,
             })),
         )
     }
@@ -1063,6 +1324,22 @@ pub async fn set_provider_url(
             .into_json_tuple();
     }
 
+    // Optional proxy_url in same request
+    let proxy_url = body["proxy_url"].as_str().map(|s| s.trim().to_string());
+    if let Some(ref pu) = proxy_url {
+        if !pu.is_empty()
+            && !pu.starts_with("http://")
+            && !pu.starts_with("https://")
+            && !pu.starts_with("socks5://")
+            && !pu.starts_with("socks5h://")
+        {
+            return ApiErrorResponse::bad_request(
+                "proxy_url must start with http://, https://, socks5://, or socks5h://",
+            )
+            .into_json_tuple();
+        }
+    }
+
     // Update catalog in memory
     {
         let mut catalog = state
@@ -1071,12 +1348,20 @@ pub async fn set_provider_url(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         catalog.set_provider_url(&name, &base_url);
+        if let Some(ref pu) = proxy_url {
+            catalog.set_provider_proxy_url(&name, pu);
+        }
     }
 
     // Persist to config.toml [provider_urls] section
     let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = upsert_provider_url(&config_path, &name, &base_url) {
         return ApiErrorResponse::internal(format!("Failed to save config: {e}")).into_json_tuple();
+    }
+    if let Some(ref pu) = proxy_url {
+        if let Err(e) = upsert_provider_proxy_url(&config_path, &name, pu) {
+            tracing::warn!("Failed to persist proxy_url: {e}");
+        }
     }
 
     // Probe reachability at the new URL
@@ -1124,7 +1409,18 @@ pub async fn set_provider_url(
 pub async fn set_default_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    body: Option<axum::Json<serde_json::Value>>,
 ) -> impl IntoResponse {
+    // Accept optional {"model": "model-id"} body to override the auto-selected model.
+    // This is needed for providers like ollama where models are dynamic and may
+    // not be in the static catalog.
+    let user_model = body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(String::from);
+
     // Verify the provider exists in the catalog
     let (default_model, env_var) = {
         let catalog = state
@@ -1139,7 +1435,7 @@ pub async fn set_default_provider(
                     .into_json_tuple();
             }
         };
-        let model_id = catalog.default_model_for_provider(&name);
+        let model_id = user_model.or_else(|| catalog.default_model_for_provider(&name));
         (model_id, provider.api_key_env.clone())
     };
 
@@ -1147,7 +1443,7 @@ pub async fn set_default_provider(
         Some(id) => id,
         None => {
             return ApiErrorResponse::bad_request(format!(
-                "No models found for provider '{}'",
+                "No models found for provider '{}'. Specify a model in the request body: {{\"model\": \"model-name\"}}",
                 name
             ))
             .into_json_tuple();
@@ -1164,22 +1460,40 @@ pub async fn set_default_provider(
         }
     };
 
+    // Read old default before updating, so sync_default_model_agents knows what to migrate
+    let old_provider = {
+        let guard = state
+            .kernel
+            .default_model_override_ref()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(dm) => dm.provider.clone(),
+            None => state.kernel.config_ref().default_model.provider.clone(),
+        }
+    };
+
     // Hot-update the in-memory default model override
+    let new_dm = librefang_types::config::DefaultModelConfig {
+        provider: name.clone(),
+        model: model_id.clone(),
+        api_key_env: env_var.clone(),
+        base_url: None,
+        ..Default::default()
+    };
     {
-        let new_dm = librefang_types::config::DefaultModelConfig {
-            provider: name.clone(),
-            model: model_id.clone(),
-            api_key_env: env_var.clone(),
-            base_url: None,
-            message_timeout_secs: 300,
-        };
         let mut guard = state
             .kernel
             .default_model_override_ref()
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        *guard = Some(new_dm);
+        *guard = Some(new_dm.clone());
     }
+
+    // Update registry entries for agents that were tracking the old default
+    state
+        .kernel
+        .sync_default_model_agents(&old_provider, &new_dm);
 
     (
         StatusCode::OK,
@@ -1278,6 +1592,50 @@ fn upsert_provider_url(
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+/// Persist a per-provider proxy URL to `[provider_proxy_urls]` in config.toml.
+fn upsert_provider_proxy_url(
+    config_path: &std::path::Path,
+    provider: &str,
+    proxy_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("provider_proxy_urls") {
+        root.insert(
+            "provider_proxy_urls".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let table = root
+        .get_mut("provider_proxy_urls")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("provider_proxy_urls is not a table")?;
+
+    if proxy_url.is_empty() {
+        table.remove(provider);
+    } else {
+        table.insert(
+            provider.to_string(),
+            toml::Value::String(proxy_url.to_string()),
+        );
     }
 
     std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
@@ -1447,7 +1805,8 @@ pub async fn copilot_oauth_poll(
 /// After syncing, the kernel's in-memory catalog is refreshed.
 #[utoipa::path(post, path = "/api/catalog/update", tag = "models", responses((status = 200, description = "Catalog updated", body = serde_json::Value)))]
 pub async fn catalog_update(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mirror = &state.kernel.config_ref().registry.registry_mirror;
+    let cfg = state.kernel.config_ref();
+    let mirror = &cfg.registry.registry_mirror;
     match librefang_runtime::catalog_sync::sync_catalog_to(state.kernel.home_dir(), mirror).await {
         Ok(result) => {
             // Refresh the in-memory catalog so the new models are available immediately

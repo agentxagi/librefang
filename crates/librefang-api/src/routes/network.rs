@@ -156,8 +156,9 @@ pub async fn get_peer(
     )
 )]
 pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state.kernel.config_ref().network_enabled
-        && !state.kernel.config_ref().network.shared_secret.is_empty();
+    let cfg = state.kernel.config_ref();
+    let enabled = cfg.network_enabled && !cfg.network.shared_secret.is_empty();
+    drop(cfg);
 
     let (node_id, listen_address, connected_peers, total_peers) =
         if let Some(peer_node) = state.kernel.peer_node_ref() {
@@ -191,20 +192,21 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 )]
 pub async fn a2a_agent_card(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agents = state.kernel.agent_registry().list();
-    let base_url = format!("http://{}", state.kernel.config_ref().api_listen);
+    let cfg = state.kernel.config_ref();
+    let base_url = format!("http://{}", cfg.api_listen);
 
     // Use service-level A2A config for the well-known card when available.
-    let (service_name, service_description) =
-        if let Some(ref a2a_cfg) = state.kernel.config_ref().a2a {
-            let name = if a2a_cfg.name.is_empty() {
-                "LibreFang Agent OS".to_string()
-            } else {
-                a2a_cfg.name.clone()
-            };
-            (name, a2a_cfg.description.clone())
+    let (service_name, service_description) = if let Some(ref a2a_cfg) = cfg.a2a {
+        let name = if a2a_cfg.name.is_empty() {
+            "LibreFang Agent OS".to_string()
         } else {
-            ("LibreFang Agent OS".to_string(), String::new())
+            a2a_cfg.name.clone()
         };
+        (name, a2a_cfg.description.clone())
+    } else {
+        ("LibreFang Agent OS".to_string(), String::new())
+    };
+    drop(cfg);
 
     // Aggregate skills from ALL agents.
     let skills: Vec<librefang_runtime::a2a::AgentSkill> = agents
@@ -452,7 +454,12 @@ pub async fn a2a_list_external_agents(State(state): State<Arc<AppState>>) -> imp
 
 /// Check whether a URL is safe to fetch (not targeting internal/private networks).
 /// Returns `Ok(())` if the URL is safe, or `Err(message)` describing the problem.
-fn is_url_safe_for_ssrf(raw_url: &str) -> Result<(), String> {
+///
+/// `allowed_hosts` entries may be CIDRs (e.g. `"10.0.0.0/8"`), glob hostname
+/// patterns (e.g. `"*.internal.example.com"`), or literal IPs/hostnames.
+/// Cloud metadata ranges (`169.254.0.0/16`, `100.64.0.0/10`) remain blocked
+/// unconditionally regardless of allowlist entries.
+fn is_url_safe_for_ssrf(raw_url: &str, allowed_hosts: &[String]) -> Result<(), String> {
     let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid URL: {e}"))?;
 
     // Only allow http and https schemes
@@ -486,9 +493,22 @@ fn is_url_safe_for_ssrf(raw_url: &str) -> Result<(), String> {
     };
 
     for ip in &addrs {
-        if is_private_ip(ip) {
+        // Canonicalise IPv4-mapped IPv6 (::ffff:X.X.X.X) before any safety
+        // check. The OS transparently connects these to the embedded IPv4
+        // target, so leaving them as IPv6 lets an attacker reach loopback /
+        // private / cloud-metadata IPs via the v6 form (e.g.
+        // [::ffff:169.254.169.254]) which the v6-only branches of
+        // is_private_ip / is_cloud_metadata_ip do not recognise.
+        let canonical = canonical_ip(ip);
+        if is_private_ip(&canonical) {
+            // Cloud metadata ranges are unconditionally blocked even when
+            // the host appears in the allowlist.
+            if !is_cloud_metadata_ip(&canonical) && is_host_allowed(host, &canonical, allowed_hosts)
+            {
+                continue;
+            }
             return Err(format!(
-                "Requests to private/internal IP addresses are not allowed ({ip})"
+                "Requests to private/internal IP addresses are not allowed ({canonical})"
             ));
         }
     }
@@ -496,10 +516,108 @@ fn is_url_safe_for_ssrf(raw_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Unwrap IPv4-mapped IPv6 (`::ffff:X.X.X.X`) to its IPv4 form. All other
+/// addresses are returned unchanged.
+fn canonical_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(*v6),
+        },
+        IpAddr::V4(_) => *ip,
+    }
+}
+
+/// Returns true if the IP is in a cloud metadata / CGNAT range that must be
+/// blocked unconditionally (`169.254.0.0/16` or `100.64.0.0/10`).
+fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            (o[0] == 169 && o[1] == 254) || (o[0] == 100 && (o[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Check whether a hostname or resolved IP matches any entry in `allowed_hosts`.
+///
+/// Entry formats:
+/// - `"10.0.0.0/8"`             — CIDR; matched against the resolved `ip`
+/// - `"*.internal.example.com"` — glob prefix wildcard; matched against `hostname`
+/// - `"10.1.2.3"` / `"svc.local"` — literal IP or hostname exact match
+fn is_host_allowed(hostname: &str, ip: &IpAddr, allowed_hosts: &[String]) -> bool {
+    for entry in allowed_hosts {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.contains('/') {
+            if cidr_contains(entry, ip).unwrap_or(false) {
+                return true;
+            }
+            continue;
+        }
+        if let Some(suffix) = entry.strip_prefix('*') {
+            if suffix.is_empty() {
+                continue; // reject bare "*" — too broad
+            }
+            if hostname.ends_with(suffix) {
+                return true;
+            }
+            continue;
+        }
+        if let Ok(entry_ip) = entry.parse::<IpAddr>() {
+            if entry_ip == *ip {
+                return true;
+            }
+            continue;
+        }
+        if entry.eq_ignore_ascii_case(hostname) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if `ip` falls within the CIDR range `cidr` (e.g. `"10.0.0.0/8"`).
+fn cidr_contains(cidr: &str, ip: &IpAddr) -> Result<bool, ()> {
+    let (addr_str, prefix_str) = cidr.split_once('/').ok_or(())?;
+    let prefix_len: u32 = prefix_str.parse().map_err(|_| ())?;
+    match (addr_str.parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(net_addr)), IpAddr::V4(v4)) => {
+            if prefix_len > 32 {
+                return Err(());
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+            Ok((u32::from_be_bytes(net_addr.octets()) & mask)
+                == (u32::from_be_bytes(v4.octets()) & mask))
+        }
+        (Ok(IpAddr::V6(net_addr)), IpAddr::V6(v6)) => {
+            if prefix_len > 128 {
+                return Err(());
+            }
+            let net_bits = u128::from_be_bytes(net_addr.octets());
+            let ip_bits = u128::from_be_bytes(v6.octets());
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
+            Ok((net_bits & mask) == (ip_bits & mask))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Returns true if the IP address is in a private, loopback, link-local, or
 /// otherwise internal range that should not be reachable from user-supplied URLs.
 fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             v4.is_loopback()              // 127.0.0.0/8
                 || v4.is_private()         // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
@@ -589,7 +707,14 @@ pub async fn a2a_discover_external(
     };
 
     // SSRF protection: validate URL before making any outbound request
-    if let Err(reason) = is_url_safe_for_ssrf(&url) {
+    let ssrf_allowed = state
+        .kernel
+        .config_snapshot()
+        .web
+        .fetch
+        .ssrf_allowed_hosts
+        .clone();
+    if let Err(reason) = is_url_safe_for_ssrf(&url, &ssrf_allowed) {
         return ApiErrorResponse::bad_request(reason).into_json_tuple();
     }
 
@@ -637,7 +762,7 @@ pub async fn a2a_discover_external(
     )
 )]
 pub async fn a2a_send_external(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let url = match body["url"].as_str() {
@@ -649,6 +774,18 @@ pub async fn a2a_send_external(
         None => return ApiErrorResponse::bad_request("Missing 'message' field").into_json_tuple(),
     };
     let session_id = body["session_id"].as_str();
+
+    // SSRF protection: validate URL before making any outbound request
+    let ssrf_allowed = state
+        .kernel
+        .config_snapshot()
+        .web
+        .fetch
+        .ssrf_allowed_hosts
+        .clone();
+    if let Err(reason) = is_url_safe_for_ssrf(&url, &ssrf_allowed) {
+        return ApiErrorResponse::bad_request(reason).into_json_tuple();
+    }
 
     let client = librefang_runtime::a2a::A2aClient::new();
     match client.send_task(&url, &message, session_id).await {
@@ -677,7 +814,7 @@ pub async fn a2a_send_external(
     )
 )]
 pub async fn a2a_external_task_status(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -687,6 +824,18 @@ pub async fn a2a_external_task_status(
             return ApiErrorResponse::bad_request("Missing 'url' query parameter").into_json_tuple()
         }
     };
+
+    // SSRF protection: validate URL before making any outbound request
+    let ssrf_allowed = state
+        .kernel
+        .config_snapshot()
+        .web
+        .fetch
+        .ssrf_allowed_hosts
+        .clone();
+    if let Err(reason) = is_url_safe_for_ssrf(&url, &ssrf_allowed) {
+        return ApiErrorResponse::bad_request(reason).into_json_tuple();
+    }
 
     let client = librefang_runtime::a2a::A2aClient::new();
     match client.get_task(&url, &task_id).await {
@@ -769,14 +918,27 @@ pub async fn mcp_http(
         // Execute the tool via the kernel's tool runner
         let kernel_handle: Arc<dyn librefang_runtime::kernel_handle::KernelHandle> =
             state.kernel.clone() as Arc<dyn librefang_runtime::kernel_handle::KernelHandle>;
+        // Snapshot config before async call — Guard is !Send and cannot cross .await
+        let cfg = state.kernel.config_snapshot();
+        let tts_opt = if cfg.tts.enabled {
+            Some(state.kernel.tts())
+        } else {
+            None
+        };
+        let docker_opt = if cfg.docker.enabled {
+            Some(&cfg.docker)
+        } else {
+            None
+        };
         let result = librefang_runtime::tool_runner::execute_tool(
             "mcp-http",
             tool_name,
             &arguments,
             Some(&kernel_handle),
-            None,
-            None,
+            None, // allowed_tools
+            None, // caller_agent_id
             Some(&skill_snapshot),
+            None, // allowed_skills
             Some(state.kernel.mcp_connections_ref()),
             Some(state.kernel.web_tools()),
             Some(state.kernel.browser()),
@@ -785,16 +947,8 @@ pub async fn mcp_http(
             Some(state.kernel.media()),
             None, // media_drivers
             None, // exec_policy
-            if state.kernel.config_ref().tts.enabled {
-                Some(state.kernel.tts())
-            } else {
-                None
-            },
-            if state.kernel.config_ref().docker.enabled {
-                Some(&state.kernel.config_ref().docker)
-            } else {
-                None
-            },
+            tts_opt,
+            docker_opt,
             Some(state.kernel.processes()),
             None, // sender_id (MCP HTTP has no sender context)
             None, // channel
@@ -1297,4 +1451,48 @@ pub(crate) fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_ip, is_cloud_metadata_ip, is_private_ip};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn canonical_ip_unwraps_ipv4_mapped_v6() {
+        let mapped: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert_eq!(
+            canonical_ip(&mapped),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        // Real IPv6 is left alone.
+        let real_v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(canonical_ip(&real_v6), real_v6);
+    }
+
+    #[test]
+    fn is_private_ip_recognises_ipv4_mapped_v6() {
+        // Without canonicalisation the V6 arms only cover fc00::/7 + fe80::/10,
+        // letting ::ffff:X.X.X.X slip past as "public". These must be blocked.
+        assert!(is_private_ip(&"::ffff:10.0.0.1".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:192.168.1.1".parse().unwrap()));
+        assert!(is_private_ip(&"::ffff:100.64.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn is_cloud_metadata_ip_recognises_ipv4_mapped_v6() {
+        // AWS IMDS + Alibaba IMDS (CGNAT) expressed as IPv4-mapped IPv6 must
+        // unconditionally be blocked — this is the exact reproduction from
+        // PR #2396 but exercising the network.rs copy of the guard.
+        assert!(is_cloud_metadata_ip(
+            &"::ffff:169.254.169.254".parse().unwrap()
+        ));
+        assert!(is_cloud_metadata_ip(&"::ffff:a9fe:a9fe".parse().unwrap()));
+        assert!(is_cloud_metadata_ip(&"::ffff:100.64.0.1".parse().unwrap()));
+        assert!(is_cloud_metadata_ip(
+            &"::ffff:100.100.100.200".parse().unwrap()
+        ));
+    }
 }

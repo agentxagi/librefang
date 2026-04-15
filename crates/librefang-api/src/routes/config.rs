@@ -9,8 +9,17 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         .route("/health", axum::routing::get(health))
         .route("/health/detail", axum::routing::get(health_detail))
         .route("/status", axum::routing::get(status))
+        .route(
+            "/dashboard/snapshot",
+            axum::routing::get({
+                |State(state): State<Arc<AppState>>| async move {
+                    axum::Json(dashboard_snapshot_inner(&state).await)
+                }
+            }),
+        )
         .route("/version", axum::routing::get(version))
         .route("/config", axum::routing::get(get_config))
+        .route("/config/export", axum::routing::get(export_config))
         .route("/config/schema", axum::routing::get(config_schema))
         .route("/config/set", axum::routing::post(config_set))
         .route("/config/reload", axum::routing::post(config_reload))
@@ -86,6 +95,8 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             std::process::Command::new("tasklist")
                 .args([
                     "/FI",
@@ -94,6 +105,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     "CSV",
                     "/NH",
                 ])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -118,6 +130,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
     };
 
+    let cfg = state.kernel.config_snapshot();
     Json(serde_json::json!({
         "status": "running",
         "version": env!("CARGO_PKG_VERSION"),
@@ -125,13 +138,14 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "active_agent_count": active_agent_count,
         "session_count": session_count,
         "memory_used_mb": memory_used_mb,
-        "default_provider": state.kernel.default_model_override_ref().read().ok().and_then(|g| g.as_ref().map(|dm| dm.provider.clone())).unwrap_or_else(|| state.kernel.config_ref().default_model.provider.clone()),
-        "default_model": state.kernel.default_model_override_ref().read().ok().and_then(|g| g.as_ref().map(|dm| dm.model.clone())).unwrap_or_else(|| state.kernel.config_ref().default_model.model.clone()),
+        "default_provider": state.kernel.default_model_override_ref().read().ok().and_then(|g| g.as_ref().map(|dm| dm.provider.clone())).unwrap_or_else(|| cfg.default_model.provider.clone()),
+        "default_model": state.kernel.default_model_override_ref().read().ok().and_then(|g| g.as_ref().map(|dm| dm.model.clone())).unwrap_or_else(|| cfg.default_model.model.clone()),
         "uptime_seconds": uptime,
-        "api_listen": state.kernel.config_ref().api_listen,
+        "api_listen": cfg.api_listen,
         "home_dir": state.kernel.home_dir().display().to_string(),
-        "log_level": state.kernel.config_ref().log_level,
-        "network_enabled": state.kernel.config_ref().network_enabled,
+        "log_level": cfg.log_level,
+        "network_enabled": cfg.network_enabled,
+        "terminal_enabled": cfg.terminal.enabled,
         "config_exists": state.kernel.home_dir().join("config.toml").exists(),
         "agents": agents,
     }))
@@ -200,7 +214,7 @@ api_key_env = "{api_key_env}"
     }
 
     // Reload config so kernel picks up new settings
-    let _ = state.kernel.reload_config();
+    let _ = state.kernel.reload_config().await;
 
     Json(serde_json::json!({
         "status": "initialized",
@@ -247,6 +261,12 @@ pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 )]
 pub async fn version() -> impl IntoResponse {
+    // Deliberately omitted from the unauthenticated version response:
+    // - `hostname` — a per-machine identifier that helps a remote probe
+    //   correlate a daemon to a specific deployment target. Operators who
+    //   need the hostname should read it from the daemon's shell
+    //   environment rather than pulling it over an unauthenticated HTTP
+    //   endpoint.
     Json(serde_json::json!({
         "name": "librefang",
         "version": env!("CARGO_PKG_VERSION"),
@@ -255,7 +275,6 @@ pub async fn version() -> impl IntoResponse {
         "rust_version": option_env!("RUSTC_VERSION").unwrap_or("unknown"),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
-        "hostname": super::system::hostname_string(),
         "api": {
             "current": crate::versioning::CURRENT_VERSION,
             "supported": crate::versioning::SUPPORTED_VERSIONS,
@@ -288,7 +307,8 @@ pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     let status = if db_ok { "ok" } else { "degraded" };
 
-    let embedding_ok = state.kernel.embedding().is_some();
+    let fts_only = state.kernel.config_ref().memory.fts_only.unwrap_or(false);
+    let embedding_ok = fts_only || state.kernel.embedding().is_some();
 
     Json(serde_json::json!({
         "status": status,
@@ -321,7 +341,8 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .structured_get(shared_id, "__health_check__")
         .is_ok();
 
-    let config_warnings = state.kernel.config_ref().validate();
+    let hcfg = state.kernel.config_ref();
+    let config_warnings = hcfg.validate();
     let status = if db_ok { "ok" } else { "degraded" };
 
     Json(serde_json::json!({
@@ -334,10 +355,10 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "database": if db_ok { "connected" } else { "error" },
         "memory": {
             "embedding_available": state.kernel.embedding().is_some(),
-            "embedding_provider": state.kernel.config_ref().memory.embedding_provider,
-            "embedding_model": &state.kernel.config_ref().memory.embedding_model,
-            "proactive_memory_enabled": state.kernel.config_ref().proactive_memory.enabled,
-            "extraction_model": &state.kernel.config_ref().proactive_memory.extraction_model,
+            "embedding_provider": hcfg.memory.embedding_provider,
+            "embedding_model": &hcfg.memory.embedding_model,
+            "proactive_memory_enabled": hcfg.proactive_memory.enabled,
+            "extraction_model": &hcfg.proactive_memory.extraction_model,
         },
         "config_warnings": config_warnings,
         "event_bus": {
@@ -509,7 +530,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 )]
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return a redacted view of the kernel config
-    let config = &state.kernel.config_ref();
+    let config = state.kernel.config_ref();
 
     // -- channels: show which platforms are configured (instance counts), no tokens --
     let channels = {
@@ -707,7 +728,10 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     set!("network_enabled", config.network_enabled);
     set!("mode", format!("{:?}", config.mode));
     set!("language", config.language);
-    set!("usage_footer", format!("{:?}", config.usage_footer));
+    set!(
+        "usage_footer",
+        serde_json::to_value(config.usage_footer).unwrap_or_default()
+    );
     set!("stable_prefix_mode", config.stable_prefix_mode);
     set!("prompt_caching", config.prompt_caching);
     set!("max_cron_jobs", config.max_cron_jobs);
@@ -715,9 +739,9 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     set!(
         "workspaces_dir",
         config
-            .workspaces_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
+            .effective_workspaces_dir()
+            .to_string_lossy()
+            .to_string()
     );
     // ── Default Model ──
     set!("default_model", {
@@ -788,9 +812,24 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     );
 
     // ── Web ──
+    // Check if at least one search provider has a configured API key
+    let search_available = [
+        &config.web.tavily.api_key_env,
+        &config.web.brave.api_key_env,
+        &config.web.jina.api_key_env,
+        &config.web.perplexity.api_key_env,
+    ]
+    .iter()
+    .any(|env_var| {
+        std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+    });
     set!("web", {
         "search_provider": format!("{:?}", config.web.search_provider),
         "cache_ttl_minutes": config.web.cache_ttl_minutes,
+        "search_available": search_available,
     });
     // Web subsections built separately to avoid recursion limit
     if let Some(web) = out.get_mut("web").and_then(|v| v.as_object_mut()) {
@@ -855,6 +894,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "path": config.vault.path.as_ref().map(|p| p.to_string_lossy().to_string()),
     });
 
+    let stt_available = config.media.audio_provider.is_some();
     set!("media", {
         "image_description": config.media.image_description,
         "audio_transcription": config.media.audio_transcription,
@@ -862,6 +902,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "max_concurrency": config.media.max_concurrency,
         "image_provider": config.media.image_provider,
         "audio_provider": config.media.audio_provider,
+        "audio_model": config.media.audio_model,
+        "stt_available": stt_available,
     });
 
     set!("links", {
@@ -894,6 +936,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "timeout_secs": config.approval.timeout_secs,
         "auto_approve_autonomous": config.approval.auto_approve_autonomous,
         "auto_approve": config.approval.auto_approve,
+        "second_factor": serde_json::to_value(config.approval.second_factor).unwrap_or(serde_json::json!("none")),
+        "totp_issuer": config.approval.totp_issuer,
     });
 
     set!("exec_policy", {
@@ -949,6 +993,16 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "model_id": config.tts.elevenlabs.model_id,
                 "stability": config.tts.elevenlabs.stability,
                 "similarity_boost": config.tts.elevenlabs.similarity_boost,
+            }),
+        );
+        tts.insert(
+            "google".into(),
+            serde_json::json!({
+                "voice": config.tts.google.voice,
+                "language_code": config.tts.google.language_code,
+                "speaking_rate": config.tts.google.speaking_rate,
+                "pitch": config.tts.google.pitch,
+                "format": config.tts.google.format,
             }),
         );
     }
@@ -1032,6 +1086,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }
 
     set!("provider_urls", config.provider_urls);
+    set!("provider_proxy_urls", config.provider_proxy_urls);
     set!("provider_api_keys", provider_api_keys);
     set!("provider_regions", config.provider_regions);
 
@@ -1123,7 +1178,10 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     )
 )]
 pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let auth_mode = if state.kernel.config_ref().api_key.is_empty() {
+    let scfg = state.kernel.config_ref();
+    let api_key_empty = scfg.api_key.is_empty();
+    drop(scfg);
+    let auth_mode = if api_key_empty {
         "localhost_only"
     } else {
         "bearer_token"
@@ -1162,7 +1220,7 @@ pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoRes
             },
             "auth": {
                 "mode": auth_mode,
-                "api_key_set": !state.kernel.config_ref().api_key.is_empty()
+                "api_key_set": !api_key_empty
             }
         },
         "monitoring": {
@@ -1300,6 +1358,14 @@ pub async fn run_migrate(
 
     match librefang_migrate::run_migration(&options) {
         Ok(report) => {
+            // Migrate writes agent manifests under `<target>/agents/<name>/`
+            // (legacy schema). Relocate them into the canonical
+            // `workspaces/agents/<name>/` layout immediately so the running
+            // daemon can use them without a restart.
+            if !req.dry_run {
+                state.kernel.relocate_legacy_agent_dirs();
+            }
+
             let imported: Vec<serde_json::Value> = report
                 .imported
                 .iter()
@@ -1369,7 +1435,7 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "config reload requested via API",
         "pending",
     );
-    match state.kernel.reload_config() {
+    match state.kernel.reload_config().await {
         Ok(plan) => {
             // If channel config changed, the kernel already cleared the adapter
             // registry — but we also need to stop the old BridgeManager and
@@ -1419,6 +1485,74 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
 }
 
 // ---------------------------------------------------------------------------
+// Config Export endpoint
+// ---------------------------------------------------------------------------
+
+/// GET /api/config/export — Download config.toml as a file attachment.
+///
+/// Reads the raw config.toml from disk. If the file does not exist, falls back
+/// to serializing the in-memory config so a download is always available.
+#[utoipa::path(
+    get,
+    path = "/api/config/export",
+    tag = "system",
+    responses(
+        (status = 200, description = "config.toml file download", content_type = "application/toml")
+    )
+)]
+pub async fn export_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use axum::body::Body;
+
+    let config_path = state.kernel.home_dir().join("config.toml");
+
+    let toml_content = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    Body::from(
+                        serde_json::json!({"status": "error", "error": format!("failed to read config: {e}")})
+                            .to_string(),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // Fall back to serializing in-memory config
+        match toml::to_string_pretty(&**state.kernel.config_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    Body::from(
+                        serde_json::json!({"status": "error", "error": format!("failed to serialize config: {e}")})
+                            .to_string(),
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/toml"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"librefang-config.toml\"",
+            ),
+        ],
+        Body::from(toml_content),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Config Schema endpoint
 // ---------------------------------------------------------------------------
 
@@ -1463,11 +1597,30 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
             "log_level": { "type": "select", "options": ["trace", "debug", "info", "warn", "error"] },
             "network_enabled": "boolean",
             "mode": { "type": "select", "options": ["stable", "default", "dev"] },
-            "language": "string",
+            "language": { "type": "select", "options": [
+                {"value": "en", "label": "English"},
+                {"value": "zh", "label": "中文"},
+                {"value": "ja", "label": "日本語"},
+                {"value": "ko", "label": "한국어"},
+                {"value": "es", "label": "Español"},
+                {"value": "fr", "label": "Français"},
+                {"value": "de", "label": "Deutsch"},
+                {"value": "it", "label": "Italiano"},
+                {"value": "pt", "label": "Português"},
+                {"value": "ru", "label": "Русский"},
+                {"value": "ar", "label": "العربية"},
+                {"value": "hi", "label": "हिन्दी"},
+                {"value": "tr", "label": "Türkçe"},
+                {"value": "pl", "label": "Polski"},
+                {"value": "nl", "label": "Nederlands"},
+                {"value": "vi", "label": "Tiếng Việt"},
+                {"value": "th", "label": "ภาษาไทย"},
+                {"value": "id", "label": "Bahasa Indonesia"}
+            ] },
             "usage_footer": { "type": "select", "options": ["off", "tokens", "cost", "full"] },
             "stable_prefix_mode": "boolean",
             "prompt_caching": "boolean",
-            "max_cron_jobs": "number",
+            "max_cron_jobs": { "type": "number", "min": 0, "max": 100, "step": 1 },
             "workspaces_dir": "string"
         }
     });
@@ -1482,33 +1635,46 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
     });
     sec!("memory", { "fields": {
         "sqlite_path": "string", "embedding_model": "string",
-        "consolidation_threshold": "number", "decay_rate": "number",
-        "embedding_provider": "string", "embedding_api_key_env": "string",
-        "consolidation_interval_hours": "number"
+        "consolidation_threshold": { "type": "number", "min": 1, "max": 1000000, "step": 1 },
+        "decay_rate": { "type": "number", "min": 0, "max": 1, "step": 0.01 },
+        "embedding_provider": { "type": "select", "options": ["auto", "openai", "groq", "mistral", "together", "fireworks", "cohere", "ollama", "bedrock", "vllm", "lmstudio"] },
+        "embedding_api_key_env": "string",
+        "consolidation_interval_hours": { "type": "number_select", "options": ["0", "1", "6", "12", "24", "48", "168"] }
     }});
     sec!("proactive_memory", { "fields": {
         "enabled": "boolean", "auto_memorize": "boolean", "auto_retrieve": "boolean",
-        "max_retrieve": "number", "extraction_threshold": "number",
+        "max_retrieve": { "type": "number", "min": 1, "max": 100, "step": 1 },
+        "extraction_threshold": { "type": "number", "min": 0, "max": 1, "step": 0.01 },
         "extraction_model": "string", "extract_categories": "array",
-        "session_ttl_hours": "number", "confidence_decay_rate": "number",
-        "duplicate_threshold": "number", "max_memories_per_agent": "number"
+        "session_ttl_hours": { "type": "number", "min": 1, "max": 8760, "step": 1 },
+        "confidence_decay_rate": { "type": "number", "min": 0, "max": 1, "step": 0.001 },
+        "duplicate_threshold": { "type": "number", "min": 0, "max": 1, "step": 0.01 },
+        "max_memories_per_agent": { "type": "number", "min": 0, "max": 100000, "step": 100 }
     }});
     sec!("web", { "fields": {
         "search_provider": { "type": "select", "options": ["brave", "tavily", "perplexity", "duck_duck_go", "auto"] },
-        "cache_ttl_minutes": "number"
+        "cache_ttl_minutes": { "type": "number", "min": 0, "max": 10080, "step": 1 }
     }});
     sec!("browser", { "fields": {
-        "headless": "boolean", "viewport_width": "number", "viewport_height": "number",
-        "timeout_secs": "number", "idle_timeout_secs": "number",
-        "max_sessions": "number", "chromium_path": "string"
+        "headless": "boolean",
+        "viewport_width": { "type": "number", "min": 320, "max": 3840, "step": 1 },
+        "viewport_height": { "type": "number", "min": 240, "max": 2160, "step": 1 },
+        "timeout_secs": { "type": "number", "min": 5, "max": 300, "step": 1 },
+        "idle_timeout_secs": { "type": "number", "min": 0, "max": 3600, "step": 1 },
+        "max_sessions": { "type": "number", "min": 1, "max": 20, "step": 1 },
+        "chromium_path": "string"
     }});
     sec!("network", { "fields": {
         "listen_addresses": "string[]", "bootstrap_peers": "string[]",
-        "mdns_enabled": "boolean", "max_peers": "number", "shared_secret": "string"
+        "mdns_enabled": "boolean",
+        "max_peers": { "type": "number", "min": 1, "max": 1000, "step": 1 },
+        "shared_secret": "string"
     }});
     sec!("extensions", { "fields": {
-        "auto_reconnect": "boolean", "reconnect_max_attempts": "number",
-        "reconnect_max_backoff_secs": "number", "health_check_interval_secs": "number"
+        "auto_reconnect": "boolean",
+        "reconnect_max_attempts": { "type": "number", "min": 0, "max": 100, "step": 1 },
+        "reconnect_max_backoff_secs": { "type": "number", "min": 1, "max": 3600, "step": 1 },
+        "health_check_interval_secs": { "type": "number", "min": 5, "max": 3600, "step": 1 }
     }});
     sec!("vault", { "fields": { "enabled": "boolean", "path": "string" }});
     sec!("a2a", { "fields": { "enabled": "boolean", "listen_path": "string" }});
@@ -1519,64 +1685,87 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }});
     sec!("media", { "fields": {
         "image_description": "boolean", "audio_transcription": "boolean",
-        "video_description": "boolean", "max_concurrency": "number",
-        "image_provider": "string", "audio_provider": "string"
+        "video_description": "boolean",
+        "max_concurrency": { "type": "number", "min": 1, "max": 20, "step": 1 },
+        "image_provider": { "type": "select", "options": ["", "anthropic", "openai", "gemini"] },
+        "audio_provider": { "type": "select", "options": ["", "groq", "openai", "gemini", "elevenlabs", "minimax", "fireworks", "together", "siliconflow"] },
+        "audio_model": "string"
     }});
     sec!("links", { "fields": {
-        "enabled": "boolean", "max_links": "number",
-        "max_content_bytes": "number", "timeout_secs": "number"
+        "enabled": "boolean",
+        "max_links": { "type": "number", "min": 1, "max": 100, "step": 1 },
+        "max_content_bytes": { "type": "number", "min": 1024, "max": 10485760, "step": 1024 },
+        "timeout_secs": { "type": "number", "min": 5, "max": 120, "step": 1 }
     }});
     sec!("reload", { "hot_reloadable": true, "fields": {
         "mode": { "type": "select", "options": ["off", "restart", "hot", "hybrid"] },
-        "debounce_ms": "number"
+        "debounce_ms": { "type": "number", "min": 100, "max": 10000, "step": 100 }
     }});
     sec!("webhook_triggers", { "fields": {
         "enabled": "boolean", "token_env": "string",
-        "max_payload_bytes": "number", "rate_limit_per_minute": "number"
+        "max_payload_bytes": { "type": "number", "min": 1024, "max": 10485760, "step": 1024 },
+        "rate_limit_per_minute": { "type": "number", "min": 1, "max": 10000, "step": 1 }
     }});
     sec!("approval", { "hot_reloadable": true, "fields": {
-        "require_approval": "string[]", "timeout_secs": "number",
-        "auto_approve_autonomous": "boolean", "auto_approve": "boolean"
+        "require_approval": "string[]",
+        "timeout_secs": { "type": "number", "min": 30, "max": 86400, "step": 1 },
+        "auto_approve_autonomous": "boolean", "auto_approve": "boolean",
+        "second_factor": { "type": "select", "options": ["none", "totp", "login", "both"] },
+        "totp_issuer": "string"
     }});
     sec!("exec_policy", { "fields": {
         "mode": { "type": "select", "options": ["deny", "allowlist", "full"] },
         "safe_bins": "string[]", "allowed_commands": "string[]",
-        "timeout_secs": "number", "max_output_bytes": "number",
-        "no_output_timeout_secs": "number"
+        "timeout_secs": { "type": "number", "min": 1, "max": 3600, "step": 1 },
+        "max_output_bytes": { "type": "number", "min": 1024, "max": 104857600, "step": 1024 },
+        "no_output_timeout_secs": { "type": "number", "min": 1, "max": 3600, "step": 1 }
     }});
     sec!("broadcast", { "fields": {
         "strategy": { "type": "select", "options": ["parallel", "sequential"] },
         "routes": "object"
     }});
     sec!("auto_reply", { "fields": {
-        "enabled": "boolean", "max_concurrent": "number",
-        "timeout_secs": "number", "suppress_patterns": "string[]"
+        "enabled": "boolean",
+        "max_concurrent": { "type": "number", "min": 1, "max": 100, "step": 1 },
+        "timeout_secs": { "type": "number", "min": 1, "max": 3600, "step": 1 },
+        "suppress_patterns": "string[]"
     }});
     sec!("canvas", { "fields": {
-        "enabled": "boolean", "max_html_bytes": "number", "allowed_tags": "string[]"
+        "enabled": "boolean",
+        "max_html_bytes": { "type": "number", "min": 1024, "max": 10485760, "step": 1024 },
+        "allowed_tags": "string[]"
     }});
     sec!("tts", { "fields": {
         "enabled": "boolean",
         "provider": { "type": "select", "options": ["openai", "elevenlabs"] },
-        "max_text_length": "number", "timeout_secs": "number"
+        "max_text_length": { "type": "number", "min": 100, "max": 100000, "step": 100 },
+        "timeout_secs": { "type": "number", "min": 5, "max": 300, "step": 1 }
     }});
     sec!("docker", { "fields": {
         "enabled": "boolean", "image": "string", "container_prefix": "string",
         "workdir": "string", "network": "string", "memory_limit": "string",
-        "cpu_limit": "number", "timeout_secs": "number", "read_only_root": "boolean",
-        "pids_limit": "number", "reuse_cool_secs": "number",
-        "idle_timeout_secs": "number", "max_age_secs": "number"
+        "cpu_limit": { "type": "number", "min": 0.1, "max": 32, "step": 0.1 },
+        "timeout_secs": { "type": "number", "min": 1, "max": 3600, "step": 1 },
+        "read_only_root": "boolean",
+        "pids_limit": { "type": "number", "min": 1, "max": 10000, "step": 1 },
+        "reuse_cool_secs": { "type": "number", "min": 0, "max": 3600, "step": 1 },
+        "idle_timeout_secs": { "type": "number", "min": 0, "max": 86400, "step": 1 },
+        "max_age_secs": { "type": "number", "min": 0, "max": 86400, "step": 1 }
     }});
     sec!("pairing", { "fields": {
-        "enabled": "boolean", "max_devices": "number", "token_expiry_secs": "number",
+        "enabled": "boolean",
+        "max_devices": { "type": "number", "min": 1, "max": 100, "step": 1 },
+        "token_expiry_secs": { "type": "number", "min": 60, "max": 2592000, "step": 60 },
         "push_provider": { "type": "select", "options": ["none", "ntfy", "gotify"] },
         "ntfy_url": "string", "ntfy_topic": "string"
     }});
-    sec!("thinking", { "fields": { "budget_tokens": "number", "stream_thinking": "boolean" }});
+    sec!("thinking", { "fields": { "budget_tokens": { "type": "number", "min": 1024, "max": 64000, "step": 512 }, "stream_thinking": "boolean" }});
     sec!("budget", { "hot_reloadable": true, "fields": {
-        "max_hourly_usd": "number", "max_daily_usd": "number",
-        "max_monthly_usd": "number", "alert_threshold": "number",
-        "default_max_llm_tokens_per_hour": "number"
+        "max_hourly_usd": { "type": "number", "min": 0, "max": 1000, "step": 0.01 },
+        "max_daily_usd": { "type": "number", "min": 0, "max": 10000, "step": 0.01 },
+        "max_monthly_usd": { "type": "number", "min": 0, "max": 100000, "step": 0.01 },
+        "alert_threshold": { "type": "number", "min": 0, "max": 1, "step": 0.01 },
+        "default_max_llm_tokens_per_hour": { "type": "number", "min": 0, "max": 10000000, "step": 1000 }
     }});
     sec!("vertex_ai", { "fields": {
         "project_id": "string", "region": "string", "credentials_path": "string"
@@ -1586,18 +1775,21 @@ pub async fn config_schema(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "microsoft_client_id": "string", "slack_client_id": "string"
     }});
     sec!("session", { "fields": {
-        "retention_days": "number", "max_sessions_per_agent": "number",
-        "cleanup_interval_hours": "number"
+        "retention_days": { "type": "number", "min": 1, "max": 3650, "step": 1 },
+        "max_sessions_per_agent": { "type": "number", "min": 1, "max": 10000, "step": 1 },
+        "cleanup_interval_hours": { "type": "number_select", "options": ["0", "1", "6", "12", "24", "48", "168"] }
     }});
     sec!("queue", { "fields": {
-        "max_depth_per_agent": "number", "max_depth_global": "number",
-        "task_ttl_secs": "number"
+        "max_depth_per_agent": { "type": "number", "min": 1, "max": 10000, "step": 1 },
+        "max_depth_global": { "type": "number", "min": 1, "max": 100000, "step": 1 },
+        "task_ttl_secs": { "type": "number", "min": 60, "max": 86400, "step": 60 }
     }});
     sec!("external_auth", { "fields": {
         "enabled": "boolean", "issuer_url": "string", "client_id": "string",
         "client_secret_env": "string", "redirect_url": "string",
         "scopes": "string[]", "allowed_domains": "string[]",
-        "audience": "string", "session_ttl_secs": "number"
+        "audience": "string",
+        "session_ttl_secs": { "type": "number", "min": 60, "max": 2592000, "step": 60 }
     }});
 
     Json(serde_json::json!({ "sections": serde_json::Value::Object(sections) }))
@@ -1655,44 +1847,64 @@ pub async fn config_set(
         );
     }
 
-    // Read existing config as a TOML table, or start fresh
-    let mut table: toml::value::Table = if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
-            Err(_) => toml::value::Table::new(),
-        }
+    // Serialize concurrent writes to prevent read-modify-write races
+    let _config_guard = state.config_write_lock.lock().await;
+
+    // Read existing config — use toml_edit to preserve comments and formatting
+    let raw_content = if config_path.exists() {
+        std::fs::read_to_string(&config_path).unwrap_or_default()
     } else {
-        toml::value::Table::new()
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = match raw_content.parse() {
+        Ok(d) => d,
+        Err(_) => toml_edit::DocumentMut::new(),
     };
 
-    // Convert JSON value to TOML value
-    let toml_val = json_to_toml_value(&value);
+    // null → remove key instead of writing empty string
+    let is_remove = value.is_null();
 
-    // Parse "section.key" path and set value
+    // Parse "section.key" path and set/remove value
     let parts: Vec<&str> = path.split('.').collect();
     match parts.len() {
         1 => {
-            table.insert(parts[0].to_string(), toml_val);
+            if is_remove {
+                doc.remove(parts[0]);
+            } else {
+                doc[parts[0]] = toml_edit::Item::Value(json_to_toml_edit_value(&value));
+            }
         }
         2 => {
-            let section = table
-                .entry(parts[0].to_string())
-                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-            if let toml::Value::Table(ref mut t) = section {
-                t.insert(parts[1].to_string(), toml_val);
+            if is_remove {
+                if let Some(t) = doc[parts[0]].as_table_mut() {
+                    t.remove(parts[1]);
+                }
+            } else {
+                if !doc.contains_table(parts[0]) {
+                    doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                doc[parts[0]][parts[1]] = toml_edit::Item::Value(json_to_toml_edit_value(&value));
             }
         }
         3 => {
-            let section = table
-                .entry(parts[0].to_string())
-                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-            if let toml::Value::Table(ref mut t) = section {
-                let sub = t
-                    .entry(parts[1].to_string())
-                    .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-                if let toml::Value::Table(ref mut t2) = sub {
-                    t2.insert(parts[2].to_string(), toml_val);
+            if is_remove {
+                if let Some(t) = doc[parts[0]].as_table_mut() {
+                    if let Some(t2) = t.get_mut(parts[1]).and_then(|i| i.as_table_mut()) {
+                        t2.remove(parts[2]);
+                    }
                 }
+            } else {
+                if !doc.contains_table(parts[0]) {
+                    doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                if !doc[parts[0]]
+                    .as_table()
+                    .is_some_and(|t| t.contains_table(parts[1]))
+                {
+                    doc[parts[0]][parts[1]] = toml_edit::Item::Table(toml_edit::Table::new());
+                }
+                doc[parts[0]][parts[1]][parts[2]] =
+                    toml_edit::Item::Value(json_to_toml_edit_value(&value));
             }
         }
         _ => {
@@ -1705,19 +1917,26 @@ pub async fn config_set(
         }
     }
 
-    // Write back
-    let toml_string = match toml::to_string_pretty(&table) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({"status": "error", "error": format!("serialize failed: {e}")}),
-                ),
-            );
-        }
-    };
-    if let Err(e) = std::fs::write(&config_path, &toml_string) {
+    // Validate by parsing the result as KernelConfig before writing
+    let new_toml_str = doc.to_string();
+    if let Err(e) = toml::from_str::<librefang_types::config::KernelConfig>(&new_toml_str) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "error": format!("invalid config after edit: {e}")
+            })),
+        );
+    }
+
+    // Backup before write
+    let backup_path = config_path.with_extension("toml.bak");
+    if config_path.exists() {
+        let _ = std::fs::copy(&config_path, &backup_path);
+    }
+
+    // Write back — preserves comments, whitespace, and key ordering
+    if let Err(e) = std::fs::write(&config_path, &new_toml_str) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"status": "error", "error": format!("write failed: {e}")})),
@@ -1725,7 +1944,7 @@ pub async fn config_set(
     }
 
     // Trigger reload
-    let reload_status = match state.kernel.reload_config() {
+    let reload_status = match state.kernel.reload_config().await {
         Ok(plan) => {
             if plan.restart_required {
                 "applied_partial"
@@ -1749,6 +1968,39 @@ pub async fn config_set(
     )
 }
 
+/// Convert a serde_json::Value to a toml_edit::Value (format-preserving).
+fn json_to_toml_edit_value(value: &serde_json::Value) -> toml_edit::Value {
+    match value {
+        serde_json::Value::String(s) => s.as_str().into(),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into()
+            } else if let Some(f) = n.as_f64() {
+                f.into()
+            } else {
+                n.to_string().into()
+            }
+        }
+        serde_json::Value::Bool(b) => (*b).into(),
+        serde_json::Value::Array(arr) => {
+            let mut a = toml_edit::Array::new();
+            for item in arr {
+                a.push(json_to_toml_edit_value(item));
+            }
+            toml_edit::Value::Array(a)
+        }
+        serde_json::Value::Object(map) => {
+            let mut t = toml_edit::InlineTable::new();
+            for (k, v) in map {
+                t.insert(k, json_to_toml_edit_value(v));
+            }
+            toml_edit::Value::InlineTable(t)
+        }
+        // null is handled by the caller (remove key) — fallback to empty string
+        serde_json::Value::Null => "".into(),
+    }
+}
+
 /// Convert a serde_json::Value to a toml::Value.
 pub(crate) fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
     match value {
@@ -1768,6 +2020,167 @@ pub(crate) fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
         serde_json::Value::Array(arr) => {
             toml::Value::Array(arr.iter().map(json_to_toml_value).collect())
         }
-        _ => toml::Value::String(value.to_string()),
+        serde_json::Value::Object(map) => {
+            // Convert nested JSON objects into TOML tables. Without this, the
+            // catch-all below would JSON-stringify the whole object, which is
+            // how #2319 wrote `mcp_servers = ['{"name":"..."}']` into config.toml
+            // and broke reload.
+            let mut table = toml::map::Map::new();
+            for (k, v) in map {
+                table.insert(k.clone(), json_to_toml_value(v));
+            }
+            toml::Value::Table(table)
+        }
+        // Null has no TOML analogue — emit an empty string so the key still
+        // round-trips; callers that care should filter before calling.
+        serde_json::Value::Null => toml::Value::String(String::new()),
     }
+}
+
+/// GET /api/dashboard/snapshot — Single aggregated snapshot for the dashboard.
+///
+/// Replaces 7 parallel frontend requests (health, status, providers, channels,
+/// skills, agents, workflows) with one round-trip, cutting poll overhead by ~7x.
+pub async fn dashboard_snapshot(
+    State(state): State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(dashboard_snapshot_inner(&state).await)
+}
+
+async fn dashboard_snapshot_inner(state: &Arc<AppState>) -> serde_json::Value {
+    // Health (same logic as /api/health)
+    let shared_id = librefang_types::agent::AgentId(uuid::Uuid::from_bytes([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]));
+    let db_ok = state
+        .kernel
+        .memory_substrate()
+        .structured_get(shared_id, "__health_check__")
+        .is_ok();
+    let health_status = if db_ok { "ok" } else { "degraded" };
+    let fts_only = state.kernel.config_ref().memory.fts_only.unwrap_or(false);
+    let embedding_ok = fts_only || state.kernel.embedding().is_some();
+    let health = serde_json::json!({
+        "status": health_status,
+        "version": env!("CARGO_PKG_VERSION"),
+        "checks": [
+            { "name": "database", "status": if db_ok { "ok" } else { "error" } },
+            { "name": "embedding", "status": if embedding_ok { "ok" } else { "warn" } },
+        ],
+    });
+
+    // Status (same logic as /api/status, without the heavy per-agent list)
+    let agent_entries = state.kernel.agent_registry().list();
+    let agent_count = agent_entries.iter().filter(|e| !e.is_hand).count();
+    let active_agent_count = agent_entries
+        .iter()
+        .filter(|e| !e.is_hand && matches!(e.state, librefang_types::agent::AgentState::Running))
+        .count();
+    let session_count = state
+        .kernel
+        .memory_substrate()
+        .list_sessions()
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let cfg = state.kernel.config_snapshot();
+    let status = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "agent_count": agent_count,
+        "active_agent_count": active_agent_count,
+        "session_count": session_count,
+        "default_provider": cfg.default_model.provider,
+        "default_model": cfg.default_model.model,
+        "config_exists": state.kernel.home_dir().join("config.toml").exists(),
+        "network_enabled": cfg.network_enabled,
+        "terminal_enabled": cfg.terminal.enabled,
+    });
+
+    // Agents list — fully enriched (same fields as /api/agents) so AgentsPage
+    // can use this snapshot directly instead of polling /api/agents separately.
+    let agents: Vec<serde_json::Value> = {
+        let catalog = state.kernel.model_catalog_ref().read().ok();
+        let dm = {
+            let dm_override = state
+                .kernel
+                .default_model_override_ref()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            super::agents::effective_default_model(&cfg.default_model, dm_override.as_ref())
+        };
+        let mut agent_entries_visible: Vec<_> = agent_entries.iter().collect();
+        // Sort by last_active descending — matches AgentsPage default query order.
+        agent_entries_visible.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        agent_entries_visible
+            .iter()
+            .map(|e| super::agents::enrich_agent_json(e, &dm, &catalog))
+            .collect()
+    };
+
+    // Skills count — cached behind a 30s TTL to avoid scanning the skills
+    // directory on every poll cycle.
+    static SKILL_COUNT_CACHE: std::sync::Mutex<Option<(usize, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let skill_count = {
+        let cached = SKILL_COUNT_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|(n, t)| {
+                if t.elapsed() < std::time::Duration::from_secs(30) {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+        match cached {
+            Some(n) => n,
+            None => {
+                let skills_dir = state.kernel.home_dir().join("skills");
+                let mut registry = librefang_skills::registry::SkillRegistry::new(skills_dir);
+                let _ = registry.load_all();
+                let n = registry.list().len();
+                *SKILL_COUNT_CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((n, std::time::Instant::now()));
+                n
+            }
+        }
+    };
+
+    // Workflows, providers, channels — run concurrently with a 5s timeout on
+    // providers/channels in case a local provider probe stalls.
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let (workflow_result, providers_result, channels_result) = tokio::join!(
+        state.kernel.workflow_engine().list_workflows(),
+        tokio::time::timeout(PROBE_TIMEOUT, super::providers::providers_snapshot(state)),
+        tokio::time::timeout(PROBE_TIMEOUT, super::channels::channels_snapshot(state)),
+    );
+    let workflow_count = workflow_result.len();
+    let providers = providers_result.unwrap_or_default();
+    let channels = channels_result.unwrap_or_default();
+
+    // Check if at least one web search provider has a configured API key
+    let web_search_available = [
+        &cfg.web.tavily.api_key_env,
+        &cfg.web.brave.api_key_env,
+        &cfg.web.jina.api_key_env,
+        &cfg.web.perplexity.api_key_env,
+    ]
+    .iter()
+    .any(|env_var| {
+        std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+    });
+
+    serde_json::json!({
+        "health": health,
+        "status": status,
+        "agents": agents,
+        "providers": providers,
+        "channels": channels,
+        "skillCount": skill_count,
+        "workflowCount": workflow_count,
+        "webSearchAvailable": web_search_available,
+    })
 }

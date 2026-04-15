@@ -28,9 +28,31 @@ impl WebFetchEngine {
     ///
     /// Uses the resolved addresses from [`check_ssrf`] to configure DNS
     /// pinning on the builder, preventing DNS-rebinding TOCTOU attacks.
+    ///
+    /// Installs a custom redirect policy so every 3xx target is re-validated
+    /// through `check_ssrf`. Without this, an attacker-controlled public
+    /// host could respond with `302 Location: http://169.254.169.254/...`
+    /// and reqwest's default policy would silently follow — the DNS pin
+    /// only protects the original hostname, not redirect targets.
     fn pinned_client(&self, resolution: SsrfResolution) -> reqwest::Client {
+        let allowed_hosts = self.config.ssrf_allowed_hosts.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            // Clone target to String so we can still move `attempt` into
+            // attempt.error() on the SSRF-denied branch below.
+            let target = attempt.url().as_str().to_owned();
+            match check_ssrf(&target, &allowed_hosts) {
+                Ok(_) => attempt.follow(),
+                Err(reason) => {
+                    attempt.error(format!("SSRF blocked redirect to {target}: {reason}"))
+                }
+            }
+        });
         let builder = crate::http_client::proxied_client_builder()
             .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+            .redirect(redirect_policy)
             .gzip(true)
             .deflate(true)
             .brotli(true);
@@ -56,7 +78,7 @@ impl WebFetchEngine {
         let method_upper = method.to_uppercase();
 
         // Step 1: SSRF protection — resolve DNS once and validate IPs
-        let resolution = check_ssrf(url)?;
+        let resolution = check_ssrf(url, &self.config.ssrf_allowed_hosts)?;
 
         // Step 2: Cache lookup (only for GET)
         let cache_key = format!("fetch:{}:{}", method_upper, url);
@@ -214,9 +236,15 @@ impl SsrfResolution {
 /// Blocks localhost, metadata endpoints, and private IPs.
 /// Must run BEFORE any network I/O.
 ///
+/// `allowed_hosts` is a list of CIDRs (e.g. `"10.0.0.0/8"`), glob hostname
+/// patterns (e.g. `"*.internal.example.com"`), or literal IPs/hostnames that
+/// are exempt from the private-IP block.  Cloud metadata ranges
+/// (`169.254.0.0/16`, `100.64.0.0/10`) remain unconditionally blocked even
+/// when an entry matches.
+///
 /// Returns the resolved addresses on success so that callers can pin DNS
 /// and avoid TOCTOU / DNS-rebinding attacks.
-pub(crate) fn check_ssrf(url: &str) -> Result<SsrfResolution, String> {
+pub(crate) fn check_ssrf(url: &str, allowed_hosts: &[String]) -> Result<SsrfResolution, String> {
     // Only allow http:// and https:// schemes
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("Only http:// and https:// URLs are allowed".to_string());
@@ -230,7 +258,8 @@ pub(crate) fn check_ssrf(url: &str) -> Result<SsrfResolution, String> {
         host.split(':').next().unwrap_or(&host)
     };
 
-    // Hostname-based blocklist (catches metadata endpoints)
+    // Hostname-based blocklist (catches metadata endpoints — always blocked,
+    // even when the hostname appears in allowed_hosts).
     let blocked = [
         "localhost",
         "ip6-localhost",
@@ -255,8 +284,21 @@ pub(crate) fn check_ssrf(url: &str) -> Result<SsrfResolution, String> {
     match socket_addr.to_socket_addrs() {
         Ok(addrs) => {
             for addr in addrs {
-                let ip = addr.ip();
+                // Canonicalise IPv4-mapped IPv6 (::ffff:X.X.X.X) before any
+                // safety check. The OS transparently connects these to the
+                // embedded IPv4 target, so leaving them as IPv6 lets an
+                // attacker reach loopback / private / cloud-metadata IPs via
+                // the IPv6 form (e.g. [::ffff:169.254.169.254]) which the
+                // v6-only branches of is_private_ip / is_cloud_metadata_ip
+                // do not recognise.
+                let ip = canonical_ip(&addr.ip());
                 if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
+                    // Before rejecting, check the allowlist — but cloud metadata
+                    // ranges are unconditionally blocked regardless of allowlist.
+                    if !is_cloud_metadata_ip(&ip) && is_host_allowed(hostname, &ip, allowed_hosts) {
+                        resolved.push(addr);
+                        continue;
+                    }
                     return Err(format!(
                         "SSRF blocked: {hostname} resolves to private IP {ip}"
                     ));
@@ -282,9 +324,162 @@ pub(crate) fn check_ssrf(url: &str) -> Result<SsrfResolution, String> {
     })
 }
 
+/// Returns true if the IP is a cloud metadata or CGNAT range that must be
+/// blocked unconditionally, even when the host appears in the allowlist.
+///
+/// Covers:
+/// - `169.254.0.0/16` — link-local / AWS EC2 metadata
+/// - `100.64.0.0/10`  — CGNAT (also used by Alibaba Cloud IMDS at 100.100.100.200)
+fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // 169.254.0.0/16
+            o[0] == 169 && o[1] == 254
+            // 100.64.0.0/10: first octet 100, second octet 64..=127
+            || o[0] == 100 && (o[1] & 0xC0) == 64
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+/// Unwrap IPv4-mapped IPv6 (`::ffff:X.X.X.X`) and the NAT64 well-known
+/// prefix (`64:ff9b::/96`, RFC 6052) to the IPv4 address the connection
+/// will actually reach. All other addresses are returned unchanged.
+///
+/// IPv4-mapped is translated by the OS itself; NAT64 is translated by a
+/// network gateway when one is deployed. Both forms must be unwrapped
+/// before SSRF checks so an attacker can't smuggle loopback / RFC1918 /
+/// cloud-metadata IPs through them.
+///
+/// Custom NAT64 prefixes (RFC 6052 §2.2) are NOT handled — those are
+/// per-environment configuration and would need an explicit setting.
+fn canonical_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            if let Some(v4) = extract_nat64_well_known(v6) {
+                return IpAddr::V4(v4);
+            }
+            IpAddr::V6(*v6)
+        }
+        IpAddr::V4(_) => *ip,
+    }
+}
+
+/// Extract the embedded IPv4 from an address in the NAT64 well-known
+/// prefix `64:ff9b::/96` (RFC 6052). Returns `None` for any other address.
+fn extract_nat64_well_known(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let segments = v6.segments();
+    // 96-bit prefix: 0064:ff9b:0000:0000:0000:0000::/96
+    if segments[0] != 0x0064
+        || segments[1] != 0xff9b
+        || segments[2] != 0
+        || segments[3] != 0
+        || segments[4] != 0
+        || segments[5] != 0
+    {
+        return None;
+    }
+    // Embedded IPv4 lives in the low 32 bits (segments 6 and 7).
+    Some(std::net::Ipv4Addr::new(
+        (segments[6] >> 8) as u8,
+        (segments[6] & 0xff) as u8,
+        (segments[7] >> 8) as u8,
+        (segments[7] & 0xff) as u8,
+    ))
+}
+
+/// Check whether a hostname or resolved IP matches any entry in `allowed_hosts`.
+///
+/// Entry formats:
+/// - `"10.0.0.0/8"`           — CIDR; matched against the resolved `ip`
+/// - `"*.internal.example.com"` — glob prefix wildcard; matched against `hostname`
+/// - `"10.1.2.3"` / `"svc.local"` — literal IP or hostname exact match
+fn is_host_allowed(hostname: &str, ip: &IpAddr, allowed_hosts: &[String]) -> bool {
+    for entry in allowed_hosts {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // CIDR notation (contains '/')
+        if entry.contains('/') {
+            if let Ok(matched) = cidr_contains(entry, ip) {
+                if matched {
+                    return true;
+                }
+            }
+            continue;
+        }
+        // Glob hostname pattern (starts with '*').
+        // Bare "*" is rejected — it would match every hostname and silently
+        // bypass all private-IP protection, which is almost certainly a
+        // misconfiguration rather than intent.
+        if let Some(suffix) = entry.strip_prefix('*') {
+            if suffix.is_empty() {
+                continue; // reject "*" — too broad
+            }
+            // "*.foo.com" -> suffix = ".foo.com"
+            if hostname.ends_with(suffix) {
+                return true;
+            }
+            continue;
+        }
+        // Literal IP match
+        if let Ok(entry_ip) = entry.parse::<IpAddr>() {
+            if entry_ip == *ip {
+                return true;
+            }
+            continue;
+        }
+        // Literal hostname match
+        if entry.eq_ignore_ascii_case(hostname) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a CIDR string like `"10.0.0.0/8"` and check if `ip` falls within it.
+/// Only IPv4 CIDRs are supported; IPv4-in-IPv6 and pure IPv6 CIDRs are not.
+fn cidr_contains(cidr: &str, ip: &IpAddr) -> Result<bool, ()> {
+    let (addr_str, prefix_str) = cidr.split_once('/').ok_or(())?;
+    let prefix_len: u32 = prefix_str.parse().map_err(|_| ())?;
+    match (addr_str.parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(net_addr)), IpAddr::V4(v4)) => {
+            if prefix_len > 32 {
+                return Err(());
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+            Ok((u32::from_be_bytes(net_addr.octets()) & mask)
+                == (u32::from_be_bytes(v4.octets()) & mask))
+        }
+        (Ok(IpAddr::V6(net_addr)), IpAddr::V6(v6)) => {
+            if prefix_len > 128 {
+                return Err(());
+            }
+            let net_bits = u128::from_be_bytes(net_addr.octets());
+            let ip_bits = u128::from_be_bytes(v6.octets());
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
+            Ok((net_bits & mask) == (ip_bits & mask))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Check if an IP address is in a private range.
 fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
+    match canonical_ip(ip) {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             matches!(
@@ -356,8 +551,8 @@ mod tests {
 
     #[test]
     fn test_ssrf_blocks_localhost() {
-        assert!(check_ssrf("http://localhost/admin").is_err());
-        assert!(check_ssrf("http://localhost:8080/api").is_err());
+        assert!(check_ssrf("http://localhost/admin", &[]).is_err());
+        assert!(check_ssrf("http://localhost:8080/api", &[]).is_err());
     }
 
     #[test]
@@ -371,8 +566,8 @@ mod tests {
 
     #[test]
     fn test_ssrf_blocks_metadata() {
-        assert!(check_ssrf("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(check_ssrf("http://metadata.google.internal/computeMetadata/v1/").is_err());
+        assert!(check_ssrf("http://169.254.169.254/latest/meta-data/", &[]).is_err());
+        assert!(check_ssrf("http://metadata.google.internal/computeMetadata/v1/", &[]).is_err());
     }
 
     #[test]
@@ -387,28 +582,151 @@ mod tests {
 
     #[test]
     fn test_ssrf_blocks_non_http() {
-        assert!(check_ssrf("file:///etc/passwd").is_err());
-        assert!(check_ssrf("ftp://internal.corp/data").is_err());
-        assert!(check_ssrf("gopher://evil.com").is_err());
+        assert!(check_ssrf("file:///etc/passwd", &[]).is_err());
+        assert!(check_ssrf("ftp://internal.corp/data", &[]).is_err());
+        assert!(check_ssrf("gopher://evil.com", &[]).is_err());
     }
 
     #[test]
     fn test_ssrf_blocks_cloud_metadata() {
         // Alibaba Cloud IMDS
-        assert!(check_ssrf("http://100.100.100.200/latest/meta-data/").is_err());
+        assert!(check_ssrf("http://100.100.100.200/latest/meta-data/", &[]).is_err());
         // Azure IMDS alternative
-        assert!(check_ssrf("http://192.0.0.192/metadata/instance").is_err());
+        assert!(check_ssrf("http://192.0.0.192/metadata/instance", &[]).is_err());
     }
 
     #[test]
     fn test_ssrf_blocks_zero_ip() {
-        assert!(check_ssrf("http://0.0.0.0/").is_err());
+        assert!(check_ssrf("http://0.0.0.0/", &[]).is_err());
     }
 
     #[test]
     fn test_ssrf_blocks_ipv6_localhost() {
-        assert!(check_ssrf("http://[::1]/admin").is_err());
-        assert!(check_ssrf("http://[::1]:8080/api").is_err());
+        assert!(check_ssrf("http://[::1]/admin", &[]).is_err());
+        assert!(check_ssrf("http://[::1]:8080/api", &[]).is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv4_mapped_ipv6_loopback() {
+        // OS transparently connects ::ffff:127.0.0.1 to 127.0.0.1.
+        // The standard is_loopback() check on IpAddr::V6 returns false, so
+        // without canonicalisation this slipped past SSRF protection.
+        assert!(check_ssrf("http://[::ffff:127.0.0.1]/", &[]).is_err());
+        assert!(check_ssrf("http://[::ffff:7f00:1]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv4_mapped_ipv6_metadata() {
+        // 169.254.169.254 expressed as an IPv4-mapped IPv6 address reaches
+        // the AWS EC2 instance metadata service on real hosts.
+        assert!(check_ssrf("http://[::ffff:169.254.169.254]/", &[]).is_err());
+        assert!(check_ssrf("http://[::ffff:a9fe:a9fe]/", &[]).is_err());
+        assert!(check_ssrf("http://[0:0:0:0:0:ffff:169.254.169.254]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_ipv4_mapped_ipv6_private() {
+        assert!(check_ssrf("http://[::ffff:10.0.0.1]/", &[]).is_err());
+        assert!(check_ssrf("http://[::ffff:192.168.1.1]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_canonical_ip_unwraps_mapped() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let mapped: IpAddr = IpAddr::V6("::ffff:169.254.169.254".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            canonical_ip(&mapped),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        // Real IPv6 is left alone.
+        let real_v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(canonical_ip(&real_v6), real_v6);
+    }
+
+    #[test]
+    fn test_is_private_ip_recognises_mapped_v6() {
+        use std::net::IpAddr;
+        let mapped_private: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&mapped_private));
+        let mapped_link_local: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_private_ip(&mapped_link_local));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_recognises_mapped_v6() {
+        use std::net::IpAddr;
+        let mapped_imds: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(is_cloud_metadata_ip(&mapped_imds));
+        let mapped_cgnat: IpAddr = "::ffff:100.64.0.1".parse().unwrap();
+        assert!(is_cloud_metadata_ip(&mapped_cgnat));
+    }
+
+    #[test]
+    fn test_extract_nat64_well_known() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // 169.254.169.254 embedded → AWS IMDS via NAT64
+        let nat64_imds: Ipv6Addr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert_eq!(
+            extract_nat64_well_known(&nat64_imds),
+            Some(Ipv4Addr::new(169, 254, 169, 254))
+        );
+        // 10.0.0.1 embedded → RFC1918 via NAT64
+        let nat64_priv: Ipv6Addr = "64:ff9b::0a00:0001".parse().unwrap();
+        assert_eq!(
+            extract_nat64_well_known(&nat64_priv),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        // Real IPv6 outside the prefix → None
+        let real_v6: Ipv6Addr = "2001:db8::a9fe:a9fe".parse().unwrap();
+        assert_eq!(extract_nat64_well_known(&real_v6), None);
+    }
+
+    #[test]
+    fn test_canonical_ip_unwraps_nat64() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let nat64_imds: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert_eq!(
+            canonical_ip(&nat64_imds),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
+        );
+    }
+
+    #[test]
+    fn test_ssrf_blocks_nat64_metadata() {
+        // 169.254.169.254 reachable via NAT64 well-known prefix when a NAT64
+        // gateway is on path (e.g. cloud VPC with IPv6 transition setup).
+        assert!(check_ssrf("http://[64:ff9b::a9fe:a9fe]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_nat64_loopback() {
+        // 127.0.0.1 = 7f00:0001 in the NAT64 low 32 bits.
+        assert!(check_ssrf("http://[64:ff9b::7f00:1]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_ssrf_blocks_nat64_private() {
+        // 10.0.0.1 and 192.168.1.1 via NAT64.
+        assert!(check_ssrf("http://[64:ff9b::a00:1]/", &[]).is_err());
+        assert!(check_ssrf("http://[64:ff9b::c0a8:101]/", &[]).is_err());
+    }
+
+    #[test]
+    fn test_is_private_ip_recognises_nat64_v6() {
+        use std::net::IpAddr;
+        let nat64_priv: IpAddr = "64:ff9b::a00:1".parse().unwrap();
+        assert!(is_private_ip(&nat64_priv));
+        let nat64_link_local: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert!(is_private_ip(&nat64_link_local));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_recognises_nat64_v6() {
+        use std::net::IpAddr;
+        let nat64_imds: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert!(is_cloud_metadata_ip(&nat64_imds));
+        let nat64_alibaba: IpAddr = "64:ff9b::6464:64c8".parse().unwrap();
+        assert!(is_cloud_metadata_ip(&nat64_alibaba));
     }
 
     #[test]
@@ -421,5 +739,85 @@ mod tests {
 
         let h3 = extract_host("http://[::1]/path");
         assert_eq!(h3, "[::1]:80");
+    }
+
+    #[test]
+    fn test_cidr_contains() {
+        use std::net::IpAddr;
+        let ip_10: IpAddr = "10.1.2.3".parse().unwrap();
+        let ip_192: IpAddr = "192.168.0.1".parse().unwrap();
+        let ip_8: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(cidr_contains("10.0.0.0/8", &ip_10).unwrap());
+        assert!(!cidr_contains("10.0.0.0/8", &ip_192).unwrap());
+        assert!(!cidr_contains("10.0.0.0/8", &ip_8).unwrap());
+        // /32 exact
+        assert!(cidr_contains("10.1.2.3/32", &ip_10).unwrap());
+        assert!(!cidr_contains("10.1.2.4/32", &ip_10).unwrap());
+        // /0 matches all
+        assert!(cidr_contains("0.0.0.0/0", &ip_8).unwrap());
+    }
+
+    #[test]
+    fn test_is_host_allowed_cidr() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let allowed = vec!["10.0.0.0/8".to_string()];
+        assert!(is_host_allowed("svc.internal", &ip, &allowed));
+        let not_allowed: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_host_allowed("dns.google", &not_allowed, &allowed));
+    }
+
+    #[test]
+    fn test_is_host_allowed_glob() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let allowed = vec!["*.internal.example.com".to_string()];
+        assert!(is_host_allowed("svc.internal.example.com", &ip, &allowed));
+        assert!(!is_host_allowed("evil.example.com", &ip, &allowed));
+    }
+
+    #[test]
+    fn test_is_host_allowed_literal_ip() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let allowed = vec!["10.1.2.3".to_string()];
+        assert!(is_host_allowed("anything", &ip, &allowed));
+        let other: IpAddr = "10.1.2.4".parse().unwrap();
+        assert!(!is_host_allowed("anything", &other, &allowed));
+    }
+
+    #[test]
+    fn test_cloud_metadata_blocked_even_when_allowlisted() {
+        // 169.254.169.254 is in hostname blocklist so check_ssrf returns Err before
+        // reaching IP resolution, but the is_cloud_metadata_ip guard also covers
+        // cases where a hostname resolves to a link-local IP.
+        use std::net::IpAddr;
+        let link_local: IpAddr = "169.254.0.1".parse().unwrap();
+        let cgnat: IpAddr = "100.64.0.1".parse().unwrap();
+        assert!(is_cloud_metadata_ip(&link_local));
+        assert!(is_cloud_metadata_ip(&cgnat));
+        // Regular private IPs are NOT cloud metadata
+        let priv_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!is_cloud_metadata_ip(&priv_ip));
+    }
+
+    #[test]
+    fn test_bare_glob_star_is_rejected() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        // Bare "*" must NOT match everything — it would bypass all private-IP protection.
+        let allowed = vec!["*".to_string()];
+        assert!(
+            !is_host_allowed("any.internal.host", &ip, &allowed),
+            "bare '*' must not be a universal allowlist entry"
+        );
+        // "*" with a dot suffix still works normally.
+        let allowed_dot = vec!["*.internal.example.com".to_string()];
+        assert!(is_host_allowed(
+            "svc.internal.example.com",
+            &ip,
+            &allowed_dot
+        ));
+        assert!(!is_host_allowed("evil.com", &ip, &allowed_dot));
     }
 }

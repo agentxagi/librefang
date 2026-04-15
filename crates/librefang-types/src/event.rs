@@ -84,6 +84,8 @@ pub enum EventPayload {
     System(SystemEvent),
     /// An approval request was created and is waiting for human resolution.
     ApprovalRequested(ApprovalRequestedEvent),
+    /// An approval request was resolved (approved, denied, modified, etc.).
+    ApprovalResolved(ApprovalResolvedEvent),
     /// User-defined payload.
     Custom(Vec<u8>),
 }
@@ -101,6 +103,17 @@ pub struct ApprovalRequestedEvent {
     pub description: String,
     /// Risk classification.
     pub risk_level: String,
+}
+
+/// Payload for `EventPayload::ApprovalResolved`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalResolvedEvent {
+    pub request_id: String,
+    pub agent_id: String,
+    pub tool_name: String,
+    /// The decision: "approved", "denied", "timed_out", "modify_and_retry", "skipped".
+    pub decision: String,
+    pub decided_by: Option<String>,
 }
 
 /// A message between agents or from user to agent.
@@ -293,6 +306,31 @@ pub enum SystemEvent {
         agent_id: AgentId,
         /// How long the agent has been unresponsive.
         unresponsive_secs: u64,
+    },
+    /// A task was posted to the Task Board.
+    TaskPosted {
+        /// The task ID.
+        task_id: String,
+        /// The task title.
+        title: String,
+        /// Agent the task is assigned to (if any).
+        assigned_to: Option<String>,
+        /// Agent that created the task.
+        created_by: Option<String>,
+    },
+    /// A task was claimed from the Task Board.
+    TaskClaimed {
+        /// The task ID.
+        task_id: String,
+        /// Agent that claimed the task.
+        claimed_by: String,
+    },
+    /// A task was completed on the Task Board.
+    TaskCompleted {
+        /// The task ID.
+        task_id: String,
+        /// The task result/verdict.
+        result: String,
     },
 }
 

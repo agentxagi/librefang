@@ -5,23 +5,31 @@ import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import {
   deleteWorkflow,
+  dryRunWorkflow,
+  getWorkflowRun,
   listWorkflowRuns,
   listWorkflows,
   runWorkflow,
   listWorkflowTemplates,
   instantiateTemplate,
   createSchedule,
+  type DryRunResult,
+  type WorkflowRunDetail,
   type WorkflowTemplate,
 } from "../api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { PageHeader } from "../components/ui/PageHeader";
+import { useUIStore } from "../lib/store";
+import { useCreateShortcut } from "../lib/useCreateShortcut";
 import { ListSkeleton } from "../components/ui/Skeleton";
+import { EmptyState } from "../components/ui/EmptyState";
 import { ScheduleModal } from "../components/ui/ScheduleModal";
 import {
   Layers, Trash2, FilePlus, Play, Search,
-  Calendar, FileText, Activity, Bot, ArrowRight, Loader2, Clock, ChevronRight
+  Calendar, FileText, Activity, Bot, ArrowRight, Loader2, Clock, ChevronRight,
+  ChevronDown, FlaskConical, AlertCircle, CheckCircle2, SkipForward,
 } from "lucide-react";
 
 const categoryIconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -39,11 +47,34 @@ export function WorkflowsPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeTab, setActiveTab] = useState<"workflows" | "templates">("workflows");
   const [scheduleWorkflowId, setScheduleWorkflowId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [expandedStepIdx, setExpandedStepIdx] = useState<number | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<DryRunResult | null>(null);
 
   const workflowsQuery = useQuery({ queryKey: ["workflows", "list"], queryFn: listWorkflows, refetchInterval: REFRESH_MS });
   const runsQuery = useQuery({ queryKey: ["workflows", "runs", selectedWorkflowId], queryFn: () => listWorkflowRuns(selectedWorkflowId), enabled: Boolean(selectedWorkflowId) });
-  const runMutation = useMutation({ mutationFn: ({ workflowId, input }: any) => runWorkflow(workflowId, input) });
-  const deleteMutation = useMutation({ mutationFn: deleteWorkflow });
+  const runDetailQuery = useQuery<WorkflowRunDetail>({
+    queryKey: ["workflows", "run-detail", selectedRunId],
+    queryFn: () => getWorkflowRun(selectedRunId!),
+    enabled: Boolean(selectedRunId),
+  });
+  const addToast = useUIStore((s) => s.addToast);
+  const runMutation = useMutation({
+    mutationFn: ({ workflowId, input }: any) => runWorkflow(workflowId, input),
+    onSuccess: () => addToast(t("workflows.run_started", { defaultValue: "Workflow run started" }), "success"),
+    onError: (e: any) => addToast(e?.message || t("workflows.run_failed", { defaultValue: "Failed to start workflow" }), "error"),
+  });
+  const dryRunMutation = useMutation({
+    mutationFn: ({ workflowId, input }: { workflowId: string; input: string }) =>
+      dryRunWorkflow(workflowId, input),
+    onSuccess: (data) => setDryRunResult(data),
+    onError: (e: any) => addToast(e?.message || t("workflows.dry_run_failed", { defaultValue: "Dry run failed" }), "error"),
+  });
+  const deleteMutation = useMutation({
+    mutationFn: deleteWorkflow,
+    onSuccess: () => addToast(t("workflows.deleted", { defaultValue: "Workflow deleted" }), "success"),
+    onError: (e: any) => addToast(e?.message || t("workflows.delete_failed", { defaultValue: "Failed to delete workflow" }), "error"),
+  });
 
   const workflows = useMemo(() =>
     [...(workflowsQuery.data ?? [])]
@@ -54,9 +85,19 @@ export function WorkflowsPage() {
 
   const handleRun = async () => {
     if (!selectedWorkflowId) return;
+    setDryRunResult(null);
     try {
       await runMutation.mutateAsync({ workflowId: selectedWorkflowId, input: runInput });
       await runsQuery.refetch();
+    } catch { /* ignore */ }
+  };
+
+  const handleDryRun = async () => {
+    if (!selectedWorkflowId) return;
+    setDryRunResult(null);
+    runMutation.reset();
+    try {
+      await dryRunMutation.mutateAsync({ workflowId: selectedWorkflowId, input: runInput });
     } catch { /* ignore */ }
   };
 
@@ -72,13 +113,38 @@ export function WorkflowsPage() {
     sessionStorage.removeItem("workflowTemplate");
     navigate({ to: "/canvas", search: { t: Date.now(), wf: undefined } });
   };
+  useCreateShortcut(handleNewWorkflow);
 
   const handleUseTemplate = async (tmpl: WorkflowTemplate) => {
+    const steps: any[] = (tmpl as any).steps ?? [];
+    const nameToIdx = new Map(steps.map((s: any, i: number) => [s.name, i]));
+    const nodes = steps.map((s: any, idx: number) => ({
+      id: `node-${idx}`,
+      type: "custom",
+      position: { x: 50, y: idx * 160 },
+      data: { label: s.name, prompt: s.prompt_template || "", nodeType: "agent" },
+    }));
+    const edges: any[] = [];
+    steps.forEach((s: any, idx: number) => {
+      (s.depends_on ?? []).forEach((dep: string) => {
+        const src = nameToIdx.get(dep);
+        if (src !== undefined) edges.push({ id: `e-${src}-${idx}`, source: `node-${src}`, target: `node-${idx}` });
+      });
+    });
+    if (edges.length === 0 && nodes.length > 1) {
+      nodes.slice(0, -1).forEach((_: any, i: number) =>
+        edges.push({ id: `e-${i}`, source: `node-${i}`, target: `node-${i + 1}` })
+      );
+    }
+
     const hasRequiredParams = (tmpl.parameters ?? []).some(p => p.required);
     if (hasRequiredParams) {
-      // Template needs params — open canvas with TemplateBrowser
+      // Template has required params — open canvas pre-populated with nodes so
+      // the user can see the workflow structure and fill in parameter values.
       sessionStorage.removeItem("canvasNodes");
-      sessionStorage.removeItem("workflowTemplate");
+      sessionStorage.setItem("workflowTemplate", JSON.stringify({
+        nodes, edges, name: tmpl.name, description: tmpl.description ?? "",
+      }));
       navigate({ to: "/canvas", search: { t: Date.now(), wf: undefined } });
       return;
     }
@@ -88,10 +154,19 @@ export function WorkflowsPage() {
       if (workflowId) {
         await queryClient.invalidateQueries({ queryKey: ["workflows"] });
         openWorkflow(workflowId);
+      } else {
+        // Instantiation succeeded but no ID returned — fall back to pre-populated canvas
+        sessionStorage.removeItem("canvasNodes");
+        sessionStorage.setItem("workflowTemplate", JSON.stringify({
+          nodes, edges, name: tmpl.name, description: tmpl.description ?? "",
+        }));
+        navigate({ to: "/canvas", search: { t: Date.now(), wf: undefined } });
       }
     } catch {
       sessionStorage.removeItem("canvasNodes");
-      sessionStorage.removeItem("workflowTemplate");
+      sessionStorage.setItem("workflowTemplate", JSON.stringify({
+        nodes, edges, name: tmpl.name, description: tmpl.description ?? "",
+      }));
       navigate({ to: "/canvas", search: { t: Date.now(), wf: undefined } });
     }
   };
@@ -121,9 +196,10 @@ export function WorkflowsPage() {
         icon={<Layers className="h-4 w-4" />}
         helpText={t("workflows.help")}
         actions={hasWorkflows ?
-          <Button variant="primary" onClick={handleNewWorkflow}>
+          <Button variant="primary" onClick={handleNewWorkflow} title={t("workflows.create_blank") + " (n)"}>
             <FilePlus className="h-4 w-4" />
-            {t("workflows.create_blank")}
+            <span>{t("workflows.create_blank")}</span>
+            <kbd className="hidden sm:inline-flex h-5 min-w-[20px] items-center justify-center rounded border border-white/30 bg-white/10 px-1 text-[9px] font-mono font-semibold">n</kbd>
           </Button> : undefined
         }
       />
@@ -157,7 +233,7 @@ export function WorkflowsPage() {
       {/* Templates Tab */}
       {activeTab === "templates" && (
         apiTemplates.length > 0 ? (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
             {apiTemplates.map(tmpl => {
               const Icon = categoryIconMap[tmpl.category || ""] || Layers;
               const stepCount = tmpl.steps?.length ?? 0;
@@ -194,7 +270,8 @@ export function WorkflowsPage() {
           {hasWorkflows && (
             <Input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
               placeholder={t("workflows.search_placeholder")}
-              leftIcon={<Search className="h-4 w-4" />} />
+              leftIcon={<Search className="h-4 w-4" />}
+              data-shortcut-search />
           )}
 
           {/* Loading Skeleton */}
@@ -264,7 +341,8 @@ export function WorkflowsPage() {
                     </div>
                   ) : (
                     <button onClick={() => handleDelete(wf.id)}
-                      className="p-2 rounded-lg text-text-dim/30 hover:text-error hover:bg-error/10 transition-colors">
+                      className="p-2 rounded-lg text-text-dim/30 hover:text-error hover:bg-error/10 transition-colors"
+                      aria-label={t("common.delete")}>
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
                   )}
@@ -276,56 +354,254 @@ export function WorkflowsPage() {
           {/* Right Panel: shown when a workflow is selected */}
           {selectedWorkflowId && (
             <div className="space-y-4">
-              <Card padding="lg" className="sticky top-4">
-                <h3 className="text-xs font-bold uppercase tracking-widest text-text-dim/50 mb-4">{t("workflows.run_workflow")}</h3>
+              <Card padding="lg" className="sticky top-4 space-y-3">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-text-dim/50">{t("workflows.run_workflow")}</h3>
                 <textarea value={runInput} onChange={e => setRunInput(e.target.value)}
                   placeholder={t("canvas.run_input_placeholder")} rows={4}
-                  className="w-full rounded-xl border border-border-subtle bg-main px-4 py-2.5 text-sm mb-3 outline-none focus:border-brand resize-none" />
-                <Button variant="primary" className="w-full" disabled={runMutation.isPending} onClick={handleRun}>
-                  {runMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
-                  {t("canvas.run_now")}
-                </Button>
+                  className="w-full rounded-xl border border-border-subtle bg-main px-4 py-2.5 text-sm outline-none focus:border-brand resize-none" />
+                <div className="flex gap-2">
+                  <Button variant="primary" className="flex-1" disabled={runMutation.isPending || dryRunMutation.isPending} onClick={handleRun}>
+                    {runMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
+                    {t("canvas.run_now")}
+                  </Button>
+                  <Button variant="secondary" disabled={runMutation.isPending || dryRunMutation.isPending} onClick={handleDryRun}
+                    title={t("workflows.dry_run_hint")}>
+                    {dryRunMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <FlaskConical className="w-4 h-4" />}
+                    <span className="hidden sm:inline ml-1.5">{t("workflows.dry_run")}</span>
+                  </Button>
+                </div>
+
+                {/* Dry-run result */}
+                {dryRunResult && (
+                  <div className={`p-3 rounded-xl border ${dryRunResult.valid ? "bg-success/5 border-success/20" : "bg-warning/5 border-warning/20"}`}>
+                    <div className="flex items-center gap-2 mb-2">
+                      {dryRunResult.valid
+                        ? <CheckCircle2 className="w-3.5 h-3.5 text-success" />
+                        : <AlertCircle className="w-3.5 h-3.5 text-warning" />}
+                      <p className={`text-[10px] font-bold ${dryRunResult.valid ? "text-success" : "text-warning"}`}>
+                        {dryRunResult.valid ? t("workflows.dry_run_valid") : t("workflows.dry_run_warning")}
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      {dryRunResult.steps.map((step, i) => (
+                        <div key={i} className="rounded-lg border border-border-subtle bg-main overflow-hidden">
+                          <button
+                            className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-surface transition-colors"
+                            onClick={() => setExpandedStepIdx(expandedStepIdx === i ? null : i)}>
+                            {step.skipped
+                              ? <SkipForward className="w-3 h-3 text-text-dim/40 shrink-0" />
+                              : step.agent_found
+                                ? <CheckCircle2 className="w-3 h-3 text-success shrink-0" />
+                                : <AlertCircle className="w-3 h-3 text-warning shrink-0" />}
+                            <span className="text-[10px] font-bold truncate flex-1">{step.step_name}</span>
+                            {step.agent_name && (
+                              <span className="text-[9px] text-text-dim/50 shrink-0">{step.agent_name}</span>
+                            )}
+                            {step.skipped && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-main border border-border-subtle text-text-dim/50 shrink-0">skip</span>
+                            )}
+                            <ChevronDown className={`w-3 h-3 text-text-dim/30 shrink-0 transition-transform ${expandedStepIdx === i ? "rotate-180" : ""}`} />
+                          </button>
+                          {expandedStepIdx === i && (
+                            <div className="px-3 pb-3 space-y-1.5 border-t border-border-subtle">
+                              {!step.agent_found && (
+                                <p className="text-[10px] text-warning mt-2">Agent not found</p>
+                              )}
+                              {step.skip_reason && (
+                                <p className="text-[10px] text-text-dim mt-2">{step.skip_reason}</p>
+                              )}
+                              <p className="text-[9px] font-bold text-text-dim/50 mt-2">Resolved prompt:</p>
+                              <pre className="text-[10px] text-text whitespace-pre-wrap max-h-28 overflow-y-auto bg-surface rounded-lg p-2">
+                                {step.resolved_prompt || "(empty)"}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Run Result */}
                 {runMutation.data && (
-                  <div className="mt-4 p-3 rounded-xl bg-success/5 border border-success/20">
-                    <p className="text-[10px] font-bold text-success mb-1">{t("canvas.run_result")}</p>
-                    <pre className="text-xs text-text whitespace-pre-wrap max-h-40 overflow-y-auto">
+                  <div className="p-3 rounded-xl bg-success/5 border border-success/20 space-y-2">
+                    <p className="text-[10px] font-bold text-success">{t("canvas.run_result")}</p>
+                    <pre className="text-xs text-text whitespace-pre-wrap max-h-32 overflow-y-auto">
                       {(runMutation.data as any).output || (runMutation.data as any).message || JSON.stringify(runMutation.data)}
                     </pre>
+                    {/* Step-level I/O */}
+                    {((runMutation.data as any).step_results as any[])?.length > 0 && (
+                      <div className="space-y-1.5 border-t border-success/20 pt-2">
+                        <p className="text-[9px] font-bold text-text-dim/50">Step details</p>
+                        {((runMutation.data as any).step_results as any[]).map((s: any, i: number) => (
+                          <div key={i} className="rounded-lg border border-border-subtle bg-main overflow-hidden">
+                            <button
+                              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-surface transition-colors"
+                              onClick={() => setExpandedStepIdx(expandedStepIdx === i + 1000 ? null : i + 1000)}>
+                              <CheckCircle2 className="w-3 h-3 text-success shrink-0" />
+                              <span className="text-[10px] font-bold truncate flex-1">{s.step_name}</span>
+                              <span className="text-[9px] text-text-dim/50 shrink-0">{s.duration_ms}ms</span>
+                              <ChevronDown className={`w-3 h-3 text-text-dim/30 shrink-0 transition-transform ${expandedStepIdx === i + 1000 ? "rotate-180" : ""}`} />
+                            </button>
+                            {expandedStepIdx === i + 1000 && (
+                              <div className="px-3 pb-3 space-y-2 border-t border-border-subtle">
+                                <div>
+                                  <p className="text-[9px] font-bold text-text-dim/50 mt-2">Prompt sent:</p>
+                                  <pre className="text-[10px] text-text whitespace-pre-wrap max-h-24 overflow-y-auto bg-surface rounded-lg p-2 mt-1">
+                                    {s.prompt || "(empty)"}
+                                  </pre>
+                                </div>
+                                <div>
+                                  <p className="text-[9px] font-bold text-text-dim/50">Output:</p>
+                                  <pre className="text-[10px] text-text whitespace-pre-wrap max-h-24 overflow-y-auto bg-surface rounded-lg p-2 mt-1">
+                                    {s.output || "(empty)"}
+                                  </pre>
+                                </div>
+                                <p className="text-[9px] text-text-dim/40">
+                                  {s.agent_name} · {s.input_tokens} in / {s.output_tokens} out tokens
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
                 {runMutation.error && (
-                  <div className="mt-4 p-3 rounded-xl bg-error/5 border border-error/20">
-                    <p className="text-xs text-error">{(runMutation.error as any)?.message || String(runMutation.error)}</p>
+                  <div className="p-3 rounded-xl bg-error/5 border border-error/20">
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <AlertCircle className="w-3.5 h-3.5 text-error shrink-0" />
+                      <p className="text-[10px] font-bold text-error">Run failed</p>
+                    </div>
+                    <p className="text-xs text-error/80">
+                      {(runMutation.error as any)?.message || String(runMutation.error)}
+                    </p>
+                  </div>
+                )}
+                {dryRunMutation.error && (
+                  <div className="p-3 rounded-xl bg-error/5 border border-error/20">
+                    <p className="text-xs text-error">
+                      {(dryRunMutation.error as any)?.message || String(dryRunMutation.error)}
+                    </p>
                   </div>
                 )}
               </Card>
+
+              {/* Run History */}
+              {runsQuery.data && runsQuery.data.length > 0 && (
+                <Card padding="lg" className="space-y-3">
+                  <h3 className="text-xs font-bold uppercase tracking-widest text-text-dim/50">Run History</h3>
+                  <div className="space-y-1.5">
+                    {runsQuery.data.slice(0, 10).map((run) => {
+                      const runId = (run as any).id as string | undefined;
+                      const state = (run as any).state as string | undefined;
+                      const isSelected = selectedRunId === runId;
+                      return (
+                        <div key={runId}>
+                          <button
+                            className={`w-full flex items-center gap-3 p-2.5 rounded-xl border text-left transition-colors ${
+                              isSelected
+                                ? "border-brand bg-brand/5"
+                                : "border-border-subtle bg-main hover:bg-surface"
+                            }`}
+                            onClick={() => {
+                              setSelectedRunId(isSelected ? null : (runId ?? null));
+                              setExpandedStepIdx(null);
+                            }}>
+                            <div className={`w-2 h-2 rounded-full shrink-0 ${
+                              state === "completed" ? "bg-success" :
+                              state === "failed" ? "bg-error" :
+                              state === "running" ? "bg-brand animate-pulse" : "bg-text-dim/30"
+                            }`} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[10px] font-bold truncate">{run.workflow_name}</p>
+                              <p className="text-[9px] text-text-dim/50">{formatDate(run.started_at)}</p>
+                            </div>
+                            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded-full shrink-0 ${
+                              state === "completed" ? "bg-success/10 text-success" :
+                              state === "failed" ? "bg-error/10 text-error" :
+                              "bg-main text-text-dim"
+                            }`}>{state}</span>
+                          </button>
+                          {/* Inline run detail */}
+                          {isSelected && runDetailQuery.data && (
+                            <div className="ml-5 mt-1 space-y-1.5">
+                              {runDetailQuery.data.error && (
+                                <div className="flex items-start gap-1.5 p-2 rounded-lg bg-error/5 border border-error/20">
+                                  <AlertCircle className="w-3 h-3 text-error shrink-0 mt-0.5" />
+                                  <p className="text-[10px] text-error">{runDetailQuery.data.error}</p>
+                                </div>
+                              )}
+                              {runDetailQuery.data.step_results.map((step, si) => (
+                                <div key={si} className="rounded-lg border border-border-subtle bg-main overflow-hidden">
+                                  <button
+                                    className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-surface transition-colors"
+                                    onClick={() => setExpandedStepIdx(expandedStepIdx === si + 2000 ? null : si + 2000)}>
+                                    <CheckCircle2 className="w-3 h-3 text-success shrink-0" />
+                                    <span className="text-[10px] font-bold truncate flex-1">{step.step_name}</span>
+                                    <span className="text-[9px] text-text-dim/50 shrink-0">{step.duration_ms}ms</span>
+                                    <ChevronDown className={`w-3 h-3 text-text-dim/30 shrink-0 transition-transform ${expandedStepIdx === si + 2000 ? "rotate-180" : ""}`} />
+                                  </button>
+                                  {expandedStepIdx === si + 2000 && (
+                                    <div className="px-3 pb-3 space-y-2 border-t border-border-subtle">
+                                      <div>
+                                        <p className="text-[9px] font-bold text-text-dim/50 mt-2">Prompt sent:</p>
+                                        <pre className="text-[10px] text-text whitespace-pre-wrap max-h-24 overflow-y-auto bg-surface rounded-lg p-2 mt-1">
+                                          {step.prompt || "(empty)"}
+                                        </pre>
+                                      </div>
+                                      <div>
+                                        <p className="text-[9px] font-bold text-text-dim/50">Output:</p>
+                                        <pre className="text-[10px] text-text whitespace-pre-wrap max-h-24 overflow-y-auto bg-surface rounded-lg p-2 mt-1">
+                                          {step.output || "(empty)"}
+                                        </pre>
+                                      </div>
+                                      <p className="text-[9px] text-text-dim/40">
+                                        {step.agent_name} · {step.input_tokens} in / {step.output_tokens} out tokens
+                                      </p>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {isSelected && runDetailQuery.isLoading && (
+                            <div className="ml-5 mt-1 p-2 text-[10px] text-text-dim/50 flex items-center gap-1.5">
+                              <Loader2 className="w-3 h-3 animate-spin" /> Loading details…
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Card>
+              )}
             </div>
           )}
         </div>
       ) : (
         /* Empty State */
         !workflowsQuery.isLoading && (
-          <div className="text-center py-12">
-            <div className="w-16 h-16 rounded-2xl bg-brand/10 flex items-center justify-center mx-auto mb-4">
-              <Layers className="w-8 h-8 text-brand" />
-            </div>
-            <h3 className="text-lg font-bold">{t("workflows.empty_title")}</h3>
-            <p className="text-sm text-text-dim mt-1 mb-6">{t("workflows.empty_desc")}</p>
-            <div className="flex items-center justify-center gap-3">
-              <Button variant="primary" onClick={() => handleNewWorkflow()}>
-                <FilePlus className="w-4 h-4" />
-                {t("workflows.create_blank")}
-              </Button>
-              {apiTemplates.length > 0 && (
-                <Button variant="secondary" onClick={() => setActiveTab("templates")}>
-                  <Layers className="w-4 h-4" />
-                  {t("workflows.template_library")}
+          <EmptyState
+            icon={<Layers className="w-7 h-7" />}
+            title={t("workflows.empty_title")}
+            description={t("workflows.empty_desc")}
+            action={
+              <div className="flex items-center justify-center gap-3">
+                <Button variant="primary" onClick={() => handleNewWorkflow()}>
+                  <FilePlus className="w-4 h-4" />
+                  {t("workflows.create_blank")}
                 </Button>
-              )}
-            </div>
-          </div>
+                {apiTemplates.length > 0 && (
+                  <Button variant="secondary" onClick={() => setActiveTab("templates")}>
+                    <Layers className="w-4 h-4" />
+                    {t("workflows.template_library")}
+                  </Button>
+                )}
+              </div>
+            }
+          />
         )
       )}
         </>
@@ -336,10 +612,11 @@ export function WorkflowsPage() {
           title={t("nav.scheduler")}
           subtitle={workflows.find(w => w.id === scheduleWorkflowId)?.name}
           initialCron={(workflows.find(w => w.id === scheduleWorkflowId) as any)?.schedule?.cron || "0 9 * * *"}
-          onSave={async (cron) => {
+          initialTz={(workflows.find(w => w.id === scheduleWorkflowId) as any)?.schedule?.tz}
+          onSave={async (cron, tz) => {
             const wf = workflows.find(w => w.id === scheduleWorkflowId);
             try {
-              await createSchedule({ name: `${wf?.name || "workflow"} schedule`, cron, workflow_id: scheduleWorkflowId, enabled: true });
+              await createSchedule({ name: `${wf?.name || "workflow"} schedule`, cron, tz, workflow_id: scheduleWorkflowId, enabled: true });
               setScheduleWorkflowId(null);
               await queryClient.invalidateQueries({ queryKey: ["workflows"] });
             } catch { /* ignore */ }

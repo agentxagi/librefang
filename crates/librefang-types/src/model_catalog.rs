@@ -40,10 +40,17 @@ impl fmt::Display for ModelTier {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthStatus {
-    /// API key is present in the environment.
+    /// API key is present and confirmed valid via a live API probe.
+    ValidatedKey,
+    /// API key is present (non-empty) but not yet validated.
     Configured,
     /// No API key, but a CLI tool (e.g. claude-code) is available as fallback.
     ConfiguredCli,
+    /// Key detected via fallback env var — may not match the actual provider.
+    /// Functionally usable but user should verify.
+    AutoDetected,
+    /// API key is present but was rejected by the provider (HTTP 401/403).
+    InvalidKey,
     /// API key is missing.
     #[default]
     Missing,
@@ -51,14 +58,24 @@ pub enum AuthStatus {
     NotRequired,
     /// CLI-based provider but CLI is not installed.
     CliNotInstalled,
+    /// Local provider was probed and found offline (port not listening).
+    /// Unlike `Missing`, `detect_auth()` will not reset this — the probe
+    /// owns the transition back to `NotRequired` when the service comes up.
+    LocalOffline,
 }
 
 impl AuthStatus {
     /// Returns true if the provider is usable (key or CLI available).
+    ///
+    /// `InvalidKey` returns false — the key exists but won't work.
     pub fn is_available(self) -> bool {
         matches!(
             self,
-            AuthStatus::Configured | AuthStatus::ConfiguredCli | AuthStatus::NotRequired
+            AuthStatus::ValidatedKey
+                | AuthStatus::Configured
+                | AuthStatus::AutoDetected
+                | AuthStatus::ConfiguredCli
+                | AuthStatus::NotRequired
         )
     }
 }
@@ -66,11 +83,15 @@ impl AuthStatus {
 impl fmt::Display for AuthStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AuthStatus::ValidatedKey => write!(f, "validated_key"),
             AuthStatus::Configured => write!(f, "configured"),
             AuthStatus::ConfiguredCli => write!(f, "configured_cli"),
+            AuthStatus::AutoDetected => write!(f, "auto_detected"),
+            AuthStatus::InvalidKey => write!(f, "invalid_key"),
             AuthStatus::Missing => write!(f, "missing"),
             AuthStatus::NotRequired => write!(f, "not_required"),
             AuthStatus::CliNotInstalled => write!(f, "cli_not_installed"),
+            AuthStatus::LocalOffline => write!(f, "local_offline"),
         }
     }
 }
@@ -107,6 +128,9 @@ pub struct ModelCatalogEntry {
     /// Whether the model supports streaming responses.
     #[serde(default)]
     pub supports_streaming: bool,
+    /// Whether the model supports extended thinking / reasoning.
+    #[serde(default)]
+    pub supports_thinking: bool,
     /// Aliases for this model (e.g. ["sonnet", "claude-sonnet"]).
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -126,8 +150,90 @@ impl Default for ModelCatalogEntry {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: false,
+            supports_thinking: false,
             aliases: Vec::new(),
         }
+    }
+}
+
+/// Model type classification.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelType {
+    /// Conversational / text generation model.
+    #[default]
+    Chat,
+    /// Speech / audio model (TTS, STT).
+    Speech,
+    /// Embedding / vector model.
+    Embedding,
+}
+
+impl fmt::Display for ModelType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModelType::Chat => write!(f, "chat"),
+            ModelType::Speech => write!(f, "speech"),
+            ModelType::Embedding => write!(f, "embedding"),
+        }
+    }
+}
+
+/// Per-model inference parameter overrides.
+///
+/// Each field is `Option` — `None` means "use the agent's or system default".
+/// These overrides are applied as a fallback layer: agent-level `ModelConfig`
+/// takes precedence, then model overrides, then system defaults.
+///
+/// Persisted to `~/.librefang/model_overrides.json` keyed by `provider:model_id`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelOverrides {
+    /// Model type classification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<ModelType>,
+    /// Sampling temperature (0.0–2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Top-p / nucleus sampling (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Maximum tokens for completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Frequency penalty (-2.0–2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// Presence penalty (-2.0–2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Reasoning effort level ("low", "medium", "high").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Use `max_completion_tokens` instead of `max_tokens` in API requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_max_completion_tokens: Option<bool>,
+    /// Model does NOT support a system role message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_system_role: Option<bool>,
+    /// Force the max_tokens parameter even when the provider doesn't require it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_max_tokens: Option<bool>,
+}
+
+impl ModelOverrides {
+    /// Returns true if all fields are `None` (no overrides set).
+    pub fn is_empty(&self) -> bool {
+        self.model_type.is_none()
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.max_tokens.is_none()
+            && self.frequency_penalty.is_none()
+            && self.presence_penalty.is_none()
+            && self.reasoning_effort.is_none()
+            && self.use_max_completion_tokens.is_none()
+            && self.no_system_role.is_none()
+            && self.force_max_tokens.is_none()
     }
 }
 
@@ -169,6 +275,22 @@ pub struct ProviderInfo {
     /// Populated from `providers/*.toml` in the registry.
     #[serde(default)]
     pub media_capabilities: Vec<String>,
+    /// Model IDs confirmed available via live API probe.
+    /// Empty until background validation completes successfully.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+    /// True when the provider was added at runtime by the user (via the
+    /// dashboard "Add provider" flow), false when it was shipped by the
+    /// librefang-registry. Drives whether the dashboard shows a real
+    /// "Delete" control — built-in providers can only be deconfigured
+    /// (key removed), not deleted, because the registry sync would
+    /// re-create their TOML on the next boot anyway.
+    #[serde(default)]
+    pub is_custom: bool,
+    /// Per-provider proxy URL override. When set, API calls to this provider
+    /// are routed through this proxy instead of the global proxy config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for ProviderInfo {
@@ -184,6 +306,9 @@ impl Default for ProviderInfo {
             signup_url: None,
             regions: HashMap::new(),
             media_capabilities: Vec::new(),
+            available_models: Vec::new(),
+            is_custom: false,
+            proxy_url: None,
         }
     }
 }
@@ -235,6 +360,11 @@ impl From<ProviderCatalogToml> for ProviderInfo {
             signup_url: p.signup_url,
             regions: p.regions,
             media_capabilities: p.media_capabilities,
+            available_models: Vec::new(),
+            // Populated by the runtime catalog loader (classifies based on
+            // whether the file is also present in registry/providers/).
+            is_custom: false,
+            proxy_url: None,
         }
     }
 }
@@ -313,6 +443,7 @@ mod tests {
         assert_eq!(AuthStatus::ConfiguredCli.to_string(), "configured_cli");
         assert_eq!(AuthStatus::Missing.to_string(), "missing");
         assert_eq!(AuthStatus::NotRequired.to_string(), "not_required");
+        assert_eq!(AuthStatus::AutoDetected.to_string(), "auto_detected");
         assert_eq!(AuthStatus::CliNotInstalled.to_string(), "cli_not_installed");
     }
 
@@ -374,6 +505,7 @@ mod tests {
             supports_tools: true,
             supports_vision: true,
             supports_streaming: true,
+            supports_thinking: true,
             aliases: vec!["sonnet".to_string(), "claude-sonnet".to_string()],
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -396,6 +528,9 @@ mod tests {
             signup_url: None,
             regions: HashMap::new(),
             media_capabilities: Vec::new(),
+            available_models: Vec::new(),
+            is_custom: false,
+            proxy_url: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: ProviderInfo = serde_json::from_str(&json).unwrap();
@@ -608,6 +743,9 @@ aliases = []
                 ),
             ]),
             media_capabilities: Vec::new(),
+            available_models: Vec::new(),
+            is_custom: false,
+            proxy_url: None,
         };
 
         // Simulate region selection: if user picks "us", use that region's base_url

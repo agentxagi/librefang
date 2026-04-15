@@ -9,6 +9,7 @@ import { Card } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { EmptyState } from "../components/ui/EmptyState";
 import { CardSkeleton } from "../components/ui/Skeleton";
+import { useCreateShortcut } from "../lib/useCreateShortcut";
 import { Globe, Search, Send, ExternalLink, Clock, CheckCircle2, XCircle, Loader2, Plus } from "lucide-react";
 
 const REFRESH_MS = 15000;
@@ -20,6 +21,7 @@ export function A2APage() {
   const [discoverUrl, setDiscoverUrl] = useState("");
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [showDiscover, setShowDiscover] = useState(false);
+  useCreateShortcut(() => setShowDiscover(true));
 
   // Send task state
   const [taskAgent, setTaskAgent] = useState<A2AAgentItem | null>(null);
@@ -111,7 +113,7 @@ export function A2APage() {
       {showDiscover && (
         <Card padding="md" className="animate-fade-in-scale">
           <h3 className="text-sm font-black mb-3">{t("a2a.discover_agent")}</h3>
-          <div className="flex gap-3">
+          <div className="flex flex-col sm:flex-row gap-3">
             <input
               type="url"
               value={discoverUrl}

@@ -65,11 +65,15 @@ impl BackgroundExecutor {
     }
 
     /// Pause an agent's background loop (ticks will be skipped until resumed).
+    ///
+    /// Safe to call before `start_agent` — pre-creates the pause flag so that
+    /// when the loop does start it begins in the paused state.
     pub fn pause_agent(&self, agent_id: AgentId) {
-        if let Some(flag) = self.pause_flags.get(&agent_id) {
-            flag.store(true, Ordering::SeqCst);
-            info!(id = %agent_id, "Background loop paused");
-        }
+        self.pause_flags
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+            .store(true, Ordering::SeqCst);
+        info!(id = %agent_id, "Background loop paused");
     }
 
     /// Resume a paused agent's background loop.
@@ -107,8 +111,13 @@ impl BackgroundExecutor {
                 let mut shutdown = self.shutdown_rx.clone();
                 let busy = Arc::new(AtomicBool::new(false));
                 let semaphore = self.llm_semaphore.clone();
-                let paused = Arc::new(AtomicBool::new(false));
-                self.pause_flags.insert(agent_id, paused.clone());
+                // Reuse a pre-existing pause flag (set by pause_agent before loop start)
+                // so hands paused before their loop begins stay paused.
+                let paused = self
+                    .pause_flags
+                    .entry(agent_id)
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .clone();
 
                 info!(
                     agent = %name, id = %agent_id,
@@ -116,7 +125,15 @@ impl BackgroundExecutor {
                     "Starting continuous background loop"
                 );
 
+                let check_interval = *check_interval_secs;
                 let handle = tokio::spawn(async move {
+                    // Stagger first tick: random jitter (0..interval) so agents
+                    // don't all load sessions into memory simultaneously at boot.
+                    let jitter_secs = rand::random::<u64>() % check_interval.max(1);
+                    let jitter = std::time::Duration::from_secs(jitter_secs);
+                    debug!(agent = %name, jitter_secs, "Continuous loop: initial jitter");
+                    tokio::time::sleep(jitter).await;
+
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(interval) => {}
@@ -157,12 +174,20 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Continuous loop: sending self-prompt");
                         let busy_clone = busy.clone();
+                        let watcher_name = name.clone();
                         let jh = (send_message)(agent_id, prompt);
                         // Spawn a watcher with RAII guard — busy flag clears even on panic
                         tokio::spawn(async move {
                             let _guard = BusyGuard { flag: busy_clone };
                             let _permit = permit; // drop permit when watcher exits
-                            let _ = jh.await;
+                            if let Err(e) = jh.await {
+                                warn!(
+                                    agent = %watcher_name,
+                                    id = %agent_id,
+                                    error = %e,
+                                    "Continuous loop: agent tick task panicked or was aborted",
+                                );
+                            }
                         });
                     }
                 });
@@ -177,8 +202,13 @@ impl BackgroundExecutor {
                 let mut shutdown = self.shutdown_rx.clone();
                 let busy = Arc::new(AtomicBool::new(false));
                 let semaphore = self.llm_semaphore.clone();
-                let paused = Arc::new(AtomicBool::new(false));
-                self.pause_flags.insert(agent_id, paused.clone());
+                // Reuse a pre-existing pause flag (set by pause_agent before loop start)
+                // so hands paused before their loop begins stay paused.
+                let paused = self
+                    .pause_flags
+                    .entry(agent_id)
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .clone();
 
                 info!(
                     agent = %name, id = %agent_id,
@@ -187,6 +217,12 @@ impl BackgroundExecutor {
                 );
 
                 let handle = tokio::spawn(async move {
+                    // Stagger first tick: random jitter so agents don't spike memory together.
+                    let jitter_secs = rand::random::<u64>() % interval_secs.max(1);
+                    let jitter = std::time::Duration::from_secs(jitter_secs);
+                    debug!(agent = %name, jitter_secs, "Periodic loop: initial jitter");
+                    tokio::time::sleep(jitter).await;
+
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(interval) => {}
@@ -225,12 +261,20 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Periodic loop: sending scheduled prompt");
                         let busy_clone = busy.clone();
+                        let watcher_name = name.clone();
                         let jh = (send_message)(agent_id, prompt);
                         // Spawn a watcher with RAII guard — busy flag clears even on panic
                         tokio::spawn(async move {
                             let _guard = BusyGuard { flag: busy_clone };
                             let _permit = permit; // drop permit when watcher exits
-                            let _ = jh.await;
+                            if let Err(e) = jh.await {
+                                warn!(
+                                    agent = %watcher_name,
+                                    id = %agent_id,
+                                    error = %e,
+                                    "Periodic loop: agent tick task panicked or was aborted",
+                                );
+                            }
                         });
                     }
                 });

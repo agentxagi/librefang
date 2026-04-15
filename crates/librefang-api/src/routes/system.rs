@@ -1,6 +1,7 @@
 //! Audit, logging, tools, profiles, templates, memory, approvals,
 //! bindings, pairing, webhooks, and miscellaneous system handlers.
 
+use super::skills::write_secret_env;
 use super::AppState;
 
 /// Build routes for the system miscellaneous domain (audit, logs, tools, sessions, approvals, pairing, etc.).
@@ -11,6 +12,7 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         .route("/profiles/{name}", axum::routing::get(get_profile))
         .route("/templates", axum::routing::get(list_agent_templates))
         .route("/templates/{name}", axum::routing::get(get_agent_template))
+        .route("/templates/{name}/toml", axum::routing::get(get_agent_template_toml))
         // Agent KV storage
         .route(
             "/memory/agents/{id}/kv",
@@ -54,19 +56,59 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             "/agents/{id}/sessions/by-label/{label}",
             axum::routing::get(find_session_by_label),
         )
-        // Approvals
+        // Approvals — static paths must precede the `{id}` wildcard
         .route(
             "/approvals",
             axum::routing::get(list_approvals).post(create_approval),
         )
+        .route("/approvals/batch", axum::routing::post(batch_resolve))
+        .route("/approvals/audit", axum::routing::get(audit_log))
+        .route("/approvals/count", axum::routing::get(approval_count))
+        .route("/approvals/totp/setup", axum::routing::post(totp_setup))
+        .route(
+            "/approvals/totp/confirm",
+            axum::routing::post(totp_confirm),
+        )
+        .route(
+            "/approvals/totp/status",
+            axum::routing::get(totp_status),
+        )
+        .route(
+            "/approvals/totp/revoke",
+            axum::routing::post(totp_revoke),
+        )
         .route("/approvals/{id}", axum::routing::get(get_approval))
         .route(
             "/approvals/{id}/approve",
-            axum::routing::post(approve_request),
+            axum::routing::post(
+                |state: State<Arc<AppState>>,
+                 id: Path<String>,
+                 lang: Option<axum::Extension<RequestLanguage>>,
+                 body: Json<ApproveRequestBody>| async move {
+                    approve_request(state, id, lang, body).await
+                },
+            ),
         )
         .route(
             "/approvals/{id}/reject",
-            axum::routing::post(reject_request),
+            axum::routing::post(
+                |state: State<Arc<AppState>>,
+                 id: Path<String>,
+                 lang: Option<axum::Extension<RequestLanguage>>| async move {
+                    reject_request(state, id, lang).await
+                },
+            ),
+        )
+        .route(
+            "/approvals/{id}/modify",
+            axum::routing::post(
+                |state: State<Arc<AppState>>,
+                 id: Path<String>,
+                 lang: Option<axum::Extension<RequestLanguage>>,
+                 body: Json<ModifyRequestBody>| async move {
+                    modify_request(state, id, body, lang).await
+                },
+            ),
         )
         // Webhook triggers (external event injection)
         .route("/hooks/wake", axum::routing::post(webhook_wake))
@@ -168,6 +210,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// TOTP helpers
+// ---------------------------------------------------------------------------
+
+use librefang_kernel::approval::ApprovalManager;
+
+// ---------------------------------------------------------------------------
 // Profile + Mode endpoints
 // ---------------------------------------------------------------------------
 
@@ -243,6 +291,67 @@ pub async fn get_profile(
 // Template endpoints
 // ---------------------------------------------------------------------------
 
+/// Validate a template name supplied via URL path before joining it onto the
+/// templates directory. Only permits `[A-Za-z0-9_-]` to guarantee the result
+/// cannot escape the base directory through `..`, absolute paths, or platform
+/// separators (`/`, `\`). Rejects empty names and anything longer than 64
+/// chars to cap log noise.
+fn validate_template_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("invalid template name");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("invalid template name");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod template_name_validation_tests {
+    use super::validate_template_name;
+
+    #[test]
+    fn accepts_simple_names() {
+        assert!(validate_template_name("assistant").is_ok());
+        assert!(validate_template_name("customer-support").is_ok());
+        assert!(validate_template_name("coder_v2").is_ok());
+        assert!(validate_template_name("a1").is_ok());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_template_name("..").is_err());
+        assert!(validate_template_name("../../etc").is_err());
+        assert!(validate_template_name("foo/../bar").is_err());
+        assert!(validate_template_name("..\\..\\tmp").is_err());
+    }
+
+    #[test]
+    fn rejects_separators_and_absolute_paths() {
+        assert!(validate_template_name("foo/bar").is_err());
+        assert!(validate_template_name("foo\\bar").is_err());
+        assert!(validate_template_name("/etc/passwd").is_err());
+        assert!(validate_template_name("C:\\Windows").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized() {
+        assert!(validate_template_name("").is_err());
+        assert!(validate_template_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn rejects_null_and_special_chars() {
+        assert!(validate_template_name("foo\0bar").is_err());
+        assert!(validate_template_name("foo bar").is_err());
+        assert!(validate_template_name("foo.bar").is_err());
+        assert!(validate_template_name("foo%2fbar").is_err());
+    }
+}
+
 /// GET /api/templates — List available agent templates.
 #[utoipa::path(get, path = "/api/templates", tag = "system", operation_id = "list_agent_templates", responses((status = 200, description = "List templates", body = Vec<serde_json::Value>)))]
 pub async fn list_agent_templates() -> impl IntoResponse {
@@ -291,6 +400,9 @@ pub async fn get_agent_template(
     lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    if validate_template_name(&name).is_err() {
+        return ApiErrorResponse::not_found(t.t("api-error-template-not-found")).into_json_tuple();
+    }
     let agents_dir = librefang_kernel::config::librefang_home()
         .join("workspaces")
         .join("agents");
@@ -332,6 +444,57 @@ pub async fn get_agent_template(
         Err(e) => {
             tracing::warn!("Failed to read template '{name}': {e}");
             ApiErrorResponse::internal(t.t("api-error-template-read-failed")).into_json_tuple()
+        }
+    }
+}
+
+/// GET /api/templates/:name/toml — Get the raw TOML content of a template.
+#[utoipa::path(get, path = "/api/templates/{name}/toml", tag = "system", operation_id = "get_agent_template_toml", params(("name" = String, Path, description = "Template name")), responses((status = 200, description = "Template TOML content as plain text", body = String)))]
+pub async fn get_agent_template_toml(
+    Path(name): Path<String>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> impl IntoResponse {
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    if validate_template_name(&name).is_err() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            t.t("api-error-template-not-found"),
+        )
+            .into_response();
+    }
+    let agents_dir = librefang_kernel::config::librefang_home()
+        .join("workspaces")
+        .join("agents");
+    let manifest_path = agents_dir.join(&name).join("agent.toml");
+
+    if !manifest_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            t.t("api-error-template-not-found"),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(&manifest_path) {
+        Ok(content) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            content,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!("Failed to read template '{name}': {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                t.t("api-error-template-read-failed"),
+            )
+                .into_response()
         }
     }
 }
@@ -1070,7 +1233,8 @@ pub async fn session_cleanup(
     lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
-    let cfg = &state.kernel.config_ref().session;
+    let kcfg = state.kernel.config_ref();
+    let cfg = &kcfg.session;
     let mut total: u64 = 0;
 
     if cfg.retention_days > 0 {
@@ -1220,6 +1384,10 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             librefang_types::approval::ApprovalDecision::Approved => "approved",
             librefang_types::approval::ApprovalDecision::Denied => "rejected",
             librefang_types::approval::ApprovalDecision::TimedOut => "expired",
+            librefang_types::approval::ApprovalDecision::ModifyAndRetry { .. } => {
+                "modify_and_retry"
+            }
+            librefang_types::approval::ApprovalDecision::Skipped => "skipped",
         };
         serde_json::json!({
             "id": request.id,
@@ -1323,6 +1491,8 @@ pub async fn create_approval(
         timeout_secs: policy.timeout_secs,
         sender_id: None,
         channel: None,
+        route_to: Vec::new(),
+        escalation_count: 0,
     };
 
     // Spawn the request in the background (it will block until resolved or timed out)
@@ -1338,33 +1508,142 @@ pub async fn create_approval(
 }
 
 /// POST /api/approvals/{id}/approve — Approve a pending request.
-#[utoipa::path(post, path = "/api/approvals/{id}/approve", tag = "approvals", params(("id" = String, Path, description = "Approval ID")), responses((status = 200, description = "Request approved", body = serde_json::Value)))]
+///
+/// When TOTP is enabled, the request body must include a `totp_code` field.
+#[derive(serde::Deserialize, Default)]
+pub struct ApproveRequestBody {
+    #[serde(default)]
+    totp_code: Option<String>,
+}
+
+#[utoipa::path(post, path = "/api/approvals/{id}/approve", tag = "approvals", params(("id" = String, Path, description = "Approval ID")), request_body = serde_json::Value, responses((status = 200, description = "Request approved", body = serde_json::Value)))]
 pub async fn approve_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     lang: Option<axum::Extension<RequestLanguage>>,
-) -> impl IntoResponse {
-    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    Json(body): Json<ApproveRequestBody>,
+) -> axum::response::Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
         Ok(u) => u,
         Err(_) => {
+            let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
             return ApiErrorResponse::bad_request(t.t("api-error-approval-invalid-id"))
-                .into_json_tuple();
+                .into_json_tuple()
+                .into_response();
         }
     };
 
-    match state.kernel.approvals().resolve(
-        uuid,
-        librefang_types::approval::ApprovalDecision::Approved,
-        Some("api".to_string()),
-    ) {
-        Ok(resp) => (
+    // Verify TOTP code or recovery code if this specific tool requires it.
+    // Use per-tool check so tools not in totp_tools skip TOTP (and lockout)
+    // even when second_factor = totp is enabled globally.
+    let totp_issuer = state.kernel.approvals().policy().totp_issuer.clone();
+    let tool_requires_totp = state
+        .kernel
+        .approvals()
+        .get_pending(uuid)
+        .map(|req| {
+            state
+                .kernel
+                .approvals()
+                .policy()
+                .tool_requires_totp(&req.tool_name)
+        })
+        .unwrap_or(false);
+    let totp_verified = if tool_requires_totp {
+        if state.kernel.approvals().is_totp_locked_out("api_admin") {
+            return ApiErrorResponse::bad_request(
+                "Too many failed TOTP attempts. Try again later.",
+            )
+            .into_json_tuple()
+            .into_response();
+        }
+        match body.totp_code.as_deref() {
+            Some(code) => {
+                if ApprovalManager::is_recovery_code_format(code) {
+                    match state.kernel.vault_get("totp_recovery_codes") {
+                        Some(stored) => {
+                            match librefang_kernel::approval::ApprovalManager::verify_recovery_code(
+                                &stored, code,
+                            ) {
+                                Ok((true, updated)) => {
+                                    let _ = state.kernel.vault_set("totp_recovery_codes", &updated);
+                                    true
+                                }
+                                Ok((false, _)) => {
+                                    state.kernel.approvals().record_totp_failure("api_admin");
+                                    return ApiErrorResponse::bad_request("Invalid recovery code")
+                                        .into_json_tuple()
+                                        .into_response();
+                                }
+                                Err(e) => {
+                                    return ApiErrorResponse::bad_request(e)
+                                        .into_json_tuple()
+                                        .into_response();
+                                }
+                            }
+                        }
+                        None => {
+                            return ApiErrorResponse::bad_request("No recovery codes configured")
+                                .into_json_tuple()
+                                .into_response();
+                        }
+                    }
+                } else {
+                    let secret = match state.kernel.vault_get("totp_secret") {
+                        Some(s) => s,
+                        None => {
+                            return ApiErrorResponse::bad_request(
+                                "TOTP not configured. Run POST /api/approvals/totp/setup first.",
+                            )
+                            .into_json_tuple()
+                            .into_response();
+                        }
+                    };
+                    match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                        &secret,
+                        code,
+                        &totp_issuer,
+                    ) {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            state.kernel.approvals().record_totp_failure("api_admin");
+                            return ApiErrorResponse::bad_request("Invalid TOTP code")
+                                .into_json_tuple()
+                                .into_response();
+                        }
+                        Err(e) => {
+                            return ApiErrorResponse::bad_request(e)
+                                .into_json_tuple()
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    match state
+        .kernel
+        .resolve_tool_approval(
+            uuid,
+            librefang_types::approval::ApprovalDecision::Approved,
+            Some("api".to_string()),
+            totp_verified,
+            Some("api_admin"),
+        )
+        .await
+    {
+        Ok((resp, _deferred)) => (
             StatusCode::OK,
             Json(
                 serde_json::json!({"id": id, "status": "approved", "decided_at": resp.decided_at.to_rfc3339()}),
             ),
-        ),
-        Err(e) => ApiErrorResponse::not_found(e).into_json_tuple(),
+        )
+            .into_response(),
+        Err(e) => ApiErrorResponse::bad_request(e).into_json_tuple().into_response(),
     }
 }
 
@@ -1374,29 +1653,517 @@ pub async fn reject_request(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     lang: Option<axum::Extension<RequestLanguage>>,
-) -> impl IntoResponse {
-    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+) -> axum::response::Response {
     let uuid = match uuid::Uuid::parse_str(&id) {
         Ok(u) => u,
         Err(_) => {
+            let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
             return ApiErrorResponse::bad_request(t.t("api-error-approval-invalid-id"))
-                .into_json_tuple();
+                .into_json_tuple()
+                .into_response();
         }
     };
 
-    match state.kernel.approvals().resolve(
-        uuid,
-        librefang_types::approval::ApprovalDecision::Denied,
-        Some("api".to_string()),
-    ) {
-        Ok(resp) => (
+    match state
+        .kernel
+        .resolve_tool_approval(
+            uuid,
+            librefang_types::approval::ApprovalDecision::Denied,
+            Some("api".to_string()),
+            false,
+            None,
+        )
+        .await
+    {
+        Ok((resp, _deferred)) => (
             StatusCode::OK,
             Json(
                 serde_json::json!({"id": id, "status": "rejected", "decided_at": resp.decided_at.to_rfc3339()}),
             ),
-        ),
-        Err(e) => ApiErrorResponse::not_found(e).into_json_tuple(),
+        )
+            .into_response(),
+        Err(e) => ApiErrorResponse::not_found(e).into_json_tuple().into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Approval — modify, batch, audit, count
+// ---------------------------------------------------------------------------
+
+/// POST /api/approvals/{id}/modify — Return a pending request with feedback for modification.
+#[derive(serde::Deserialize)]
+pub struct ModifyRequestBody {
+    #[serde(default)]
+    feedback: String,
+}
+
+#[utoipa::path(post, path = "/api/approvals/{id}/modify", tag = "approvals", params(("id" = String, Path, description = "Approval ID")), request_body = serde_json::Value, responses((status = 200, description = "Request modified", body = serde_json::Value)))]
+pub async fn modify_request(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ModifyRequestBody>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> axum::response::Response {
+    // Truncate feedback to prevent database bloat
+    let feedback: String = body
+        .feedback
+        .chars()
+        .take(librefang_types::approval::MAX_APPROVAL_FEEDBACK_LEN)
+        .collect();
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+            return ApiErrorResponse::bad_request(t.t("api-error-approval-invalid-id"))
+                .into_json_tuple()
+                .into_response();
+        }
+    };
+
+    match state
+        .kernel
+        .resolve_tool_approval(
+            uuid,
+            librefang_types::approval::ApprovalDecision::ModifyAndRetry { feedback },
+            Some("api".to_string()),
+            false,
+            None,
+        )
+        .await
+    {
+        Ok((resp, _deferred)) => (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({"id": id, "status": "modified", "decided_at": resp.decided_at.to_rfc3339()}),
+            ),
+        )
+            .into_response(),
+        Err(e) => ApiErrorResponse::not_found(e).into_json_tuple().into_response(),
+    }
+}
+
+/// POST /api/approvals/batch — Batch resolve multiple pending requests.
+#[derive(serde::Deserialize)]
+pub struct BatchResolveRequest {
+    ids: Vec<String>,
+    decision: String,
+}
+
+#[utoipa::path(post, path = "/api/approvals/batch", tag = "approvals", request_body = serde_json::Value, responses((status = 200, description = "Batch resolve results", body = serde_json::Value)))]
+pub async fn batch_resolve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchResolveRequest>,
+) -> impl IntoResponse {
+    const MAX_BATCH_SIZE: usize = 100;
+
+    if body.ids.len() > MAX_BATCH_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": format!("batch size {} exceeds maximum {MAX_BATCH_SIZE}", body.ids.len())}),
+            ),
+        );
+    }
+
+    let decision = match body.decision.as_str() {
+        "approve" => librefang_types::approval::ApprovalDecision::Approved,
+        "reject" => librefang_types::approval::ApprovalDecision::Denied,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"error": format!("invalid decision: {other}, expected 'approve' or 'reject'")}),
+                ),
+            );
+        }
+    };
+
+    // Batch approve is incompatible with TOTP enforcement for tools that
+    // require a TOTP code. Check if any of the requested IDs need TOTP;
+    // if so, reject the batch so each can be approved individually.
+    // Batch reject is always allowed.
+    if matches!(
+        decision,
+        librefang_types::approval::ApprovalDecision::Approved
+    ) {
+        let policy = state.kernel.approvals().policy();
+        let any_needs_totp = body
+            .ids
+            .iter()
+            .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+            .filter_map(|uid| state.kernel.approvals().get_pending(uid))
+            .any(|req| policy.tool_requires_totp(&req.tool_name));
+        if any_needs_totp {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Batch approval is not available when TOTP is required for some tools. Approve those items individually with TOTP verification."
+                })),
+            );
+        }
+    }
+
+    // Parse UUIDs, returning error entries for invalid ones
+    let mut result_json: Vec<serde_json::Value> = Vec::with_capacity(body.ids.len());
+    let mut valid_uuids = Vec::new();
+    for id_str in &body.ids {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(uuid) => valid_uuids.push(uuid),
+            Err(_) => {
+                result_json.push(serde_json::json!({
+                    "id": id_str, "status": "error", "message": "invalid UUID"
+                }));
+            }
+        }
+    }
+
+    for uuid in valid_uuids {
+        let id = uuid.to_string();
+        match state
+            .kernel
+            .resolve_tool_approval(uuid, decision.clone(), Some("api".to_string()), false, None)
+            .await
+        {
+            Ok((resp, _)) => result_json.push(serde_json::json!({
+                "id": id,
+                "status": "ok",
+                "decision": resp.decision.as_str(),
+                "decided_at": resp.decided_at.to_rfc3339(),
+            })),
+            Err(e) => {
+                result_json.push(serde_json::json!({"id": id, "status": "error", "message": e}))
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"results": result_json})),
+    )
+}
+
+/// GET /api/approvals/audit — Query the persistent approval audit log.
+#[derive(serde::Deserialize)]
+pub struct AuditQueryParams {
+    #[serde(default = "default_audit_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+    agent_id: Option<String>,
+    tool_name: Option<String>,
+}
+
+fn default_audit_limit() -> usize {
+    50
+}
+
+#[utoipa::path(get, path = "/api/approvals/audit", tag = "approvals", params(("limit" = Option<usize>, Query, description = "Max entries"), ("offset" = Option<usize>, Query, description = "Offset"), ("agent_id" = Option<String>, Query, description = "Filter by agent"), ("tool_name" = Option<String>, Query, description = "Filter by tool")), responses((status = 200, description = "Audit log entries", body = serde_json::Value)))]
+pub async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AuditQueryParams>,
+) -> impl IntoResponse {
+    const MAX_AUDIT_LIMIT: usize = 500;
+    let limit = params.limit.min(MAX_AUDIT_LIMIT);
+    let entries = state.kernel.approvals().query_audit(
+        limit,
+        params.offset,
+        params.agent_id.as_deref(),
+        params.tool_name.as_deref(),
+    );
+    let total = state
+        .kernel
+        .approvals()
+        .audit_count(params.agent_id.as_deref(), params.tool_name.as_deref());
+
+    Json(serde_json::json!({"entries": entries, "total": total}))
+}
+
+/// GET /api/approvals/count — Lightweight pending count for notification badges.
+#[utoipa::path(get, path = "/api/approvals/count", tag = "approvals", responses((status = 200, description = "Pending approval count", body = serde_json::Value)))]
+pub async fn approval_count(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pending = state.kernel.approvals().pending_count();
+    Json(serde_json::json!({"pending": pending}))
+}
+
+// ---------------------------------------------------------------------------
+// TOTP setup endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /api/approvals/totp/setup — Generate a new TOTP secret and return a provisioning URI.
+///
+/// The secret is stored in the vault but not yet active. The user must call
+/// `/api/approvals/totp/confirm` with a valid code to activate TOTP.
+///
+/// If TOTP is already confirmed, the request body must include a valid
+/// `current_code` (TOTP or recovery code) to authorize the reset.
+#[derive(serde::Deserialize, Default)]
+pub struct TotpSetupBody {
+    /// Required when resetting an already-confirmed TOTP enrollment.
+    #[serde(default)]
+    current_code: Option<String>,
+}
+
+pub async fn totp_setup(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TotpSetupBody>,
+) -> impl IntoResponse {
+    let totp_issuer = state.kernel.approvals().policy().totp_issuer.clone();
+    // If TOTP is already confirmed, require verification of the old code
+    let already_confirmed = state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
+
+    if already_confirmed {
+        if state.kernel.approvals().is_totp_locked_out("api_admin") {
+            return ApiErrorResponse::bad_request(
+                "Too many failed TOTP attempts. Try again later.",
+            )
+            .into_json_tuple();
+        }
+        match body.current_code.as_deref() {
+            None => {
+                return ApiErrorResponse::bad_request(
+                    "TOTP is already enrolled. Provide current_code (TOTP or recovery code) to reset.",
+                )
+                .into_json_tuple();
+            }
+            Some(code) => {
+                let verified = if ApprovalManager::is_recovery_code_format(code) {
+                    // Recovery code
+                    match state.kernel.vault_get("totp_recovery_codes") {
+                        Some(stored) => {
+                            match librefang_kernel::approval::ApprovalManager::verify_recovery_code(
+                                &stored, code,
+                            ) {
+                                Ok((true, updated)) => {
+                                    let _ = state.kernel.vault_set("totp_recovery_codes", &updated);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        None => false,
+                    }
+                } else {
+                    // TOTP code
+                    match state.kernel.vault_get("totp_secret") {
+                        Some(secret) => {
+                            librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                                &secret,
+                                code,
+                                &totp_issuer,
+                            )
+                            .unwrap_or(false)
+                        }
+                        None => false,
+                    }
+                };
+                if !verified {
+                    state.kernel.approvals().record_totp_failure("api_admin");
+                    return ApiErrorResponse::bad_request(
+                        "Invalid current_code. Provide a valid TOTP or recovery code to reset.",
+                    )
+                    .into_json_tuple();
+                }
+            }
+        }
+    }
+
+    let (secret_base32, otpauth_uri, qr_base64) =
+        match librefang_kernel::approval::ApprovalManager::generate_totp_secret(
+            &totp_issuer,
+            "admin",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return ApiErrorResponse::internal(e).into_json_tuple();
+            }
+        };
+    let qr_data_uri = format!("data:image/png;base64,{qr_base64}");
+
+    // Generate recovery codes
+    let recovery_codes = librefang_kernel::approval::ApprovalManager::generate_recovery_codes();
+    let recovery_json = serde_json::to_string(&recovery_codes).unwrap_or_default();
+
+    // Store secret and recovery codes in vault (not yet active — totp_confirmed = false)
+    if let Err(e) = state.kernel.vault_set("totp_secret", &secret_base32) {
+        return ApiErrorResponse::internal(e).into_json_tuple();
+    }
+    if let Err(e) = state.kernel.vault_set("totp_confirmed", "false") {
+        return ApiErrorResponse::internal(e).into_json_tuple();
+    }
+    if let Err(e) = state
+        .kernel
+        .vault_set("totp_recovery_codes", &recovery_json)
+    {
+        return ApiErrorResponse::internal(e).into_json_tuple();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "otpauth_uri": otpauth_uri,
+            "secret": secret_base32,
+            "qr_code": qr_data_uri,
+            "recovery_codes": recovery_codes,
+            "message": "Scan the QR code or enter the secret in your authenticator app, then call POST /api/approvals/totp/confirm with a valid code. Save your recovery codes in a safe place."
+        })),
+    )
+}
+
+/// POST /api/approvals/totp/confirm — Confirm TOTP enrollment by verifying a code.
+#[derive(serde::Deserialize)]
+pub struct TotpConfirmBody {
+    code: String,
+}
+
+pub async fn totp_confirm(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TotpConfirmBody>,
+) -> impl IntoResponse {
+    let totp_issuer = state.kernel.approvals().policy().totp_issuer.clone();
+    if state.kernel.approvals().is_totp_locked_out("api_admin") {
+        return ApiErrorResponse::bad_request("Too many failed TOTP attempts. Try again later.")
+            .into_json_tuple();
+    }
+
+    let secret = match state.kernel.vault_get("totp_secret") {
+        Some(s) => s,
+        None => {
+            return ApiErrorResponse::bad_request(
+                "No TOTP secret found. Run POST /api/approvals/totp/setup first.",
+            )
+            .into_json_tuple();
+        }
+    };
+
+    match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+        &secret,
+        &body.code,
+        &totp_issuer,
+    ) {
+        Ok(true) => {
+            if let Err(e) = state.kernel.vault_set("totp_confirmed", "true") {
+                return ApiErrorResponse::internal(e).into_json_tuple();
+            }
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"status": "confirmed", "message": "TOTP is now active. Set second_factor = \"totp\" in your config to enforce it."}),
+                ),
+            )
+        }
+        Ok(false) => {
+            state.kernel.approvals().record_totp_failure("api_admin");
+            ApiErrorResponse::bad_request(
+                "Invalid TOTP code. Check your authenticator app and try again.",
+            )
+            .into_json_tuple()
+        }
+        Err(e) => ApiErrorResponse::internal(e).into_json_tuple(),
+    }
+}
+
+/// GET /api/approvals/totp/status — Check TOTP enrollment status.
+pub async fn totp_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let has_secret = state
+        .kernel
+        .vault_get("totp_secret")
+        .is_some_and(|s| !s.is_empty());
+    let confirmed = state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
+    let policy = state.kernel.approvals().policy();
+    let sf = policy.second_factor;
+    let enforced = sf != librefang_types::approval::SecondFactor::None;
+
+    let remaining_recovery = state
+        .kernel
+        .vault_get("totp_recovery_codes")
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "enrolled": has_secret,
+        "confirmed": confirmed,
+        "enforced": enforced,
+        "scope": serde_json::to_value(sf).unwrap_or(serde_json::json!("none")),
+        "remaining_recovery_codes": remaining_recovery,
+    }))
+}
+
+/// POST /api/approvals/totp/revoke — Revoke TOTP enrollment.
+///
+/// Requires a valid TOTP or recovery code to authorize revocation.
+#[derive(serde::Deserialize)]
+pub struct TotpRevokeBody {
+    code: String,
+}
+
+pub async fn totp_revoke(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TotpRevokeBody>,
+) -> impl IntoResponse {
+    let totp_issuer = state.kernel.approvals().policy().totp_issuer.clone();
+    if state.kernel.approvals().is_totp_locked_out("api_admin") {
+        return ApiErrorResponse::bad_request("Too many failed TOTP attempts. Try again later.")
+            .into_json_tuple();
+    }
+
+    let confirmed = state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
+
+    if !confirmed {
+        return ApiErrorResponse::bad_request("TOTP is not enrolled.").into_json_tuple();
+    }
+
+    // Verify the provided code (recovery codes are consumed on use)
+    let verified = if ApprovalManager::is_recovery_code_format(&body.code) {
+        match state.kernel.vault_get("totp_recovery_codes") {
+            Some(stored) => {
+                match librefang_kernel::approval::ApprovalManager::verify_recovery_code(
+                    &stored, &body.code,
+                ) {
+                    Ok((true, updated)) => {
+                        let _ = state.kernel.vault_set("totp_recovery_codes", &updated);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            None => false,
+        }
+    } else {
+        match state.kernel.vault_get("totp_secret") {
+            Some(secret) => {
+                librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                    &secret,
+                    &body.code,
+                    &totp_issuer,
+                )
+                .unwrap_or(false)
+            }
+            None => false,
+        }
+    };
+
+    if !verified {
+        state.kernel.approvals().record_totp_failure("api_admin");
+        return ApiErrorResponse::bad_request(
+            "Invalid code. Provide a valid TOTP or recovery code.",
+        )
+        .into_json_tuple();
+    }
+
+    // Remove TOTP data from vault
+    // vault_set to empty/false markers (vault doesn't expose remove via kernel helper)
+    let _ = state.kernel.vault_set("totp_confirmed", "false");
+    let _ = state.kernel.vault_set("totp_secret", "");
+    let _ = state.kernel.vault_set("totp_recovery_codes", "[]");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "revoked",
+            "message": "TOTP has been revoked. Set second_factor = \"none\" in config to disable enforcement."
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,8 +2188,10 @@ pub async fn webhook_wake(
             t.t("api-error-webhook-invalid-token"),
         )
     };
-    // Check if webhook triggers are enabled
-    let wh_config = match &state.kernel.config_ref().webhook_triggers {
+    // Check if webhook triggers are enabled — use config_snapshot()
+    // because wh_config is held across .await below.
+    let cfg = state.kernel.config_snapshot();
+    let wh_config = match &cfg.webhook_triggers {
         Some(c) if c.enabled => c,
         _ => {
             return ApiErrorResponse::not_found(err_webhook_not_enabled).into_json_tuple();
@@ -1485,8 +2254,10 @@ pub async fn webhook_agent(
             t.t("api-error-webhook-no-agents"),
         )
     };
-    // Check if webhook triggers are enabled
-    let wh_config = match &state.kernel.config_ref().webhook_triggers {
+    // Check if webhook triggers are enabled — use config_snapshot()
+    // because wh_config is held across .await below.
+    let cfg2 = state.kernel.config_snapshot();
+    let wh_config = match &cfg2.webhook_triggers {
         Some(c) if c.enabled => c,
         _ => {
             return ApiErrorResponse::not_found(err_webhook_not_enabled).into_json_tuple();
@@ -2457,7 +3228,8 @@ pub async fn queue_status(State(state): State<Arc<AppState>>) -> impl IntoRespon
         })
         .collect();
 
-    let queue_cfg = &state.kernel.config_ref().queue;
+    let kcfg2 = state.kernel.config_ref();
+    let queue_cfg = &kcfg2.queue;
     Json(serde_json::json!({
         "lanes": lanes,
         "config": {
@@ -3076,7 +3848,7 @@ pub async fn task_queue_retry(
 
 /// GET /api/registry/schema — Return the full registry schema for all content types.
 async fn registry_schema(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let home_dir = &state.kernel.config_ref().home_dir;
+    let home_dir = state.kernel.home_dir();
     match librefang_types::registry_schema::load_registry_schema(home_dir) {
         Some(schema) => match serde_json::to_value(&schema) {
             Ok(val) => Json(val).into_response(),
@@ -3097,7 +3869,7 @@ async fn registry_schema_by_type(
     State(state): State<Arc<AppState>>,
     Path(content_type): Path<String>,
 ) -> impl IntoResponse {
-    let home_dir = &state.kernel.config_ref().home_dir;
+    let home_dir = state.kernel.home_dir();
     match librefang_types::registry_schema::load_registry_schema(home_dir) {
         Some(schema) => match schema.content_types.get(&content_type) {
             Some(ct) => match serde_json::to_value(ct) {
@@ -3138,7 +3910,7 @@ async fn create_registry_content(
     Query(params): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let home_dir = &state.kernel.config_ref().home_dir;
+    let home_dir = state.kernel.home_dir();
     let allow_overwrite = params
         .get("allow_overwrite")
         .is_some_and(|v| v == "true" || v == "1");
@@ -3187,7 +3959,11 @@ async fn create_registry_content(
         "provider" => home_dir
             .join("providers")
             .join(format!("{identifier}.toml")),
-        "agent" => home_dir.join("agents").join(&identifier).join("agent.toml"),
+        "agent" => home_dir
+            .join("workspaces")
+            .join("agents")
+            .join(&identifier)
+            .join("agent.toml"),
         "hand" => home_dir.join("hands").join(&identifier).join("HAND.toml"),
         "integration" => home_dir
             .join("integrations")
@@ -3213,8 +3989,47 @@ async fn create_registry_content(
         .into_response();
     }
 
-    // Convert JSON values to TOML
-    let toml_value = json_to_toml_value(&body);
+    // For providers: extract the `api_key` value (if present) before writing TOML.
+    // The actual key is stored in secrets.env, NOT in the provider TOML file.
+    let api_key_to_save: Option<(String, String)> = if content_type == "provider" {
+        let obj = body.as_object();
+        let api_key = obj
+            .and_then(|m| m.get("api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let api_key_env = obj
+            .and_then(|m| m.get("api_key_env"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}_API_KEY", identifier.to_uppercase().replace('-', "_")));
+        api_key.map(|k| (api_key_env, k))
+    } else {
+        None
+    };
+
+    // Convert JSON values to TOML.
+    // For providers: the catalog TOML format requires a `[provider]` section header.
+    // If the body is a flat object (fields at the top level), restructure it so that
+    // non-`models` fields are nested under a `"provider"` key, producing the correct
+    // `[provider] … [[models]] …` layout that `ModelCatalogFile` expects.
+    // Strip `api_key` from the body so the secret is not written to the TOML file.
+    let body_without_secret = if content_type == "provider" {
+        let mut b = body.clone();
+        if let Some(obj) = b.as_object_mut() {
+            obj.remove("api_key");
+        }
+        b
+    } else {
+        body.clone()
+    };
+    let body_for_toml = if content_type == "provider" {
+        normalize_provider_body(&body_without_secret)
+    } else {
+        body_without_secret
+    };
+    let toml_value = json_to_toml_value(&body_for_toml);
     let toml_string = match toml::to_string_pretty(&toml_value) {
         Ok(s) => s,
         Err(e) => {
@@ -3241,6 +4056,16 @@ async fn create_registry_content(
     // For provider files, refresh the in-memory model catalog so new models
     // and provider config changes are available immediately.
     if content_type == "provider" {
+        // Save the API key to secrets.env before detect_auth so the provider
+        // is immediately recognized as configured.
+        if let Some((env_var, key_value)) = &api_key_to_save {
+            let secrets_path = state.kernel.home_dir().join("secrets.env");
+            if let Err(e) = write_secret_env(&secrets_path, env_var, key_value) {
+                tracing::warn!("Failed to write API key to secrets.env: {e}");
+            }
+            std::env::set_var(env_var, key_value);
+        }
+
         let mut catalog = state
             .kernel
             .model_catalog_ref()
@@ -3253,6 +4078,10 @@ async fn create_registry_content(
         // Invalidate cached LLM drivers — URLs/keys may have changed.
         drop(catalog);
         state.kernel.clear_driver_cache();
+
+        if api_key_to_save.is_some() {
+            state.kernel.clone().spawn_key_validation();
+        }
     }
 
     Json(serde_json::json!({
@@ -3275,6 +4104,35 @@ async fn update_registry_content(
     let mut overwrite = HashMap::new();
     overwrite.insert("allow_overwrite".to_string(), "true".to_string());
     create_registry_content(state, path, Query(overwrite), Json(body)).await
+}
+
+/// Ensure a provider JSON body has the `[provider]` wrapper required by
+/// `ModelCatalogFile`. If the body is already wrapped (contains a `"provider"`
+/// key), it is returned unchanged. Otherwise the non-`models` fields are moved
+/// under `"provider"` and `models` is kept at the top level so TOML
+/// serialization produces the correct `[provider] … [[models]] …` structure.
+fn normalize_provider_body(body: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = body.as_object() else {
+        return body.clone();
+    };
+    if obj.contains_key("provider") {
+        return body.clone();
+    }
+    let models = obj.get("models").cloned();
+    let provider_fields: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "models")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut restructured = serde_json::Map::new();
+    restructured.insert(
+        "provider".to_string(),
+        serde_json::Value::Object(provider_fields),
+    );
+    if let Some(serde_json::Value::Array(arr)) = models {
+        restructured.insert("models".to_string(), serde_json::Value::Array(arr));
+    }
+    serde_json::Value::Object(restructured)
 }
 
 /// Recursively convert serde_json::Value to toml::Value, stripping empty
@@ -3313,6 +4171,94 @@ fn json_to_toml_value(json: &serde_json::Value) -> toml::Value {
             }
             toml::Value::Table(table)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// normalize_provider_body tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod provider_body_tests {
+    use super::*;
+    use librefang_types::model_catalog::ModelCatalogFile;
+
+    fn round_trip(body: serde_json::Value) -> ModelCatalogFile {
+        let normalized = normalize_provider_body(&body);
+        let toml_value = json_to_toml_value(&normalized);
+        let toml_str = toml::to_string_pretty(&toml_value).expect("serialization failed");
+        toml::from_str(&toml_str).expect("TOML did not parse as ModelCatalogFile")
+    }
+
+    #[test]
+    fn flat_body_gets_provider_section() {
+        let body = serde_json::json!({
+            "id": "deepinfra",
+            "display_name": "Deepinfra",
+            "api_key_env": "DEEPINFRA_API_KEY",
+            "base_url": "https://api.deepinfra.com/v1/openai",
+            "key_required": true
+        });
+        let catalog = round_trip(body);
+        let provider = catalog.provider.expect("provider section must be present");
+        assert_eq!(provider.id, "deepinfra");
+        assert_eq!(provider.display_name, "Deepinfra");
+    }
+
+    #[test]
+    fn flat_body_with_models_preserves_models() {
+        let body = serde_json::json!({
+            "id": "deepinfra",
+            "display_name": "Deepinfra",
+            "api_key_env": "DEEPINFRA_API_KEY",
+            "base_url": "https://api.deepinfra.com/v1/openai",
+            "key_required": true,
+            "models": [{
+                "id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B",
+                "display_name": "Nemotron 3 Super",
+                "tier": "frontier",
+                "context_window": 200000,
+                "max_output_tokens": 16000,
+                "input_cost_per_m": 0.1,
+                "output_cost_per_m": 0.5,
+                "supports_streaming": true,
+                "supports_tools": true,
+                "supports_vision": true
+            }]
+        });
+        let catalog = round_trip(body);
+        assert!(catalog.provider.is_some());
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(
+            catalog.models[0].id,
+            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B"
+        );
+    }
+
+    #[test]
+    fn already_wrapped_body_is_unchanged() {
+        let body = serde_json::json!({
+            "provider": {
+                "id": "deepinfra",
+                "display_name": "Deepinfra",
+                "api_key_env": "DEEPINFRA_API_KEY",
+                "base_url": "https://api.deepinfra.com/v1/openai",
+                "key_required": true
+            }
+        });
+        let normalized = normalize_provider_body(&body);
+        // Should not double-wrap
+        assert!(normalized["provider"].is_object());
+        assert!(normalized
+            .get("provider")
+            .and_then(|p| p.get("provider"))
+            .is_none());
+    }
+
+    #[test]
+    fn non_object_body_is_returned_as_is() {
+        let body = serde_json::json!("not an object");
+        let normalized = normalize_provider_body(&body);
+        assert_eq!(normalized, body);
     }
 }
 

@@ -99,6 +99,8 @@ async fn test_full_daemon_lifecycle() {
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         },
         ..KernelConfig::default()
     };
@@ -123,6 +125,10 @@ async fn test_full_daemon_lifecycle() {
         active_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         prometheus_handle: None,
         media_drivers: librefang_runtime::media::MediaDriverCache::new(),
+        webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
+        api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+        provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
@@ -235,6 +241,8 @@ async fn test_server_immediate_responsiveness() {
             api_key_env: "OLLAMA_API_KEY".to_string(),
             base_url: None,
             message_timeout_secs: 300,
+            extra_params: std::collections::HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         },
         ..KernelConfig::default()
     };
@@ -258,6 +266,10 @@ async fn test_server_immediate_responsiveness() {
         active_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         prometheus_handle: None,
         media_drivers: librefang_runtime::media::MediaDriverCache::new(),
+        webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
+        api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+        provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
